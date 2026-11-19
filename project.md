@@ -380,7 +380,7 @@ parede espacial próprio.
 | Etapa | Entrega | Critério de pronto |
 |---|---|---|
 | **E0** ✅ | Toolchain e build: clang/lld/NASM, script de build, imagem de disco GPT/FAT32, QEMU+OVMF | `build` gera a imagem e o QEMU chega ao bootloader. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
-| **E1** | Bootloader UEFI, kernel 64 bits, GOP, serial, console de texto no framebuffer, GDT/IDT, exceções | "Hello" na tela e no log serial (UTF-8); exceção mostra um diagnóstico |
+| **E1** ✅ | Bootloader UEFI, kernel 64 bits, GOP, serial, console de texto no framebuffer, GDT/IDT, exceções | "Hello" na tela e no log serial (UTF-8); exceção mostra um diagnóstico. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
 | **E2** | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa |
 | **E3** | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando |
 | **E4** | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel |
@@ -430,9 +430,11 @@ OpalineOS/
 | Comando | O que faz |
 |---|---|
 | `python tools/build.py` | compila o bootloader (`build/BOOTX64.EFI`) e gera a imagem `build/opaline.img` (128 MiB, GPT + ESP FAT32 de 64 MiB); `--clean` recomeça do zero |
-| `python tools/vm.py run` | abre o QEMU (q35, OVMF) com a imagem |
+| `python tools/vm.py run [--cmdline "..."]` | abre o QEMU (q35, OVMF) com a imagem; `--cmdline` cria uma variante com `CMDLINE.TXT` |
 | `python tools/vm.py run vbox` | abre a VM **OpalineOS** no VirtualBox (criada na primeira vez: EFI, 512 MB, SATA, COM1 em arquivo) |
-| `python tools/vm.py test` | boota sem janela no QEMU e no VirtualBox e procura o marcador `TEST_OK` na COM1. Saída `TEST_OK`/`TEST_FAILED` por emulador e código de saída ≠ 0 se falhar |
+| `python tools/vm.py test` | roda a lista `TESTS` de `tools/vm.py`: cada caso boota sem janela (QEMU ou VirtualBox), lê a COM1 e confere textos esperados e proibidos. Saída `TEST_OK`/`TEST_FAILED` por caso e código ≠ 0 se algum falhar |
+| `python tools/vm.py screenshot OUT.png [--cmdline "..."]` | screenshot do QEMU quando o kernel termina ou entra em pânico |
+| `python tools/gen_font.py FONTE.ttf` | regenera `assets/fonts/console.fnt` (precisa de Pillow e fontTools; o arquivo gerado é versionado) |
 | `python tools/mkimage.py IMG --verify` | relê uma imagem e confere GPT (CRCs, cópia de reserva) e FAT32 |
 
 - A imagem é gerada por um script próprio em Python (`tools/mkimage.py`), sem mtools nem permissão de
@@ -442,6 +444,29 @@ OpalineOS/
 - No QEMU, o OVMF espelha o console na serial, por isso as mensagens aparecem duas vezes em
   `build/serial-qemu.log`. Isso é normal.
 - Instalados: LLVM 23.1, NASM, QEMU 11.1 (`C:\Program Files\qemu`, firmware `share/edk2-x86_64-code.fd`), VirtualBox.
+
+### 10.1.1 Como a E1 funciona
+
+- **Protocolo de boot** (`boot/bootinfo.h`, compartilhado): o bootloader lê `\OPALINE\KERNEL.ELF`,
+  `\OPALINE\CONSOLE.FNT` e o opcional `\OPALINE\CMDLINE.TXT` da ESP, carrega os segmentos ELF,
+  escolhe o modo de vídeo (preferência 1280x800, ou `video=LxA` na linha de comando, senão o maior
+  até 1920x1080), monta as tabelas de páginas (identidade dos primeiros 4 GiB + RAM, a mesma memória
+  em `0xFFFF800000000000` (HHDM) e o kernel em `0xFFFFFFFF80000000`), sai dos boot services e pula
+  para o kernel com `RDI = struct boot_info *`.
+- **Mapa de memória**: tudo é alocado como `EfiLoaderData` e o bootloader separa as próprias regiões
+  (`kernel`, `boot data`) ao converter o mapa. Tipos de memória próprios (≥ 0x80000000), permitidos
+  pela especificação UEFI, **derrubam o firmware do VirtualBox** no `ExitBootServices`: não usar.
+- **Kernel** (`kernel/`): `entry.asm` (pilha própria de 64 KiB), console UTF-8 no framebuffer + COM1
+  (`console.c`, `kprintf`), GDT com segmentos de usuário já na ordem do `SYSRET`, TSS com pilhas IST
+  para #DF/NMI/#MC, IDT com as 32 exceções, `#BP` retomável e tela de pânico com registradores,
+  CR2 e *stack trace* (o kernel é compilado com frame pointers).
+- **Fonte do console**: `assets/fonts/console.fnt` (1271 caracteres, célula 9x18, alfa de 8 bits),
+  gerada a partir da DejaVu Sans Mono. É um arquivo de dados separado, carregado pelo bootloader; não
+  é ligado ao binário do kernel.
+- **Testes da E1**: boot normal (QEMU e VirtualBox) e três exceções provocadas pela linha de comando
+  (`test=pagefault`, `test=ud`, `test=divide`), cada uma conferindo a tela de pânico. Uma divisão por
+  zero em C pode ser removida pelo compilador; por isso o teste usa `div` em assembly.
+- Screenshots em `docs/screenshots/`.
 
 ### 10.2 Geral
 
@@ -490,6 +515,7 @@ OpalineOS/
 | 2026-11-17 | Licença **GPLv3**. Sistema **em inglês** (interface, APIs, bibliotecas, código e documentação técnica). APIs do sistema renomeadas para `opaline.system` (antes `opaline.sistema`). Interface em **en-US + pt-BR**, trocável a qualquer momento sem reiniciar. **Unicode/UTF-8** em todo o sistema |
 | 2026-11-17 | **E0 concluída**: bootloader UEFI mínimo, imagem GPT/FAT32 gerada em Python, testes automáticos no QEMU e no VirtualBox. `project.md` continua em português |
 | 2026-11-17 | Licenças: sistema **GPL-3.0-or-later**, bibliotecas para apps **LGPL-3.0-or-later**. Arquivos `COPYING`, `COPYING.LESSER`, `LICENSING.md`; cabeçalho SPDX em cada arquivo-fonte, com copyright "The OpalineOS authors". Repositório git iniciado |
+| 2026-11-17 | **E1 concluída**: kernel de 64 bits no *higher half*, console UTF-8 com fonte própria (DejaVu Sans Mono), GDT/TSS/IDT, diagnóstico de exceções. Bootloader usa só `EfiLoaderData` por causa do VirtualBox |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

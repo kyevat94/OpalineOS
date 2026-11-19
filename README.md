@@ -4,7 +4,10 @@ A light, fast and modern operating system with its own kernel, where **Python is
 the desktop and the apps are written in Python (official CPython) using `opaline-vitrum`, the
 system's GUI toolkit.
 
-> **Status:** stage **E0** — toolchain, UEFI bootloader stub and GPT/FAT32 disk image.
+> **Status:** stage **E1** — UEFI bootloader, 64-bit higher-half kernel, UTF-8 console on the
+> framebuffer and serial port, GDT/TSS/IDT and exception diagnostics.
+
+![Boot screen](docs/screenshots/e1-boot.png)
 > The full plan is in [`project.md`](project.md) (in Portuguese) and the toolkit API in
 > [`opaline-vitrum.md`](opaline-vitrum.md).
 
@@ -22,7 +25,8 @@ system's GUI toolkit.
 python tools/build.py              # builds build/opaline.img (add --clean for a fresh build)
 python tools/vm.py run             # boots in QEMU (window)
 python tools/vm.py run vbox        # boots in VirtualBox (creates the "OpalineOS" VM the first time)
-python tools/vm.py test            # headless boot test in QEMU and VirtualBox
+python tools/vm.py test            # automated boot and exception tests in QEMU and VirtualBox
+python tools/vm.py run --cmdline test=pagefault   # see the panic screen
 ```
 
 The test prints `TEST_OK` / `TEST_FAILED` per emulator and exits with a non-zero code on failure.
