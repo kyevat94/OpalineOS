@@ -32,26 +32,41 @@ VM_NAME = "OpalineOS"
 TIMEOUT = 90          # seconds per test
 
 # (name, emulator, command line or None, text that must appear, text that must not appear)
+BOOT_OK = "TEST_OK boot complete"
+PANIC_END = "The system has stopped."
+
 TESTS = [
     ("boot", "qemu", None,
-     ["Hello, OpalineOS!", "Olá, mundo! Ação", "GDT, TSS and IDT loaded.",
-      "Breakpoint (#BP)", "TEST_OK E1 kernel"],
-     ["PANIC"]),
+     ["Hello, OpalineOS!", "Olá, mundo! Ação", "Breakpoint (#BP)", "no-execute on",
+      "Memory self-test passed", "TEST_OK E2 memory", BOOT_OK],
+     ["PANIC", "FAILED"]),
     ("page-fault", "qemu", "test=pagefault",
      ["PANIC: Page fault (#PF)", "CR2=0xffffc00000000000", "not-present page on read in kernel mode",
-      "Stack trace:", "The system has stopped."],
-     ["TEST_OK E1 kernel"]),
+      "Stack trace:", PANIC_END],
+     [BOOT_OK]),
+    ("null-pointer", "qemu", "test=null",
+     ["PANIC: Page fault (#PF)", "CR2=0x0000000000000000", "not-present page on read", PANIC_END],
+     [BOOT_OK]),
+    ("write-protect", "qemu", "test=wp",
+     ["PANIC: Page fault (#PF)", "protection violation on write in kernel mode", PANIC_END],
+     [BOOT_OK]),
+    ("no-execute", "qemu", "test=nx",
+     ["PANIC: Page fault (#PF)", "protection violation on instruction fetch", PANIC_END],
+     [BOOT_OK]),
+    ("double-free", "qemu", "test=doublefree",
+     ["PANIC: kfree: double free of", PANIC_END],
+     [BOOT_OK]),
     ("invalid-opcode", "qemu", "test=ud",
-     ["PANIC: Invalid opcode (#UD)", "The system has stopped."],
-     ["TEST_OK E1 kernel"]),
+     ["PANIC: Invalid opcode (#UD)", PANIC_END],
+     [BOOT_OK]),
     ("divide-error", "qemu", "test=divide",
-     ["PANIC: Divide error (#DE)", "The system has stopped."],
-     ["TEST_OK E1 kernel"]),
+     ["PANIC: Divide error (#DE)", PANIC_END],
+     [BOOT_OK]),
     ("boot", "vbox", None,
-     ["Hello, OpalineOS!", "Olá, mundo! Ação", "Breakpoint (#BP)", "TEST_OK E1 kernel"],
-     ["PANIC"]),
+     ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory", BOOT_OK],
+     ["PANIC", "FAILED"]),
 ]
-DONE_MARKERS = ["TEST_OK E1 kernel", "The system has stopped."]
+DONE_MARKERS = [BOOT_OK, PANIC_END]
 
 
 def find(name, dirs):

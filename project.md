@@ -381,7 +381,7 @@ parede espacial próprio.
 |---|---|---|
 | **E0** ✅ | Toolchain e build: clang/lld/NASM, script de build, imagem de disco GPT/FAT32, QEMU+OVMF | `build` gera a imagem e o QEMU chega ao bootloader. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
 | **E1** ✅ | Bootloader UEFI, kernel 64 bits, GOP, serial, console de texto no framebuffer, GDT/IDT, exceções | "Hello" na tela e no log serial (UTF-8); exceção mostra um diagnóstico. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
-| **E2** | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa |
+| **E2** ✅ | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E3** | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando |
 | **E4** | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel |
 | **E5** | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados |
@@ -468,6 +468,38 @@ OpalineOS/
   zero em C pode ser removida pelo compilador; por isso o teste usa `div` em assembly.
 - Screenshots em `docs/screenshots/`.
 
+### 10.1.2 Como a E2 funciona
+
+- **Páginas físicas** (`kernel/mm/pmm.c`): bitmap de 1 bit por página de 4 KiB. Gerencia as regiões
+  `usable` e também as `bootloader` (o código e os buffers do bootloader não servem mais depois que o
+  kernel começa). O primeiro 1 MiB nunca é entregue (fica para o código de partida dos outros núcleos,
+  na E13). Liberar uma página já livre causa pânico.
+- **Tabelas de páginas do kernel** (`kernel/mm/vmm.c`): o kernel monta as próprias tabelas e
+  abandona as do bootloader:
+  - `.text` só leitura + execução; `.rodata` só leitura; `.data`/`.bss` leitura e escrita; dados
+    nunca executáveis (bit NX ligado via `EFER.NXE`);
+  - HHDM (`0xFFFF800000000000 + físico`) de toda a memória tipo RAM, com páginas de 2 MiB quando dá;
+  - framebuffer em *write-combining* (entrada 1 da PAT reprogramada);
+  - **sem mapa de identidade**: acessar um ponteiro NULL agora gera page fault;
+  - as 256 entradas da metade alta do PML4 já existem, para que os processos (E3/E4) compartilhem a
+    metade do kernel copiando essas entradas;
+  - `vmm_map`, `vmm_unmap`, `vmm_translate`, `vmm_map_mmio` (sem cache, para registradores de
+    dispositivos).
+- **Heap** (`kernel/mm/heap.c`): `kmalloc`, `kcalloc`, `krealloc`, `kfree`, `ksize`. Até 2048 bytes
+  usa *slabs* (uma página por slab, classes de 16 a 2048 bytes); acima disso, páginas contíguas.
+  Blocos liberados são preenchidos com `0xDE`; `kfree` detecta liberação dupla e ponteiros que não
+  vieram do `kmalloc`.
+- **Ainda não é seguro para várias threads**: não há preempção nem outros núcleos até a E3, que
+  adiciona travas (*locks*).
+- **Autoteste de memória** (`kernel/mm/selftest.c`, roda em todo boot): 512 páginas com padrão
+  verificado, uma sequência de 64 páginas contíguas, mapear/desmapear e traduzir endereços, e 40 mil
+  operações aleatórias de `kmalloc`/`kfree` (de 1 byte a 64 KiB) conferindo o conteúdo de cada bloco.
+  No fim, nada pode ter vazado.
+- **Testes da E2** (`tools/vm.py`): além do boot, provocam e conferem a tela de pânico para
+  ponteiro NULL (`test=null`), escrita em dados só de leitura (`test=wp`), execução de código no heap
+  (`test=nx`) e liberação dupla (`test=doublefree`). Verificado também que o teste de boot **falha**
+  se o heap for sabotado (o autoteste acusa o bloco corrompido).
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -516,6 +548,7 @@ OpalineOS/
 | 2026-11-17 | **E0 concluída**: bootloader UEFI mínimo, imagem GPT/FAT32 gerada em Python, testes automáticos no QEMU e no VirtualBox. `project.md` continua em português |
 | 2026-11-17 | Licenças: sistema **GPL-3.0-or-later**, bibliotecas para apps **LGPL-3.0-or-later**. Arquivos `COPYING`, `COPYING.LESSER`, `LICENSING.md`; cabeçalho SPDX em cada arquivo-fonte, com copyright "The OpalineOS authors". Repositório git iniciado |
 | 2026-11-17 | **E1 concluída**: kernel de 64 bits no *higher half*, console UTF-8 com fonte própria (DejaVu Sans Mono), GDT/TSS/IDT, diagnóstico de exceções. Bootloader usa só `EfiLoaderData` por causa do VirtualBox |
+| 2026-11-19 | **E2 concluída**: bitmap de páginas físicas, tabelas de páginas próprias do kernel (W^X, NX, sem identidade, framebuffer WC), heap com slabs e detecção de liberação dupla, autoteste de memória em todo boot |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

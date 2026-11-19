@@ -40,4 +40,22 @@ static inline u64 rdmsr(u32 msr) {
     return ((u64)hi << 32) | lo;
 }
 
+static inline void wrmsr(u32 msr, u64 value) {
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((u32)value), "d"((u32)(value >> 32)) : "memory");
+}
+
+static inline void cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
+    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
+}
+
+static inline void write_cr3(u64 v) { __asm__ volatile("mov %0, %%cr3" : : "r"(v) : "memory"); }
+static inline void write_cr4(u64 v) { __asm__ volatile("mov %0, %%cr4" : : "r"(v) : "memory"); }
+static inline void invlpg(u64 addr) { __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory"); }
+static inline void wbinvd(void) { __asm__ volatile("wbinvd" ::: "memory"); }
+
+#define MSR_EFER 0xC0000080
+#define MSR_PAT  0x00000277
+#define EFER_NXE (1ULL << 11)
+#define CR4_PGE  (1ULL << 7)
+
 #endif
