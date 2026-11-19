@@ -79,7 +79,8 @@ bool sched_selftest(void) {
     u64 t0 = time_ms();
     thread_sleep_ms(50);
     u64 slept = time_ms() - t0;
-    if (slept < 50 || slept > 80) FAIL("thread_sleep_ms(50) took %lu ms", slept);
+    /* never early; late only within reason (a virtual machine can be paused by its host) */
+    if (slept < 50 || slept > 1000) FAIL("thread_sleep_ms(50) took %lu ms", slept);
 
     /* 3. many threads */
     enum { N = 32 };

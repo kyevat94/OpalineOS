@@ -29,6 +29,7 @@ void console_set_color(u32 fg);
 void console_write(const char *utf8, size_t n);
 
 int kprintf(const char *fmt, ...) PRINTF(1, 2);
+void kputs(const char *s, size_t n);   /* raw text (UTF-8), as one locked write */
 int kvprintf(const char *fmt, va_list ap);
 int ksnprintf(char *buf, size_t size, const char *fmt, ...) PRINTF(3, 4);
 

@@ -4,6 +4,7 @@
 #include <opaline/arch/idt.h>
 #include <opaline/console.h>
 #include <opaline/panic.h>
+#include <opaline/proc.h>
 
 struct idt_entry {
     u16 offset_low;
@@ -52,6 +53,8 @@ void idt_init(void) {
 void irq_set_handler(u8 vector, irq_handler handler) { handlers[vector] = handler; }
 
 void interrupt_dispatch(struct interrupt_frame *f) {
+    /* a CPU exception in user mode ends that process, never the system */
+    if (f->vector < 32 && (f->cs & 3) == 3) process_fault(f);
     if (f->vector == 3) {   /* breakpoint: report and continue after the int3 */
         kprintf("Breakpoint (#BP) at RIP=%p: handled, continuing\n", (void *)f->rip);
         return;

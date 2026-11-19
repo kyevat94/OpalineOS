@@ -141,6 +141,13 @@ int kvprintf(const char *fmt, va_list ap) {
     return n;
 }
 
+void kputs(const char *s, size_t n) {
+    bool locked = !panic_in_progress();
+    u64 flags = locked ? spin_lock(&console_lock) : 0;
+    console_write(s, n);
+    if (locked) spin_unlock(&console_lock, flags);
+}
+
 int kprintf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

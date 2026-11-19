@@ -134,3 +134,7 @@ void panic_exception(const struct interrupt_frame *f) {
     stack_trace(f->rip, f->rbp);
     panic_end();
 }
+
+const char *exception_name(u64 vector) {
+    return vector < 32 ? exception_names[vector] : "Unexpected interrupt";
+}

@@ -64,9 +64,12 @@ void lapic_eoi(void) { lapic_write(LAPIC_EOI, 0); }
 
 u32 lapic_id(void) { return lapic_read(LAPIC_ID) >> 24; }
 
-/* Counts LAPIC timer ticks during 10 ms measured by PIT channel 2 (interrupts must be off). */
-static u64 measure_ticks_per_10ms(void) {
-    const u32 pit_count = PIT_HZ / 100;
+#define CALIBRATION_MS   25
+#define CALIBRATION_RUNS 5
+
+/* Counts LAPIC timer ticks during CALIBRATION_MS measured by PIT channel 2 (interrupts must be off). */
+static u64 measure_ticks(void) {
+    const u32 pit_count = PIT_HZ / (1000 / CALIBRATION_MS);
     u8 gate = inb(PIT_GATE_PORT);
     outb(PIT_GATE_PORT, (u8)((gate & ~0x02) | 0x01));   /* speaker off, gate on */
     outb(PIT_COMMAND, 0xB0);                             /* channel 2, lo/hi byte, mode 0 */
@@ -86,15 +89,19 @@ u64 lapic_timer_start(u8 vector, u32 hz) {
     lapic_write(LAPIC_TIMER_DIV, TIMER_DIVIDE_16);
     lapic_write(LAPIC_LVT_TIMER, LVT_MASKED | vector);
 
-    /* smallest of three measurements: any delay in noticing the PIT can only make a count larger */
-    u64 best = ~0ULL;
-    for (int i = 0; i < 3; i++) {
-        u64 t = measure_ticks_per_10ms();
-        if (t < best) best = t;
+    /* median of five 25 ms measurements: in a virtual machine a single one can be far off
+       when the host pauses the guest in the middle of it */
+    u64 m[CALIBRATION_RUNS];
+    for (int i = 0; i < CALIBRATION_RUNS; i++) {
+        u64 t = measure_ticks();
+        int j = i;
+        for (; j > 0 && m[j - 1] > t; j--) m[j] = m[j - 1];   /* insertion sort */
+        m[j] = t;
     }
     lapic_write(LAPIC_TIMER_INIT, 0);
-    u64 ticks_per_second = best * 100;
-    if (ticks_per_second < hz) panic("timer calibration failed (%lu ticks per 10 ms)", best);
+    u64 median = m[CALIBRATION_RUNS / 2];
+    u64 ticks_per_second = median * (1000 / CALIBRATION_MS);
+    if (ticks_per_second < hz) panic("timer calibration failed (%lu ticks per %d ms)", median, CALIBRATION_MS);
 
     lapic_write(LAPIC_LVT_TIMER, LVT_PERIODIC | vector);
     lapic_write(LAPIC_TIMER_INIT, (u32)(ticks_per_second / hz));

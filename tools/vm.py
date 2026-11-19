@@ -40,8 +40,15 @@ TESTS = [
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Breakpoint (#BP)", "no-execute on",
       "Memory self-test passed", "TEST_OK E2 memory",
       "Timer: local APIC", "Threads A and B alternating without yielding: ABAB",
-      "Scheduler self-test passed", "TEST_OK E3 scheduler", BOOT_OK],
-     ["PANIC", "FAILED", "unexpected interrupt"]),
+      "Scheduler self-test passed", "TEST_OK E3 scheduler",
+      "usertest: write() from ring 3 works", "usertest: all checks passed",
+      "Olá do espaço de usuário! Hello from user space (3/3)",
+      'Process "crashnull"', "crashed: Page fault (#PF)", "address 0x0000000000000000",
+      'Process "crashpriv"', "crashed: General protection fault (#GP)",
+      'Process "crashkernel"', "address 0xffffffff80000000",
+      "The process was stopped (exit code 139). The system continues.",
+      "User-space self-test passed", "TEST_OK E4 userspace", BOOT_OK],
+     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
     ("stack-overflow", "qemu", "test=stackoverflow",
      ["PANIC: Double fault (#DF)", 'Thread: "overflow"', "Cause: kernel stack overflow", PANIC_END],
      [BOOT_OK]),
@@ -73,8 +80,9 @@ TESTS = [
     ("boot", "vbox", None,
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
       "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",
-      "TEST_OK E3 scheduler", BOOT_OK],
-     ["PANIC", "FAILED", "unexpected interrupt"]),
+      "TEST_OK E3 scheduler", "usertest: all checks passed", "User-space self-test passed",
+      "TEST_OK E4 userspace", BOOT_OK],
+     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
 ]
 DONE_MARKERS = [BOOT_OK, PANIC_END]
 
@@ -96,12 +104,15 @@ def need_image():
 
 
 def image_for(cmdline):
-    """The normal image, or a variant with CMDLINE.TXT."""
+    """The normal image, or a variant with CMDLINE.TXT. All variants share one file
+    (build/variant.img), so a test run does not leave a 128 MiB image per test behind."""
     need_image()
     if cmdline is None:
         return IMAGE
-    safe = "".join(c if c.isalnum() else "-" for c in cmdline).strip("-")
-    path = os.path.join(BUILD, f"variant-{safe}.img")
+    for name in os.listdir(BUILD):   # images from older versions of this script
+        if name.startswith("variant-") and (name.endswith(".img") or name.endswith(".cmdline.txt")):
+            os.remove(os.path.join(BUILD, name))
+    path = os.path.join(BUILD, "variant.img")
     build.make_image(path, cmdline)
     return path
 
@@ -254,15 +265,18 @@ def vbox_test(cmdline):
 def run_tests(target):
     runners = {"qemu": qemu_test, "vbox": vbox_test}
     failed = 0
-    for name, emu, cmdline, expect, forbid in TESTS:
+    # VirtualBox first: it is the more timing-sensitive emulator, so it runs before the QEMU
+    # cases write their variant images
+    for name, emu, cmdline, expect, forbid in sorted(TESTS, key=lambda t: t[1] != "vbox"):
         if target not in ("all", emu):
             continue
+        start = time.time()
         text, log = runners[emu](cmdline)
         missing = [e for e in expect if e not in text]
         present = [f for f in forbid if f in text]
         ok = not missing and not present
         failed += not ok
-        print(f"{'TEST_OK' if ok else 'TEST_FAILED'} {emu}/{name}", flush=True)
+        print(f"{'TEST_OK' if ok else 'TEST_FAILED'} {emu}/{name}  ({time.time() - start:.1f} s)", flush=True)
         for m in missing:
             print(f"    missing:    {m!r}")
         for p in present:

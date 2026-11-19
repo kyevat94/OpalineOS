@@ -383,7 +383,7 @@ parede espacial próprio.
 | **E1** ✅ | Bootloader UEFI, kernel 64 bits, GOP, serial, console de texto no framebuffer, GDT/IDT, exceções | "Hello" na tela e no log serial (UTF-8); exceção mostra um diagnóstico. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
 | **E2** ✅ | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E3** ✅ | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
-| **E4** | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel |
+| **E4** ✅ | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E5** | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados |
 | **E6** | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
@@ -530,6 +530,44 @@ OpalineOS/
   "kernel stack overflow") e `test=threadfault` (NULL dentro de uma thread → o pânico mostra o nome da
   thread).
 
+### 10.1.4 Como a E4 funciona
+
+- **Espaço de endereços por processo**: cada processo tem seu PML4; a metade alta aponta para as
+  mesmas tabelas do kernel (pré-alocadas na E2), a metade baixa é só dele. O escalonador troca o CR3
+  ao trocar de processo. Ao terminar, todas as páginas e tabelas do processo voltam ao alocador.
+- **Carregador ELF** (`kernel/proc/elf.c`): ELF64 estático (`ET_EXEC`, x86-64). Cada segmento
+  `PT_LOAD` ganha páginas zeradas com as permissões do próprio segmento (escrita só com `PF_W`,
+  execução só com `PF_X`). Programas não podem mapear abaixo de 4 MiB nem no topo da metade baixa.
+- **Pilha de usuário**: 64 KiB abaixo de `0x00007FFFFFFFE000`, com página de guarda. O topo segue a
+  ABI System V (`argc`, `argv`, `envp`, `auxv` vazios), pronto para a musl na E6.
+- **Syscalls** (`SYSCALL`/`SYSRET`): MSRs `STAR`/`LSTAR`/`FMASK`; a entrada (`syscall.asm`) usa
+  `SWAPGS` só para trocar de pilha (bloco por CPU com a pilha do kernel da thread atual). Numeração,
+  registradores e `errno` do **Linux x86-64**. Implementadas: `write` (stdout/stderr → console),
+  `sched_yield`, `nanosleep`, `getpid`, `gettid`, `clock_gettime`, `exit`, `exit_group`. As demais
+  devolvem `-ENOSYS`. **Todo ponteiro de usuário é verificado** nas tabelas de páginas do processo
+  (`-EFAULT` se não for memória de usuário mapeada).
+- **FPU/SSE por thread**: o estado é salvo (`fxsave`) e restaurado (`fxrstor`) a cada troca; o kernel
+  é compilado sem SSE, então só os programas usam esses registradores.
+- **Falhas de programas**: uma exceção em ring 3 (NULL, instrução privilegiada, ler memória do kernel,
+  divisão por zero...) mostra uma mensagem em amarelo e encerra **só aquele processo**, com código de
+  saída 128 + sinal (139 = SIGSEGV, 132 = SIGILL, 136 = SIGFPE). O sistema continua.
+- **Programas de usuário** (`user/`): cada pasta vira `build/user/<nome>.elf`, ligado em 0x400000 com
+  uma biblioteca mínima (`user/lib`: `_start`, `printf`, `write`, `sleep_ms`... **LGPL-3.0-or-later**),
+  que a musl substitui na E6. Sem sistema de arquivos ainda, os ELFs vão **embutidos no kernel**
+  (`build/gen/user_programs.asm`, gerado pelo `build.py`).
+- **Autoteste de usuário** (todo boot): `usertest` confere as syscalls a partir do ring 3 (resultados,
+  `-ENOSYS`, `-EFAULT` para ponteiro do kernel e endereço não mapeado, `-EBADF`, `-EINVAL`, sleep,
+  estado SSE preservado); dois `hello` rodam ao mesmo tempo; `crashnull`, `crashpriv` e `crashkernel`
+  são encerrados e o kernel continua; no fim, nenhuma página vazou. Verificado que o teste **falha**
+  se a verificação de ponteiros for desligada.
+- **Timer mais estável**: a calibração do LAPIC agora usa a mediana de 5 medições de 25 ms (antes,
+  menor de 3 × 10 ms variava de 268 a 717 MHz no VirtualBox; agora dá ~1000 MHz sempre). Testes de
+  tempo exigem "nunca acordar antes", com folga de até 1 s para atrasos do host.
+- **Ferramenta de testes**: as variantes com linha de comando reaproveitam um único
+  `build/variant.img` (antes eram 128 MiB por teste), o VirtualBox roda primeiro e cada caso mostra
+  quanto tempo levou. Houve duas falhas intermitentes no VirtualBox logo após gravar muitas imagens;
+  a causa provável (disco do host ocupado) não foi confirmada, mas não se repetiu em 10 execuções.
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -580,6 +618,7 @@ OpalineOS/
 | 2026-11-17 | **E1 concluída**: kernel de 64 bits no *higher half*, console UTF-8 com fonte própria (DejaVu Sans Mono), GDT/TSS/IDT, diagnóstico de exceções. Bootloader usa só `EfiLoaderData` por causa do VirtualBox |
 | 2026-11-19 | **E2 concluída**: bitmap de páginas físicas, tabelas de páginas próprias do kernel (W^X, NX, sem identidade, framebuffer WC), heap com slabs e detecção de liberação dupla, autoteste de memória em todo boot |
 | 2026-11-19 | **E3 concluída**: LAPIC + timer a 1000 Hz (PIC mascarado), threads do kernel com escalonador round-robin preemptivo (fatia de 10 ms), pilhas com página de guarda, spinlocks no pmm/heap/vmm/console, autoteste do escalonador |
+| 2026-11-19 | **E4 concluída**: processos com espaço de endereços próprio, carregador ELF64, SYSCALL/SYSRET com numeração Linux e verificação de ponteiros, FPU por thread, falhas de programas encerram só o processo. Biblioteca mínima de usuário (`user/lib`) sob LGPL-3.0-or-later |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

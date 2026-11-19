@@ -23,15 +23,17 @@
 #include <opaline/arch/cpu.h>
 #include <opaline/arch/gdt.h>
 #include <opaline/arch/idt.h>
+#include <opaline/arch/syscall.h>
 #include <opaline/console.h>
 #include <opaline/fb.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/serial.h>
 #include <opaline/string.h>
 
-#define OPALINE_VERSION "0.3.0-e3"
+#define OPALINE_VERSION "0.4.0-e4"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",
@@ -174,10 +176,17 @@ void kmain(struct boot_info *bi) {
     static const char sched_marker[] = "TEST_OK E3 scheduler\n";
     serial_write(sched_marker, sizeof sched_marker - 1);
 
+    /* user mode */
+    syscall_init();
+    kprintf("System calls ready (SYSCALL/SYSRET, Linux x86-64 numbering).\n");
+    if (!user_selftest()) panic("user-space self-test failed");
+    static const char user_marker[] = "TEST_OK E4 userspace\n";
+    serial_write(user_marker, sizeof user_marker - 1);
+
     run_self_test(bi->cmdline);
 
     console_set_color(COLOR_SUCCESS);
-    kprintf("Stage E3 complete. The system is idle.\n");
+    kprintf("Stage E4 complete. The system is idle.\n");
     static const char marker[] = "TEST_OK boot complete\n";
     serial_write(marker, sizeof marker - 1);
     for (;;) thread_sleep_ms(1000);   /* kmain stays alive; the idle thread halts the CPU */

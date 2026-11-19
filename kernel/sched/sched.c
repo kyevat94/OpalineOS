@@ -12,7 +12,9 @@
  * go to a dead list: thread_join() frees a joinable thread, and the idle
  * thread frees detached ones.
  */
+#include <opaline/arch/cpu.h>
 #include <opaline/arch/gdt.h>
+#include <opaline/arch/syscall.h>
 #include <opaline/console.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
@@ -90,7 +92,15 @@ static void schedule(void) {
     next->state = THREAD_RUNNING;
     current = next;
     switches++;
-    if (next->stack_top) tss_set_kernel_stack(next->stack_top);
+    if (next->stack_top) {
+        tss_set_kernel_stack(next->stack_top);    /* interrupts from user mode land here */
+        cpu_set_syscall_stack(next->stack_top);   /* and so do system calls */
+    }
+    u64 page_table = next->process->page_table;
+    if (page_table && read_cr3() != page_table) write_cr3(page_table);
+    /* the kernel itself never touches FPU/SSE registers, so they only change here */
+    fxsave(old->fpu);
+    fxrstor(next->fpu);
     switch_context(&old->rsp, next->rsp);
 }
 
@@ -136,7 +146,16 @@ static void idle_main(void *arg) {
     }
 }
 
+/* FPU state of a new thread: x87 and SSE reset to their defaults (taken once in sched_init). */
+static u8 fpu_initial[512] ALIGNED(16);
+
 struct thread *thread_create(const char *name, thread_fn fn, void *arg) {
+    return thread_create_in(&kernel_process, name, fn, arg);
+}
+
+struct process *sched_kernel_process(void) { return &kernel_process; }
+
+struct thread *thread_create_in(struct process *p, const char *name, thread_fn fn, void *arg) {
     struct thread *t = kcalloc(1, sizeof *t);
     if (!t) return NULL;
     t->stack_top = vmm_alloc_stack(THREAD_STACK_PAGES);
@@ -145,8 +164,9 @@ struct thread *thread_create(const char *name, thread_fn fn, void *arg) {
         return NULL;
     }
     for (size_t i = 0; i < sizeof t->name - 1 && name[i]; i++) t->name[i] = name[i];
-    t->process = &kernel_process;
+    t->process = p;
     t->joinable = true;
+    memcpy(t->fpu, fpu_initial, sizeof t->fpu);
 
     /* initial frame, popped by switch_context: r15 r14 r13 r12 rbx rbp, then the return address */
     u64 *sp = (u64 *)t->stack_top;
@@ -163,7 +183,7 @@ struct thread *thread_create(const char *name, thread_fn fn, void *arg) {
     t->id = next_id++;
     t->all_next = all_threads;
     all_threads = t;
-    kernel_process.thread_count++;
+    p->thread_count++;
     ready_push(t);
     irq_restore(f);
     return t;
@@ -229,6 +249,13 @@ u64 sched_ticks(void) { return ticks; }
 u64 sched_context_switches(void) { return switches; }
 
 void sched_init(void) {
+    /* a clean FPU/SSE state for new threads: x87 reset, SSE exceptions masked (MXCSR 0x1F80) */
+    u32 mxcsr = 0x1F80;
+    __asm__ volatile("fninit\n\tldmxcsr %0" : : "m"(mxcsr));
+    fxsave(fpu_initial);
+
+    kernel_process.page_table = read_cr3();
+    kernel_process.main_thread = &boot_thread;
     memcpy(boot_thread.name, "kmain", 6);
     boot_thread.id = 0;
     boot_thread.state = THREAD_RUNNING;

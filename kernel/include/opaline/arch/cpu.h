@@ -53,8 +53,18 @@ static inline void write_cr4(u64 v) { __asm__ volatile("mov %0, %%cr4" : : "r"(v
 static inline void invlpg(u64 addr) { __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory"); }
 static inline void wbinvd(void) { __asm__ volatile("wbinvd" ::: "memory"); }
 
-#define MSR_EFER 0xC0000080
-#define MSR_PAT  0x00000277
+/* FPU/SSE state (512-byte, 16-byte aligned area) */
+static inline void fxsave(void *area) { __asm__ volatile("fxsave64 (%0)" : : "r"(area) : "memory"); }
+static inline void fxrstor(const void *area) { __asm__ volatile("fxrstor64 (%0)" : : "r"(area) : "memory"); }
+
+#define MSR_EFER           0xC0000080
+#define MSR_STAR           0xC0000081
+#define MSR_LSTAR          0xC0000082
+#define MSR_FMASK          0xC0000084
+#define MSR_GS_BASE        0xC0000101
+#define MSR_KERNEL_GS_BASE 0xC0000102
+#define MSR_PAT            0x00000277
+#define EFER_SCE (1ULL << 0)
 #define EFER_NXE (1ULL << 11)
 #define CR4_PGE  (1ULL << 7)
 

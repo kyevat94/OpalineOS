@@ -32,9 +32,14 @@ struct process {
     char name[32];
     u64 page_table;           /* physical address of the PML4 */
     u64 thread_count;
+    bool user;                /* has a user-mode address space */
+    struct thread *main_thread;
+    u64 user_entry;           /* where the main thread enters user mode */
+    u64 user_stack;           /* its initial user stack pointer */
 };
 
 struct thread {
+    u8 fpu[512] ALIGNED(16);  /* FPU/SSE registers (fxsave area), saved on every switch */
     u64 id;
     char name[32];
     enum thread_state state;
@@ -57,6 +62,9 @@ void sched_init(void);
 void sched_tick(void);
 
 struct thread *thread_create(const char *name, thread_fn fn, void *arg);   /* NULL if out of memory */
+/* Same, in another process (its address space is used while the thread runs). */
+struct thread *thread_create_in(struct process *p, const char *name, thread_fn fn, void *arg);
+struct process *sched_kernel_process(void);
 struct thread *thread_current(void);
 void thread_yield(void);
 void thread_sleep_ms(u64 ms);

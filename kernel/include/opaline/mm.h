@@ -62,6 +62,21 @@ u64 vmm_translate(u64 virt);                       /* physical address, or VMM_N
 void *vmm_map_mmio(u64 phys, size_t size);         /* uncached, inside the HHDM */
 u64 vmm_alloc_stack(size_t pages);                 /* kernel stack with a guard page; returns its top, 0 if no memory */
 void vmm_free_stack(u64 top, size_t pages);
+
+/* ---- process address spaces ---------------------------------------------
+ * A process address space is a PML4 (physical address) whose upper half is
+ * shared with the kernel and whose lower half (below USER_TOP) is private. */
+
+#define USER_TOP 0x0000800000000000ULL   /* first address that is not user space */
+
+u64 vmm_kernel_page_table(void);
+u64 vmm_create_address_space(void);                        /* 0 if out of memory */
+bool vmm_map_in(u64 page_table, u64 virt, u64 phys, u32 flags);
+u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte);  /* pte: raw entry, may be NULL */
+/* True if [addr, addr+len) is user memory mapped in `page_table` (and writable if `write`). */
+bool vmm_user_range_ok(u64 page_table, u64 addr, u64 len, bool write);
+/* Frees every user page and page table of the address space, then the PML4. */
+void vmm_destroy_address_space(u64 page_table);
 bool vmm_nx_enabled(void);
 
 /* ---- kernel heap ------------------------------------------------------ */

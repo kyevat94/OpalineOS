@@ -225,7 +225,7 @@ u64 vmm_alloc_stack(size_t pages) {
     for (size_t i = 0; i < pages; i++) {
         u64 phys = pmm_alloc_page();
         if (!phys) {
-            vmm_free_stack(bottom + pages * PAGE_SIZE, i);
+            vmm_free_stack(bottom + pages * PAGE_SIZE, pages);   /* frees the pages mapped so far */
             return 0;
         }
         vmm_map(bottom + i * PAGE_SIZE, phys, VMM_WRITE | VMM_GLOBAL);
@@ -270,4 +270,72 @@ void *vmm_map_mmio(u64 phys, size_t size) {
     }
     spin_unlock(&lock, f);
     return phys_to_virt(phys);
+}
+
+/* ---- process address spaces ---------------------------------------------- */
+
+u64 vmm_kernel_page_table(void) { return kernel_pml4_phys; }
+
+u64 vmm_create_address_space(void) {
+    u64 phys = pmm_alloc_page();
+    if (!phys) return 0;
+    u64 *pml4 = phys_to_virt(phys);
+    memset(pml4, 0, PAGE_SIZE / 2);
+    /* the kernel half points at the same (preallocated) tables in every address space */
+    for (unsigned i = 256; i < 512; i++) pml4[i] = kernel_pml4[i];
+    return phys;
+}
+
+bool vmm_map_in(u64 page_table, u64 virt, u64 phys, u32 flags) {
+    u64 f = spin_lock(&lock);
+    bool ok = map_4k(phys_to_virt(page_table), virt, phys, flags);
+    if (read_cr3() == page_table) invlpg(virt);
+    spin_unlock(&lock, f);
+    return ok;
+}
+
+u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte_out) {
+    u64 *pml4 = phys_to_virt(page_table);
+    u64 *pdpt = next_table(pml4, (virt >> 39) & 511, false, false);
+    u64 *pd = pdpt ? next_table(pdpt, (virt >> 30) & 511, false, false) : NULL;
+    u64 *pt = pd ? next_table(pd, (virt >> 21) & 511, false, false) : NULL;
+    u64 e = pt ? pt[(virt >> 12) & 511] : 0;
+    if (pte_out) *pte_out = e;
+    if (!(e & PTE_PRESENT)) return VMM_NOT_MAPPED;
+    return (e & PTE_ADDR) + (virt & (PAGE_SIZE - 1));
+}
+
+bool vmm_user_range_ok(u64 page_table, u64 addr, u64 len, bool write) {
+    if (len == 0) return addr < USER_TOP;
+    if (addr + len < addr || addr + len > USER_TOP) return false;
+    for (u64 page = ALIGN_DOWN(addr, PAGE_SIZE); page < addr + len; page += PAGE_SIZE) {
+        u64 pte;
+        if (vmm_translate_in(page_table, page, &pte) == VMM_NOT_MAPPED) return false;
+        if (!(pte & PTE_USER) || (write && !(pte & PTE_WRITE))) return false;
+    }
+    return true;
+}
+
+void vmm_destroy_address_space(u64 page_table) {
+    if (page_table == kernel_pml4_phys) panic("vmm: refusing to destroy the kernel address space");
+    if (read_cr3() == page_table) panic("vmm: destroying the active address space");
+    u64 *pml4 = phys_to_virt(page_table);
+    for (unsigned i = 0; i < 256; i++) {               /* user half only */
+        if (!(pml4[i] & PTE_PRESENT)) continue;
+        u64 *pdpt = phys_to_virt(pml4[i] & PTE_ADDR);
+        for (unsigned j = 0; j < 512; j++) {
+            if (!(pdpt[j] & PTE_PRESENT)) continue;
+            u64 *pd = phys_to_virt(pdpt[j] & PTE_ADDR);
+            for (unsigned k = 0; k < 512; k++) {
+                if (!(pd[k] & PTE_PRESENT)) continue;
+                u64 *pt = phys_to_virt(pd[k] & PTE_ADDR);
+                for (unsigned l = 0; l < 512; l++)
+                    if (pt[l] & PTE_PRESENT) pmm_free_page(pt[l] & PTE_ADDR);
+                pmm_free_page(pd[k] & PTE_ADDR);
+            }
+            pmm_free_page(pdpt[j] & PTE_ADDR);
+        }
+        pmm_free_page(pml4[i] & PTE_ADDR);
+    }
+    pmm_free_page(page_table);
 }

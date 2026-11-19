@@ -4,12 +4,12 @@ A light, fast and modern operating system with its own kernel, where **Python is
 the desktop and the apps are written in Python (official CPython) using `opaline-vitrum`, the
 system's GUI toolkit.
 
-> **Status:** stage **E3** — UEFI bootloader, 64-bit higher-half kernel, UTF-8 console,
-> exception diagnostics, physical page allocator, the kernel's own page tables (W^X, no-execute,
-> NULL unmapped), kernel heap, local APIC timer and a preemptive round-robin scheduler for kernel
-> threads (guard-paged stacks, spinlocks). Memory and scheduler self-tests run on every boot.
+> **Status:** stage **E4** — 64-bit higher-half kernel with its own memory management, a
+> preemptive scheduler and **user-mode processes**: static ELF64 programs in their own address
+> space, system calls with the Linux x86-64 numbering, and crashing programs stopped without
+> taking the system down. Self-tests for memory, scheduling and user space run on every boot.
 
-![Boot screen](docs/screenshots/e3-boot.png)
+![Boot screen](docs/screenshots/e4-boot.png)
 > The full plan is in [`project.md`](project.md) (in Portuguese) and the toolkit API in
 > [`opaline-vitrum.md`](opaline-vitrum.md).
 
