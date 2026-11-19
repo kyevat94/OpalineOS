@@ -24,16 +24,19 @@
 #include <opaline/arch/gdt.h>
 #include <opaline/arch/idt.h>
 #include <opaline/arch/syscall.h>
+#include <opaline/block.h>
 #include <opaline/console.h>
 #include <opaline/fb.h>
 #include <opaline/mm.h>
+#include <opaline/pci.h>
 #include <opaline/panic.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/serial.h>
 #include <opaline/string.h>
+#include <opaline/vfs.h>
 
-#define OPALINE_VERSION "0.4.0-e4"
+#define OPALINE_VERSION "0.5.0-e5"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",
@@ -52,6 +55,40 @@ static void log_memory_map(const struct boot_info *bi) {
 }
 
 static const u64 read_only_value = 0x0BADC0DE;
+
+/* GPT partition type of the OpalineOS root partition: 4f50414c-494e-4552-4f4f-542d45465333 (tools/efs3.py) */
+static const u8 root_partition_type[16] = {0x4C, 0x41, 0x50, 0x4F, 0x4E, 0x49, 0x52, 0x45,
+                                           0x4F, 0x4F, 0x54, 0x2D, 0x45, 0x46, 0x53, 0x33};
+
+static void mount_root_file_system(void) {
+    pci_scan();
+    if (ahci_init() == 0) panic("no SATA disk found (AHCI)");
+    struct block_device *disk = block_first_disk();
+    struct block_device *part = gpt_find_partition(disk, root_partition_type);
+    if (!part) panic("no OpalineOS root partition on %s", disk->name);
+    struct vnode *root;
+    int r = efs3_mount(part, &root);
+    if (r < 0) panic("cannot mount the root file system on %s (error %d)", part->name, r);
+    vfs_init();
+    vfs_mount_root(root);
+    vnode_put(root);
+    r = vfs_mount("/dev", devfs_init());
+    if (r < 0) panic("cannot mount /dev (error %d)", r);
+    u64 total, free_blocks;
+    char label[33];
+    efs3_info(root, &total, &free_blocks, label, sizeof label);
+    kprintf("Root file system: EFS3 \"%s\" on %s, %lu MiB, %lu MiB free; /dev mounted\n", label, part->name,
+            total * 4 / 1024, free_blocks * 4 / 1024);
+}
+
+/* Starts a program with no arguments and waits for it. Returns its exit code (or -errno). */
+static int run_program(const char *path) {
+    const char *argv[] = {path, NULL};
+    int err;
+    struct process *p = process_spawn_path(path, argv, NULL, &err);
+    if (!p) return err;
+    return process_wait(p);
+}
 
 static void timer_interrupt(struct interrupt_frame *f) {
     (void)f;
@@ -176,6 +213,11 @@ void kmain(struct boot_info *bi) {
     static const char sched_marker[] = "TEST_OK E3 scheduler\n";
     serial_write(sched_marker, sizeof sched_marker - 1);
 
+    /* storage, files and the terminal */
+    mount_root_file_system();
+    tty_init();
+    keyboard_init();
+
     /* user mode */
     syscall_init();
     kprintf("System calls ready (SYSCALL/SYSRET, Linux x86-64 numbering).\n");
@@ -183,11 +225,20 @@ void kmain(struct boot_info *bi) {
     static const char user_marker[] = "TEST_OK E4 userspace\n";
     serial_write(user_marker, sizeof user_marker - 1);
 
+    if (run_program("/apps/fstest") != 0) panic("file system self-test (/apps/fstest) failed");
+    static const char fs_marker[] = "TEST_OK E5 files\n";
+    serial_write(fs_marker, sizeof fs_marker - 1);
+
     run_self_test(bi->cmdline);
 
     console_set_color(COLOR_SUCCESS);
-    kprintf("Stage E4 complete. The system is idle.\n");
+    kprintf("Stage E5 complete.\n\n");
+    console_set_color(COLOR_TEXT);
     static const char marker[] = "TEST_OK boot complete\n";
     serial_write(marker, sizeof marker - 1);
-    for (;;) thread_sleep_ms(1000);   /* kmain stays alive; the idle thread halts the CPU */
+
+    /* the shell runs on the terminal; when it exits, a new one starts */
+    for (;;) {
+        if (run_program("/system/bin/sh") < 0) thread_sleep_ms(1000);
+    }
 }

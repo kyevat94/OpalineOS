@@ -24,6 +24,7 @@
 /* Sets up the screen part of the console. Without a font, only COM1 is used. */
 void console_init(const void *font, size_t font_size);
 bool console_has_screen(void);
+void console_get_size(u32 *cols, u32 *rows);   /* in characters */
 void console_clear(u32 background);
 void console_set_color(u32 fg);
 void console_write(const char *utf8, size_t n);

@@ -125,6 +125,7 @@ static void free_thread(struct thread *t) {
     all_remove(t);
     if (t->process) t->process->thread_count--;
     if (t->stack_top) vmm_free_stack(t->stack_top, THREAD_STACK_PAGES);
+    if (t->on_free) t->on_free(t);   /* may free t->process */
     kfree(t);
 }
 
@@ -273,4 +274,41 @@ void sched_init(void) {
     slice_left = TIME_SLICE_MS * TIMER_HZ / 1000;
     current = &boot_thread;
     irq_restore(f);
+}
+
+/* ---- wait queues and mutexes ---------------------------------------------- */
+
+void waitqueue_wait(struct waitqueue *wq) {
+    current->state = THREAD_BLOCKED;
+    current->next = wq->head;
+    wq->head = current;
+    schedule();
+}
+
+void waitqueue_wake_all(struct waitqueue *wq) {
+    u64 f = irq_save();
+    struct thread *t = wq->head;
+    wq->head = NULL;
+    while (t) {
+        struct thread *next = t->next;
+        if (t->state == THREAD_BLOCKED) ready_push(t);
+        t = next;
+    }
+    irq_restore(f);
+}
+
+void mutex_lock(struct mutex *m) {
+    u64 f = irq_save();
+    if (m->owner == current) panic("mutex_lock: \"%s\" already holds this mutex", current->name);
+    while (m->owner) waitqueue_wait(&m->waiters);
+    m->owner = current;
+    irq_restore(f);
+}
+
+void mutex_unlock(struct mutex *m) {
+    u64 f = irq_save();
+    if (m->owner != current) panic("mutex_unlock: \"%s\" does not hold this mutex", current->name);
+    m->owner = NULL;
+    irq_restore(f);
+    waitqueue_wake_all(&m->waiters);
 }

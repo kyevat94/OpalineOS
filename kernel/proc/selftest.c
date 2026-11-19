@@ -7,7 +7,9 @@
  *   3. three programs that crash (NULL access, privileged instruction, reading
  *      kernel memory) are stopped while the kernel keeps running;
  *   4. no memory is lost once every process ended.
+ * The programs are read from /apps on the root file system.
  */
+#include <opaline/block.h>
 #include <opaline/console.h>
 #include <opaline/mm.h>
 #include <opaline/proc.h>
@@ -20,15 +22,21 @@
         return false;                      \
     } while (0)
 
+/* Starts /apps/<name> from the root file system. */
 static struct process *spawn(const char *name) {
-    const struct embedded_program *prog = embedded_program_find(name);
-    if (!prog) return NULL;
-    return process_spawn(name, prog->start, (size_t)(prog->end - prog->start));
+    char path[64];
+    ksnprintf(path, sizeof path, "/apps/%s", name);
+    const char *argv[] = {path, NULL};
+    int err;
+    struct process *p = process_spawn_path(path, argv, NULL, &err);
+    if (!p) kprintf("  cannot start %s: error %d\n", path, err);
+    return p;
 }
 
 bool user_selftest(void) {
     struct pmm_stats before, after;
     pmm_get_stats(&before);
+    u64 cache_before = block_cache_pages();
 
     struct process *p = spawn("usertest");
     if (!p) FAIL("could not start usertest");
@@ -51,8 +59,10 @@ bool user_selftest(void) {
     pmm_get_stats(&after);
     struct heap_stats hs;
     heap_get_stats(&hs);
-    if (before.free_pages - after.free_pages > hs.slab_pages)
-        FAIL("pages lost: %lu free before, %lu after", before.free_pages, after.free_pages);
+    u64 cached = block_cache_pages() - cache_before;   /* the programs' files stay in the block cache */
+    if (before.free_pages - after.free_pages > hs.slab_pages + cached)
+        FAIL("pages lost: %lu free before, %lu after (%lu now in the block cache)", before.free_pages,
+             after.free_pages, cached);
 
     console_set_color(COLOR_TEXT);
     kprintf("User-space self-test passed: 6 processes, 3 crashes contained, no memory lost\n");

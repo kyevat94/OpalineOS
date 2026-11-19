@@ -1,0 +1,1 @@
+Olá! Este arquivo foi criado no build, num nome com acentos.

@@ -14,6 +14,14 @@ static inline u8 inb(u16 port) {
     return v;
 }
 
+static inline void outw(u16 port, u16 value) { __asm__ volatile("outw %0, %1" : : "a"(value), "Nd"(port)); }
+static inline void outl(u16 port, u32 value) { __asm__ volatile("outl %0, %1" : : "a"(value), "Nd"(port)); }
+static inline u32 inl(u16 port) {
+    u32 v;
+    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
 static inline void cpu_cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void cpu_sti(void) { __asm__ volatile("sti" ::: "memory"); }
 static inline void cpu_hlt(void) { __asm__ volatile("hlt" ::: "memory"); }

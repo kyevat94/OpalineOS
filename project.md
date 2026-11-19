@@ -384,7 +384,7 @@ parede espacial próprio.
 | **E2** ✅ | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E3** ✅ | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E4** ✅ | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
-| **E5** | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados |
+| **E5** ✅ | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E6** | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, blur, sombras, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela de vidro arrastável a 60 fps; digitar "ação, über, ñ" funciona |
@@ -568,6 +568,57 @@ OpalineOS/
   quanto tempo levou. Houve duas falhas intermitentes no VirtualBox logo após gravar muitas imagens;
   a causa provável (disco do host ocupado) não foi confirmada, mas não se repetiu em 10 execuções.
 
+### 10.1.5 Como a E5 funciona
+
+- **Disco**: varredura PCI pelas portas 0xCF8/0xCFC e driver **AHCI** (SATA), que funciona no `q35` do
+  QEMU, no VirtualBox e na maioria dos PCs. Versão simples: um comando por vez, conclusão por
+  *polling*, LBA48 com DMA. Camada de blocos de 4 KiB com **cache write-through** (256 blocos) e
+  leitura da **GPT** para achar a partição raiz (tipo `4f50414c-494e-4552-4f4f-542d45465333`).
+- **Imagem**: o disco agora tem a ESP (64 MiB) e a **partição raiz EFS3** (o resto, ~62 MiB). O
+  `build.py` monta `build/root/` com `rootfs/` (arquivos fixos do sistema) + os programas (`/apps/<nome>`,
+  o shell em `/system/bin/sh`) e o `mkimage.py` grava a partição e a relê para conferir.
+- **EFS3** (`kernel/fs/efs3.c`, formato documentado em `tools/efs3.py`): blocos de 4 KiB, inodes de
+  128 bytes com 12 ponteiros diretos + indireto + duplamente indireto (até ~4 GiB por arquivo),
+  bitmaps de blocos e inodes, diretórios com registros de tamanho variável. Criar, ler, gravar,
+  truncar, renomear (substituindo arquivos), apagar, `mkdir`/`rmdir`. Um arquivo apagado enquanto
+  aberto só some quando é fechado. Um *mutex* por sistema de arquivos; **sem journal** ainda (uma queda
+  de energia no meio de uma operação pode deixar inconsistências).
+- **Nomes UTF-8 em NFC**: o VFS valida o UTF-8 e compõe acentos (tabela gerada por
+  `tools/gen_nfc.py` com os dados Unicode do Python: latim, grego, cirílico). `ação` digitado com
+  acentos combinantes é o mesmo arquivo. O `efs3.py` também grava em NFC.
+- **VFS** (`kernel/fs/vfs.c`): vnodes com tabela de operações, resolução de caminhos (`.`, `..`,
+  barras repetidas), pontos de montagem (`/dev`), arquivos abertos compartilhados por `dup`.
+- **/dev** (devfs): `console` e `tty` (o terminal), `null`, `zero`.
+- **Pipes**: buffer circular de 4 KiB; leitura espera dados (fim de arquivo quando não há mais
+  escritores), escrita espera espaço (`-EPIPE` sem leitores).
+- **Terminal (TTY)**: modo canônico (eco, Backspace sabendo UTF-8, Enter entrega a linha, Ctrl+D =
+  fim de arquivo, Ctrl+C descarta a linha), `TIOCGWINSZ` com o tamanho do console.
+- **Teclado PS/2** (layout US), lido por uma thread a cada 10 ms. Interrupções pelo I/O APIC e os
+  layouts US-International/ABNT2 ficam para a E8; USB para a E13.
+- **Escalonador**: filas de espera (`waitqueue`) e `mutex` que bloqueia a thread (pode ser mantido
+  durante acesso a disco).
+- **Processos**: descritores de arquivo (0-2 = terminal), diretório atual, `argv` na pilha (ABI System
+  V), pai/filho, `wait4` com status no formato do Linux, órfãos liberados sozinhos.
+- **Syscalls novas** (numeração Linux): `read`, `open`, `openat` (só `AT_FDCWD`), `close`, `stat`,
+  `fstat`, `lstat`, `lseek`, `ioctl`, `readv`, `writev`, `pipe`, `pipe2`, `dup`, `dup2`, `wait4`, `fsync`,
+  `ftruncate`, `getcwd`, `chdir`, `rename`, `mkdir`, `rmdir`, `unlink`, `getdents64`, `getppid`; e a
+  primeira própria do OpalineOS, **`spawn(path, argv)` = 1000** (até existir `fork`/`execve` na E6).
+- **Shell** (`/system/bin/sh`): `ls [-l]`, `cat`, `echo`, `touch`, `mkdir`, `rmdir`, `rm`, `mv`, `cd`,
+  `pwd`, `help`, `exit`, redirecionamento `>`/`>>`, aspas; o resto roda programas de `/apps` e
+  `/system/bin`. O kernel inicia o shell no fim do boot e o reinicia se ele sair.
+- **Testes da E5**:
+  - `fstest` (todo boot, do ring 3): arquivo com acento criado no build, nomes NFD achando o arquivo
+    NFC, arquivo de 300 KiB (blocos indiretos), `lseek`, `ftruncate`, `O_APPEND`, `rename`, erros
+    (`ENOENT`, `EEXIST`, `ENOTEMPTY`, `EISDIR`, `ENOTDIR`, `ESPIPE`, `EPIPE`, `EBADF`), `/dev/null`,
+    `/dev/zero`, pipes, `dup2` desviando o stdout para arquivo, `spawn` + `wait4` (inclusive filho que
+    trava com sinal 11) e um contador em `/home/persist.txt`;
+  - `shell`: o QEMU **digita** comandos (`sendkey`) e o teste confere a saída;
+  - `persistence`: dois boots da mesma imagem; o segundo encontra o contador do primeiro; após cada
+    boot o disco é lido **no Windows** (`tools/efs3.py`) e passa por um **fsck** (bitmaps, contagem de
+    links, blocos duplicados). Verificado que o fsck **acusa** quando o kernel deixa de liberar blocos.
+- **`tools/efs3.py`**: `ls`, `cat`, `tree` e `check` (fsck) numa imagem de disco, direto do Windows.
+  No Git Bash, use `MSYS_NO_PATHCONV=1` antes do comando (senão `/home/...` vira um caminho do Windows).
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -619,6 +670,7 @@ OpalineOS/
 | 2026-11-19 | **E2 concluída**: bitmap de páginas físicas, tabelas de páginas próprias do kernel (W^X, NX, sem identidade, framebuffer WC), heap com slabs e detecção de liberação dupla, autoteste de memória em todo boot |
 | 2026-11-19 | **E3 concluída**: LAPIC + timer a 1000 Hz (PIC mascarado), threads do kernel com escalonador round-robin preemptivo (fatia de 10 ms), pilhas com página de guarda, spinlocks no pmm/heap/vmm/console, autoteste do escalonador |
 | 2026-11-19 | **E4 concluída**: processos com espaço de endereços próprio, carregador ELF64, SYSCALL/SYSRET com numeração Linux e verificação de ponteiros, FPU por thread, falhas de programas encerram só o processo. Biblioteca mínima de usuário (`user/lib`) sob LGPL-3.0-or-later |
+| 2026-11-19 | **E5 concluída**: PCI + AHCI, cache de blocos, GPT com partição raiz EFS3, VFS com nomes UTF-8 em NFC, devfs, pipes, TTY canônico, teclado PS/2, syscalls de arquivos com numeração Linux, `spawn` (1000) + `wait4`, shell mínimo. Programas agora vêm do disco (`/apps`, `/system/bin`) |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

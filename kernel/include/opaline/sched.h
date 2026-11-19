@@ -27,6 +27,11 @@ enum thread_state {
     THREAD_DEAD,
 };
 
+struct file;
+struct vnode;
+
+#define PROCESS_MAX_FDS 64
+
 struct process {
     u64 pid;
     char name[32];
@@ -36,6 +41,15 @@ struct process {
     struct thread *main_thread;
     u64 user_entry;           /* where the main thread enters user mode */
     u64 user_stack;           /* its initial user stack pointer */
+    /* files (stage E5) */
+    struct file *fds[PROCESS_MAX_FDS];
+    struct vnode *cwd;
+    char cwd_path[256];
+    /* family */
+    struct process *parent;   /* NULL: started by the kernel, or its parent ended */
+    bool orphan;              /* nobody will wait: freed when it ends */
+    int signal;               /* set when killed by a CPU exception (POSIX signal number) */
+    struct process *all_next;
 };
 
 struct thread {
@@ -50,6 +64,7 @@ struct thread {
     int exit_code;
     bool joinable;
     struct thread *joiner;    /* thread waiting in thread_join */
+    void (*on_free)(struct thread *t);   /* called just before the thread is freed */
     struct thread *next;      /* run queue / sleep list / dead list */
     struct thread *all_next;  /* list of every thread */
 };
@@ -71,6 +86,28 @@ void thread_sleep_ms(u64 ms);
 NORETURN void thread_exit(int code);
 int thread_join(struct thread *t);    /* waits for t to finish, frees it, returns its exit code */
 void thread_detach(struct thread *t); /* nobody will join: freed automatically when it exits */
+
+/*
+ * Wait queues: a thread blocks until another one wakes the queue.
+ * Pattern (interrupts must be disabled around the check and the wait):
+ *     u64 f = irq_save();
+ *     while (!condition) waitqueue_wait(&wq);
+ *     ...
+ *     irq_restore(f);
+ */
+struct waitqueue {
+    struct thread *head;
+};
+void waitqueue_wait(struct waitqueue *wq);      /* interrupts disabled */
+void waitqueue_wake_all(struct waitqueue *wq);
+
+/* Sleeping lock: the waiting thread blocks instead of spinning (may be held across disk I/O). */
+struct mutex {
+    struct thread *owner;
+    struct waitqueue waiters;
+};
+void mutex_lock(struct mutex *m);
+void mutex_unlock(struct mutex *m);
 
 u64 sched_ticks(void);                /* timer ticks since the timer started */
 static inline u64 time_ms(void) { return sched_ticks() * 1000 / TIMER_HZ; }

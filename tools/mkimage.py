@@ -1,27 +1,32 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The OpalineOS authors
-"""Builds the OpalineOS disk image: a GPT disk with an EFI System Partition (FAT32).
+"""Builds the OpalineOS disk image: a GPT disk with an EFI System Partition (FAT32)
+and the OpalineOS root partition (EFS3, see tools/efs3.py).
 
 Written from scratch (no mtools, no admin rights) so the build works on any
 machine with Python 3.
 
-    python tools/mkimage.py OUT.img --file EFI/BOOT/BOOTX64.EFI=build/BOOTX64.EFI [--file ...]
+    python tools/mkimage.py OUT.img --file EFI/BOOT/BOOTX64.EFI=build/BOOTX64.EFI [--file ...] [--root-dir DIR]
     python tools/mkimage.py OUT.img --verify     # re-reads an image and checks GPT + FAT32
 
 Layout (512-byte sectors):
     LBA 0             protective MBR
     LBA 1             GPT header
     LBA 2..33         GPT partition entries (128 x 128 bytes)
-    LBA 2048..        EFI System Partition, FAT32
-    ...               free space (future OpalineOS root partition)
+    LBA 2048..        EFI System Partition, FAT32 (64 MiB)
+    LBA 133120..      OpalineOS root partition, EFS3 (the rest of the disk)
     last 33 sectors   backup GPT entries + backup header
 """
 import argparse
 import datetime
+import os
 import struct
 import sys
 import uuid
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import efs3  # noqa: E402
 
 SECTOR = 512
 DISK_MB = 128
@@ -35,6 +40,8 @@ ESP_TYPE = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
 NS = uuid.UUID("6f70616c-696e-654f-5300-000000000000")      # namespace for reproducible GUIDs
 DISK_GUID = uuid.uuid5(NS, "disk")
 ESP_GUID = uuid.uuid5(NS, "esp")
+ROOT_GUID = uuid.uuid5(NS, "root")
+ROOT_START = ESP_START + ESP_MB * 1024 * 1024 // SECTOR   # 65 MiB, 1 MiB aligned
 
 # FAT32 parameters
 RESERVED_SECTORS = 32
@@ -210,7 +217,7 @@ def gpt_header(my_lba, alt_lba, first_usable, last_usable, entries_lba, entries_
     return pack(crc32(hdr)).ljust(SECTOR, b"\0")
 
 
-def build_image(files):
+def build_image(files, root_dir=None):
     total = DISK_MB * 1024 * 1024 // SECTOR
     esp_sectors = ESP_MB * 1024 * 1024 // SECTOR
     esp_last = ESP_START + esp_sectors - 1
@@ -223,6 +230,12 @@ def build_image(files):
     esp = fat.build()
 
     entries = gpt_entry(ESP_TYPE, ESP_GUID, ESP_START, esp_last, "EFI System Partition")
+    root_fs = None
+    if root_dir:
+        root_sectors = (last_usable + 1 - ROOT_START) // 8 * 8          # whole 4 KiB blocks
+        root_fs = efs3.make_fs(root_dir, root_sectors * SECTOR)
+        entries += gpt_entry(efs3.ROOT_TYPE_GUID, ROOT_GUID, ROOT_START, ROOT_START + root_sectors - 1,
+                             "OpalineOS")
     entries = entries.ljust(GPT_ENTRIES * GPT_ENTRY_SIZE, b"\0")
     entries_crc = crc32(entries)
 
@@ -242,6 +255,8 @@ def build_image(files):
                                            backup_entries_lba, entries_crc, total)
 
     img[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
+    if root_fs:
+        img[ROOT_START * SECTOR:ROOT_START * SECTOR + len(root_fs)] = root_fs
     return bytes(img)
 
 
@@ -322,10 +337,34 @@ def verify_image(img, expected):
     return errors
 
 
+def verify_root(image, root_dir):
+    """Reads every file of the root partition back and compares it with the source folder."""
+    import unicodedata
+    errors = []
+    try:
+        fs = efs3.Efs3.from_disk(image)
+    except ValueError as e:
+        return [str(e)]
+    for dirpath, _, names in os.walk(root_dir):
+        for name in names:
+            src = os.path.join(dirpath, name)
+            rel = "/" + os.path.relpath(src, root_dir).replace(os.sep, "/")
+            try:
+                data = fs.read(fs.lookup(unicodedata.normalize("NFC", rel)))
+            except FileNotFoundError:
+                errors.append(f"root partition: {rel} missing")
+                continue
+            with open(src, "rb") as f:
+                if f.read() != data:
+                    errors.append(f"root partition: {rel} differs")
+    return errors
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image")
     ap.add_argument("--file", action="append", default=[], metavar="ESP_PATH=LOCAL_FILE")
+    ap.add_argument("--root-dir", help="folder whose contents become the EFS3 root partition")
     ap.add_argument("--verify", action="store_true", help="only check an existing image")
     args = ap.parse_args()
 
@@ -339,11 +378,13 @@ def main():
         with open(args.image, "rb") as f:
             img = f.read()
     else:
-        img = build_image(files)
+        img = build_image(files, args.root_dir)
         with open(args.image, "wb") as f:
             f.write(img)
 
     errors = verify_image(img, files)
+    if args.root_dir and not args.verify:
+        errors += verify_root(args.image, args.root_dir)
     if errors:
         for e in errors:
             print("ERROR:", e, file=sys.stderr)

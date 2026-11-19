@@ -71,6 +71,11 @@ void console_init(const void *font_file, size_t size) {
 
 bool console_has_screen(void) { return con.screen; }
 
+void console_get_size(u32 *cols, u32 *rows) {
+    *cols = con.screen ? con.cols : 80;
+    *rows = con.screen ? con.rows : 25;
+}
+
 void console_clear(u32 background) {
     con.bg = background;
     con.col = con.row = 0;
@@ -98,6 +103,10 @@ static void draw_codepoint(u32 cp) {
     }
     if (cp == '\t') {
         do draw_codepoint(' '); while (con.col % TAB_WIDTH);
+        return;
+    }
+    if (cp == 0x08) {   /* backspace: one cell to the left (the terminal then draws a space over it) */
+        if (con.col > 0) con.col--;
         return;
     }
     if (cp < 0x20) return;

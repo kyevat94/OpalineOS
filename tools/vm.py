@@ -47,7 +47,9 @@ TESTS = [
       'Process "crashpriv"', "crashed: General protection fault (#GP)",
       'Process "crashkernel"', "address 0xffffffff80000000",
       "The process was stopped (exit code 139). The system continues.",
-      "User-space self-test passed", "TEST_OK E4 userspace", BOOT_OK],
+      "User-space self-test passed", "TEST_OK E4 userspace",
+      "Disk sata0:", "Root file system: EFS3", "persist:", "fstest: all checks passed", "TEST_OK E5 files",
+      BOOT_OK],
      ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
     ("stack-overflow", "qemu", "test=stackoverflow",
      ["PANIC: Double fault (#DF)", 'Thread: "overflow"', "Cause: kernel stack overflow", PANIC_END],
@@ -81,7 +83,7 @@ TESTS = [
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
       "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",
       "TEST_OK E3 scheduler", "usertest: all checks passed", "User-space self-test passed",
-      "TEST_OK E4 userspace", BOOT_OK],
+      "TEST_OK E4 userspace", "Disk sata0:", "fstest: all checks passed", "TEST_OK E5 files", BOOT_OK],
      ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
 ]
 DONE_MARKERS = [BOOT_OK, PANIC_END]
@@ -200,6 +202,127 @@ def screenshot(out, cmdline):
     print(f"OK: {out}" if os.path.isfile(out) else "ERROR: no screenshot written")
 
 
+class QemuSession:
+    """A headless QEMU with its monitor open: wait for serial output, type keys, take screenshots."""
+
+    # characters the tests type -> QEMU key names (US layout)
+    KEYS = {" ": "spc", "\n": "ret", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
+            '"': "shift-apostrophe", "_": "shift-minus", ":": "shift-semicolon", "=": "equal"}
+
+    def __init__(self, image, log_name="serial-session.log", port=45455):
+        self.log = os.path.join(BUILD, log_name)
+        self.port = port
+        self.proc = qemu_boot(image, self.log, extra=["-monitor", f"tcp:127.0.0.1:{port},server,nowait"])
+        self.sock = None
+
+    def text(self):
+        return read_log(self.log)
+
+    def wait_for(self, needle, timeout=60, start=0):
+        """Waits until `needle` appears in the serial output after position `start`."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            t = self.text()
+            if needle in t[start:]:
+                return True
+            if self.proc.poll() is not None:
+                return False
+            time.sleep(0.2)
+        return False
+
+    def monitor(self, command):
+        if not self.sock:
+            self.sock = socket.create_connection(("127.0.0.1", self.port))
+            time.sleep(0.3)
+        self.sock.sendall((command + "\n").encode())
+
+    def type(self, text):
+        for ch in text:
+            if ch.isalnum() and ch.isascii():
+                key = ("shift-" + ch.lower()) if ch.isupper() else ch
+            else:
+                key = self.KEYS[ch]
+            self.monitor(f"sendkey {key}")
+            time.sleep(0.05)
+
+    def screenshot(self, out):
+        self.monitor(f"screendump {os.path.abspath(out).replace(os.sep, '/')} -f png")
+        time.sleep(1.5)
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait()
+
+
+def shell_test():
+    """Types commands into the shell and checks what it prints (on a fresh disk, so earlier runs
+    cannot change the result)."""
+    path = os.path.join(BUILD, "shell.img")
+    build.make_image(path)
+    s = QemuSession(path)
+    try:
+        if not s.wait_for("opaline:/home$ ", timeout=TIMEOUT):
+            return False, s.text(), ["the shell prompt never appeared"]
+        steps = [
+            ("echo ola mundo > nota.txt\n", "opaline:/home$ "),
+            ("cat nota.txt\n", "ola mundo"),
+            ("mkdir pasta\n", "opaline:/home$ "),
+            ("ls -l\n", "pasta/"),
+            ("hello\n", "Hello from user space (3/3)"),
+            ("crashnull\n", "[crashnull was stopped by signal 11]"),
+            ("cd /apps\n", "opaline:/apps$ "),
+            ("ls\n", "fstest"),
+            ("cat /home/Documentos/nada\n", "ENOENT"),
+            ("nosuchcmd\n", "nosuchcmd: command not found"),
+        ]
+        problems = []
+        for keys, expect in steps:
+            mark = len(s.text())
+            s.type(keys)
+            if not s.wait_for(expect, timeout=30, start=mark):
+                problems.append(f"after typing {keys.strip()!r}: {expect!r} not printed")
+                break
+        s.wait_for("opaline:/apps$ ", timeout=10, start=len(s.text()) - 200)
+        s.screenshot(os.path.join(BUILD, "shell.png"))
+        return not problems, s.text(), problems
+    finally:
+        s.close()
+        os.remove(path)
+
+
+def persistence_test():
+    """Boots the same disk twice: the second boot must see what the first wrote. The disk is
+    also read on the host (tools/efs3.py) and checked for consistency after each boot."""
+    import efs3
+    path = os.path.join(BUILD, "persist.img")
+    build.make_image(path)   # a fresh disk
+    problems, log = [], ""
+    for boot, expect in ((1, "persist: first boot of this disk"), (2, "persist: found from a previous boot (boot 1)")):
+        s = QemuSession(path, log_name="serial-persist.log")
+        try:
+            ok = s.wait_for(BOOT_OK, timeout=TIMEOUT)
+            log = s.text()
+        finally:
+            s.close()
+        if not ok or expect not in log:
+            problems.append(f"boot {boot}: {expect!r} not printed")
+            break
+        fs = efs3.Efs3.from_disk(path)
+        counter = fs.read(fs.lookup("/home/persist.txt")).decode()
+        if counter != f"{boot}\n":
+            problems.append(f"boot {boot}: /home/persist.txt read on the host is {counter!r}, expected {boot!r}")
+        errors = fs.check()
+        problems += [f"boot {boot}: fsck: {e}" for e in errors[:5]]
+    os.remove(path)
+    return not problems, log, problems
+
+
+SESSION_TESTS = [("shell", "qemu", shell_test), ("persistence", "qemu", persistence_test)]
+
+
 # ---- VirtualBox ---------------------------------------------------------
 
 def vbox(*args, check=True):
@@ -284,6 +407,20 @@ def run_tests(target):
         if not ok:
             keep = os.path.join(BUILD, f"failed-{emu}-{name}.log")
             shutil.copyfile(log, keep) if os.path.isfile(log) else None
+            print(f"    serial log: {os.path.relpath(keep, ROOT)}")
+    for name, emu, fn in SESSION_TESTS:
+        if target not in ("all", emu):
+            continue
+        start = time.time()
+        ok, text, problems = fn()
+        failed += not ok
+        print(f"{'TEST_OK' if ok else 'TEST_FAILED'} {emu}/{name}  ({time.time() - start:.1f} s)", flush=True)
+        for p in problems:
+            print(f"    {p}")
+        if not ok:
+            keep = os.path.join(BUILD, f"failed-{emu}-{name}.log")
+            with open(keep, "w", encoding="utf-8") as f:
+                f.write(text)
             print(f"    serial log: {os.path.relpath(keep, ROOT)}")
     return failed
 
