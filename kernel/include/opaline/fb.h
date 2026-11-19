@@ -21,5 +21,7 @@ void fb_fill(u32 x, u32 y, u32 w, u32 h, u32 rgb);
 void fb_alpha_mask(u32 x, u32 y, u32 w, u32 h, const u8 *alpha, u32 fg, u32 bg);
 /* Moves a block of rows up by `dy` pixels (used for scrolling). */
 void fb_scroll_up(u32 y, u32 h, u32 dy);
+/* Inverts the colors of a rectangle (doing it twice restores it): the text cursor. */
+void fb_invert(u32 x, u32 y, u32 w, u32 h);
 
 #endif

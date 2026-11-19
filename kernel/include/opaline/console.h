@@ -25,9 +25,15 @@
 void console_init(const void *font, size_t font_size);
 bool console_has_screen(void);
 void console_get_size(u32 *cols, u32 *rows);   /* in characters */
+void console_get_cursor(u32 *col, u32 *row);   /* where the next character goes */
 void console_clear(u32 background);
 void console_set_color(u32 fg);
+/* Low level: the caller holds the console lock (kprintf and kputs take it themselves). */
 void console_write(const char *utf8, size_t n);
+u64 console_lock(void);
+void console_unlock(u64 flags);
+/* Starts the thread that blinks the cursor (needs the scheduler). */
+void console_start_cursor_blink(void);
 
 int kprintf(const char *fmt, ...) PRINTF(1, 2);
 void kputs(const char *s, size_t n);   /* raw text (UTF-8), as one locked write */

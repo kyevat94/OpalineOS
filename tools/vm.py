@@ -207,7 +207,8 @@ class QemuSession:
 
     # characters the tests type -> QEMU key names (US layout)
     KEYS = {" ": "spc", "\n": "ret", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
-            '"': "shift-apostrophe", "_": "shift-minus", ":": "shift-semicolon", "=": "equal"}
+            '"': "shift-apostrophe", "_": "shift-minus", ":": "shift-semicolon", "=": "equal",
+            "\t": "tab", "\b": "backspace"}
 
     def __init__(self, image, log_name="serial-session.log", port=45455):
         self.log = os.path.join(BUILD, log_name)
@@ -249,12 +250,46 @@ class QemuSession:
         self.monitor(f"screendump {os.path.abspath(out).replace(os.sep, '/')} -f png")
         time.sleep(1.5)
 
+    def pixels(self):
+        """The screen as (width, height, RGB bytes), through a PPM screendump (no image library needed)."""
+        path = os.path.join(BUILD, "screen.ppm")
+        if os.path.isfile(path):
+            os.remove(path)
+        self.monitor(f"screendump {os.path.abspath(path).replace(os.sep, '/')}")
+        for _ in range(50):
+            time.sleep(0.1)
+            if os.path.isfile(path) and os.path.getsize(path) > 100:
+                break
+        time.sleep(0.3)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.remove(path)
+        parts = data.split(b"\n", 3)          # "P6", "W H", "255", pixels
+        w, h = map(int, parts[1].split())
+        return w, h, parts[3]
+
     def close(self):
         if self.sock:
             self.sock.close()
         if self.proc.poll() is None:
             self.proc.kill()
         self.proc.wait()
+
+
+# console geometry (kernel/console.c, assets/fonts/console.fnt)
+CONSOLE_MARGIN, CELL_W, CELL_H = 16, 9, 18
+
+
+def same_cells(screen, row_a, row_b, cells):
+    """True if the first `cells` character cells of two console rows have identical pixels."""
+    w, _, px = screen
+    for dy in range(CELL_H):
+        ya, yb = CONSOLE_MARGIN + row_a * CELL_H + dy, CONSOLE_MARGIN + row_b * CELL_H + dy
+        xa = (ya * w + CONSOLE_MARGIN) * 3
+        xb = (yb * w + CONSOLE_MARGIN) * 3
+        if px[xa:xa + cells * CELL_W * 3] != px[xb:xb + cells * CELL_W * 3]:
+            return False
+    return True
 
 
 def shell_test():
@@ -266,9 +301,29 @@ def shell_test():
     try:
         if not s.wait_for("opaline:/home$ ", timeout=TIMEOUT):
             return False, s.text(), ["the shell prompt never appeared"]
+        problems = []
+        for keys, expect in [("echo ola mundo > nota.txt\n", "opaline:/home$ "), ("cat nota.txt\n", "ola mundo")]:
+            mark = len(s.text())
+            s.type(keys)
+            if not s.wait_for(expect, timeout=30, start=mark) or not s.wait_for("$ ", timeout=10, start=mark):
+                return False, s.text(), [f"after typing {keys.strip()!r}: {expect!r} not printed"]
+
+        # Tab then Backspace in the middle of a word must leave the screen exactly as if they were
+        # never typed: compare the line being edited with "cat nota.txt" typed plainly two lines up
+        # (the screen has scrolled, so the line being edited is the last one).
+        s.type("cat no\t\bta.txt")
+        time.sleep(0.8)
+        screen = s.pixels()
+        rows = (screen[1] - 2 * CONSOLE_MARGIN) // CELL_H
+        typed = len("opaline:/home$ cat nota.txt")
+        if not same_cells(screen, rows - 1, rows - 3, typed):
+            problems.append("after Tab + Backspace the edited line differs on screen from \"cat nota.txt\"")
+        mark = len(s.text())
+        s.type("\n")
+        if not s.wait_for("ola mundo", timeout=30, start=mark):
+            problems.append("the line edited with Tab + Backspace did not run \"cat nota.txt\"")
+
         steps = [
-            ("echo ola mundo > nota.txt\n", "opaline:/home$ "),
-            ("cat nota.txt\n", "ola mundo"),
             ("mkdir pasta\n", "opaline:/home$ "),
             ("ls -l\n", "pasta/"),
             ("hello\n", "Hello from user space (3/3)"),
@@ -278,7 +333,6 @@ def shell_test():
             ("cat /home/Documentos/nada\n", "ENOENT"),
             ("nosuchcmd\n", "nosuchcmd: command not found"),
         ]
-        problems = []
         for keys, expect in steps:
             mark = len(s.text())
             s.type(keys)

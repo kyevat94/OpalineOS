@@ -209,6 +209,7 @@ void kmain(struct boot_info *bi) {
     cpu_sti();
     kprintf("Timer: local APIC at %lu MHz, %d interrupts per second, %d ms time slice\n",
             timer_hz / 1000000, TIMER_HZ, TIME_SLICE_MS);
+    console_start_cursor_blink();
     if (!sched_selftest()) panic("scheduler self-test failed");
     static const char sched_marker[] = "TEST_OK E3 scheduler\n";
     serial_write(sched_marker, sizeof sched_marker - 1);

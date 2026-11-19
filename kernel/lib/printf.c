@@ -126,26 +126,21 @@ static void console_put(void *ctx, char c) {
     }
 }
 
-/* One kprintf at a time, so lines from different threads do not interleave.
-   Skipped during a panic: the panicking code may have been interrupted while holding it. */
-static spinlock_t console_lock = SPINLOCK_INIT;
-
+/* The whole kprintf holds the console lock, so its lines do not mix with other threads' output. */
 int kvprintf(const char *fmt, va_list ap) {
-    bool locked = !panic_in_progress();
-    u64 flags = locked ? spin_lock(&console_lock) : 0;
+    u64 flags = console_lock();
     struct console_sink s;
     s.n = 0;
     int n = format(console_put, &s, fmt, ap);
     if (s.n) console_write(s.buf, s.n);
-    if (locked) spin_unlock(&console_lock, flags);
+    console_unlock(flags);
     return n;
 }
 
 void kputs(const char *s, size_t n) {
-    bool locked = !panic_in_progress();
-    u64 flags = locked ? spin_lock(&console_lock) : 0;
+    u64 flags = console_lock();
     console_write(s, n);
-    if (locked) spin_unlock(&console_lock, flags);
+    console_unlock(flags);
 }
 
 int kprintf(const char *fmt, ...) {

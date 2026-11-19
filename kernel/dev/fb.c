@@ -52,3 +52,13 @@ void fb_scroll_up(u32 y, u32 h, u32 dy) {
     if (!fb.base || dy >= h) return;
     memmove(fb.base + (u64)y * fb.pitch, fb.base + (u64)(y + dy) * fb.pitch, (u64)(h - dy) * fb.pitch);
 }
+
+void fb_invert(u32 x, u32 y, u32 w, u32 h) {
+    if (!fb.base || x >= fb.width || y >= fb.height) return;
+    w = MIN(w, fb.width - x);
+    h = MIN(h, fb.height - y);
+    for (u32 row = 0; row < h; row++) {
+        u32 *p = (u32 *)(fb.base + (u64)(y + row) * fb.pitch) + x;
+        for (u32 i = 0; i < w; i++) p[i] ^= 0x00FFFFFF;
+    }
+}

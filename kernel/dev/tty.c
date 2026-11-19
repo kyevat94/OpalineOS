@@ -21,6 +21,7 @@
 
 static struct {
     char line[LINE_MAX];          /* line being edited */
+    u8 cells[LINE_MAX];           /* screen cells the echo of each byte took (a Tab takes up to 4) */
     u32 line_len;
     char ready[READY_MAX];        /* finished lines, waiting for read() */
     u32 ready_head, ready_len;
@@ -29,6 +30,31 @@ static struct {
 } tty;
 
 static void echo(const char *s, u32 n) { kputs(s, n); }
+
+/* Echoes one byte and returns how many screen cells the cursor moved. */
+static u8 echo_measured(char c) {
+    if (!console_has_screen()) {   /* serial only: no columns to measure */
+        echo(&c, 1);
+        return 1;
+    }
+    u32 cols, rows, c0, r0, c1, r1;
+    console_get_size(&cols, &rows);
+    u64 f = console_lock();
+    console_get_cursor(&c0, &r0);
+    console_write(&c, 1);
+    console_get_cursor(&c1, &r1);
+    console_unlock(f);
+    u64 before = (u64)r0 * cols + c0, after = (u64)r1 * cols + c1;
+    if (after < before) after += cols;   /* the screen scrolled up by one line */
+    return (u8)MIN(after - before, 255);
+}
+
+/* Erases `cells` screen cells before the cursor. */
+static void erase_cells(u32 cells) {
+    u64 f = console_lock();
+    for (u32 i = 0; i < cells; i++) console_write("\b \b", 3);
+    console_unlock(f);
+}
 
 static void push_ready(const char *s, u32 n) {
     for (u32 i = 0; i < n && tty.ready_len < READY_MAX; i++)
@@ -48,15 +74,17 @@ void tty_input(const char *s, u32 n) {
             wake = true;
             irq_restore(f);
             echo("\n", 1);
-        } else if (c == 0x08 || c == 0x7F) {   /* backspace: drop one whole UTF-8 character */
-            bool erased = false;
+        } else if (c == 0x08 || c == 0x7F) {
+            /* backspace: drop one whole UTF-8 character and erase exactly the cells its echo took,
+               so the screen always shows what the line really contains */
+            u32 cells = 0;
             while (tty.line_len > 0) {
                 u8 last = (u8)tty.line[--tty.line_len];
-                erased = true;
+                cells += tty.cells[tty.line_len];
                 if ((last & 0xC0) != 0x80) break;
             }
             irq_restore(f);
-            if (erased) echo("\b \b", 3);
+            erase_cells(cells);
         } else if (c == 0x04) {   /* Ctrl+D */
             if (tty.line_len == 0) tty.eof_pending++;
             else {
@@ -71,9 +99,10 @@ void tty_input(const char *s, u32 n) {
             echo("^C\n", 3);
         } else if ((u8)c >= 0x20 || c == '\t') {
             bool fits = tty.line_len < LINE_MAX - 1;
+            u32 at = tty.line_len;
             if (fits) tty.line[tty.line_len++] = c;
             irq_restore(f);
-            if (fits) echo(&c, 1);
+            if (fits) tty.cells[at] = echo_measured(c);
         } else {
             irq_restore(f);
         }
