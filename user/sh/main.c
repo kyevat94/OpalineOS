@@ -5,7 +5,10 @@
  * the terminal; the real Terminal app comes in stage E10.
  *
  * Built-in commands: help, ls [-l] [dir], cat FILE..., echo TEXT, mkdir DIR, rmdir DIR,
- * rm FILE, mv OLD NEW, touch FILE, cd [DIR], pwd, exit [CODE].
+ * rm FILE, mv OLD NEW, touch FILE, cd [DIR], pwd, poweroff, reboot, exit [CODE].
+ * Leaving the main shell (exit or Ctrl+D) turns the computer off: the kernel does that
+ * when the shell it started ends.
+ * Line editing (arrows, Home/End, Delete, history with Up/Down) is done by the terminal.
  * Anything else runs a program: a path, or a name looked up in /apps and /system/bin.
  * "> FILE" and ">> FILE" at the end of a line redirect the output. Arguments may be quoted.
  */
@@ -85,7 +88,10 @@ static void help(void) {
            "  mkdir DIR       make a directory       rmdir DIR      remove an empty directory\n"
            "  rm FILE         remove a file          mv OLD NEW     rename or move\n"
            "  cd [DIR]        change directory       pwd            show the directory\n"
+           "  poweroff        turn the computer off  reboot         restart the computer\n"
            "  help            this text              exit [CODE]    leave the shell\n"
+           "Leaving the main shell (exit or Ctrl+D) turns the computer off.\n"
+           "Arrows, Home/End and Delete edit the line; Up/Down bring back earlier lines.\n"
            "Anything else runs a program from /apps or /system/bin (try: hello, usertest).\n"
            "End a line with \"> FILE\" or \">> FILE\" to send the output to a file.\n");
 }
@@ -129,6 +135,8 @@ static int execute(int argc, char **argv) {
         printf("\n");
         return 0;
     }
+    if (!strcmp(c, "poweroff")) return simple(c, poweroff(), "");
+    if (!strcmp(c, "reboot")) return simple(c, reboot(), "");
     if (!strcmp(c, "pwd")) {
         char buf[256];
         if (getcwd(buf, sizeof buf) > 0) printf("%s\n", buf);

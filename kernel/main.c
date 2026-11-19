@@ -29,6 +29,7 @@
 #include <opaline/fb.h>
 #include <opaline/mm.h>
 #include <opaline/pci.h>
+#include <opaline/power.h>
 #include <opaline/panic.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
@@ -203,6 +204,7 @@ void kmain(struct boot_info *bi) {
     /* interrupts and scheduling */
     pic_disable();
     lapic_init();
+    acpi_init(bi->rsdp_phys);
     irq_set_handler(VECTOR_TIMER, timer_interrupt);
     sched_init();
     u64 timer_hz = lapic_timer_start(VECTOR_TIMER, TIMER_HZ);
@@ -238,8 +240,11 @@ void kmain(struct boot_info *bi) {
     static const char marker[] = "TEST_OK boot complete\n";
     serial_write(marker, sizeof marker - 1);
 
-    /* the shell runs on the terminal; when it exits, a new one starts */
-    for (;;) {
-        if (run_program("/system/bin/sh") < 0) thread_sleep_ms(1000);
+    /* the shell runs on the terminal; leaving it ("exit", Ctrl+D) turns the computer off */
+    int r;
+    while ((r = run_program("/system/bin/sh")) < 0) {
+        kprintf("Cannot start /system/bin/sh (error %d), trying again\n", r);
+        thread_sleep_ms(1000);
     }
+    system_poweroff();
 }

@@ -38,6 +38,7 @@
 #define SYS_mkdir         83
 #define SYS_rmdir         84
 #define SYS_unlink        87
+#define SYS_reboot       169
 #define SYS_gettid       186
 #define SYS_getdents64   217
 #define SYS_clock_gettime 228
@@ -164,6 +165,9 @@ static inline long clock_gettime(int clock, struct timespec *tp) { return syscal
 static inline long spawn(const char *path, char *const argv[]) {
     return syscall2(SYS_opaline_spawn, (long)path, (long)argv);
 }
+/* Linux reboot(): turns the computer off or restarts it (does not return on success). */
+static inline long poweroff(void) { return syscall3(SYS_reboot, 0xFEE1DEAD, 672274793, 0x4321FEDC); }
+static inline long reboot(void) { return syscall3(SYS_reboot, 0xFEE1DEAD, 672274793, 0x01234567); }
 static inline long wait4(long pid, int *status, int options) {
     return syscall4(SYS_wait4, pid, (long)status, options, 0);
 }

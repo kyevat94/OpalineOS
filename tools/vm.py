@@ -83,8 +83,9 @@ TESTS = [
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
       "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",
       "TEST_OK E3 scheduler", "usertest: all checks passed", "User-space self-test passed",
-      "TEST_OK E4 userspace", "Disk sata0:", "fstest: all checks passed", "TEST_OK E5 files", BOOT_OK],
-     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
+      "TEST_OK E4 userspace", "Disk sata0:", "fstest: all checks passed", "TEST_OK E5 files", BOOT_OK,
+      "ACPI: power off via PM1a control port", "Shutting down..."],
+     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen", "the VM did not power off"]),
 ]
 DONE_MARKERS = [BOOT_OK, PANIC_END]
 
@@ -238,11 +239,20 @@ class QemuSession:
         self.sock.sendall((command + "\n").encode())
 
     def type(self, text):
-        for ch in text:
-            if ch.isalnum() and ch.isascii():
-                key = ("shift-" + ch.lower()) if ch.isupper() else ch
+        """Types text; "<name>" sends a special key by its QEMU name (<left>, <home>, <delete>...)."""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "<" and ">" in text[i:]:
+                end = text.index(">", i)
+                key = text[i + 1:end]
+                i = end + 1
             else:
-                key = self.KEYS[ch]
+                i += 1
+                if ch.isalnum() and ch.isascii():
+                    key = ("shift-" + ch.lower()) if ch.isupper() else ch
+                else:
+                    key = self.KEYS[ch]
             self.monitor(f"sendkey {key}")
             time.sleep(0.05)
 
@@ -308,20 +318,30 @@ def shell_test():
             if not s.wait_for(expect, timeout=30, start=mark) or not s.wait_for("$ ", timeout=10, start=mark):
                 return False, s.text(), [f"after typing {keys.strip()!r}: {expect!r} not printed"]
 
-        # Tab then Backspace in the middle of a word must leave the screen exactly as if they were
-        # never typed: compare the line being edited with "cat nota.txt" typed plainly two lines up
-        # (the screen has scrolled, so the line being edited is the last one).
-        s.type("cat no\t\bta.txt")
-        time.sleep(0.8)
-        screen = s.pixels()
-        rows = (screen[1] - 2 * CONSOLE_MARGIN) // CELL_H
+        # Line editing: each sequence below must leave the line looking exactly like "cat nota.txt"
+        # typed plainly (compared pixel by pixel with the same command two lines up: the screen
+        # has scrolled, so the line being edited is the last one) and must then run that command.
+        # <end> first moves the cursor out of the compared cells.
+        edits = [
+            ("Tab then Backspace in the middle of a word", "cat no\t\bta.txt"),
+            ("Left arrows then Backspace", "cat notaa.txt<left><left><left><left>\b<end>"),
+            ("Home then typing at the start", "at nota.txt<home>c<end>"),
+            ("Left then Delete", "cat nota.txtZ<left><delete>"),
+            ("Up arrow (history)", "<up>"),
+            ("Tab in the middle, Left, Right and Delete", "cat nota<left><left>\t<left><right><left><delete><end>.txt"),
+        ]
         typed = len("opaline:/home$ cat nota.txt")
-        if not same_cells(screen, rows - 1, rows - 3, typed):
-            problems.append("after Tab + Backspace the edited line differs on screen from \"cat nota.txt\"")
-        mark = len(s.text())
-        s.type("\n")
-        if not s.wait_for("ola mundo", timeout=30, start=mark):
-            problems.append("the line edited with Tab + Backspace did not run \"cat nota.txt\"")
+        for what, keys in edits:
+            s.type(keys)
+            time.sleep(0.8)
+            screen = s.pixels()
+            rows = (screen[1] - 2 * CONSOLE_MARGIN) // CELL_H
+            if not same_cells(screen, rows - 1, rows - 3, typed):
+                problems.append(f"{what}: the edited line differs on screen from \"cat nota.txt\"")
+            mark = len(s.text())
+            s.type("\n")
+            if not s.wait_for("ola mundo", timeout=30, start=mark) or not s.wait_for("$ ", timeout=10, start=mark):
+                problems.append(f"{what}: the edited line did not run \"cat nota.txt\"")
 
         steps = [
             ("mkdir pasta\n", "opaline:/home$ "),
@@ -341,6 +361,16 @@ def shell_test():
                 break
         s.wait_for("opaline:/apps$ ", timeout=10, start=len(s.text()) - 200)
         s.screenshot(os.path.join(BUILD, "shell.png"))
+
+        # leaving the main shell turns the computer off (ACPI): QEMU must exit by itself
+        s.type("exit\n")
+        deadline = time.time() + 20
+        while s.proc.poll() is None and time.time() < deadline:
+            time.sleep(0.2)
+        if "Shutting down..." not in s.text():
+            problems.append("\"exit\" did not print \"Shutting down...\"")
+        if s.proc.poll() is None:
+            problems.append("\"exit\" did not power the machine off (QEMU still running)")
         return not problems, s.text(), problems
     finally:
         s.close()
@@ -431,7 +461,22 @@ def vbox_test(cmdline):
         os.remove(log)
     vbox("startvm", VM_NAME, "--type", "headless")
     try:
-        return wait_for_done(log, vbox_running), log
+        text = wait_for_done(log, vbox_running)
+        if BOOT_OK not in text:
+            return text, log
+        # type "exit" + Enter into the shell: the VM must power itself off (ACPI)
+        deadline = time.time() + 30
+        while "opaline:/home$ " not in read_log(log) and time.time() < deadline:
+            time.sleep(0.25)
+        vbox("controlvm", VM_NAME, "keyboardputstring", "exit", check=False)
+        vbox("controlvm", VM_NAME, "keyboardputscancode", "1c", "9c", check=False)   # Enter
+        deadline = time.time() + 30
+        while vbox_running() and time.time() < deadline:
+            time.sleep(0.5)
+        text = read_log(log)
+        if vbox_running():
+            text += "\n[vm.py: the VM did not power off]\n"
+        return text, log
     finally:
         if vbox_running():
             vbox("controlvm", VM_NAME, "poweroff", check=False)

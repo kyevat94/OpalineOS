@@ -18,13 +18,13 @@
 
 /* scan code -> character, without and with Shift (0 = no character) */
 static const char normal[128] = {
-    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x08, '\t',
+    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x08, '\t',
     'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
     'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
     'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ',
 };
 static const char shifted[128] = {
-    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0x08, '\t',
+    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0x08, '\t',
     'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0, 'A', 'S',
     'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|', 'Z', 'X', 'C', 'V',
     'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ',
@@ -59,9 +59,19 @@ static void handle(u8 sc) {
         caps = !caps;
         return;
     }
-    if (was_extended) {
-        if (code == 0x1C) tty_input("\n", 1);   /* keypad Enter */
-        return;                                 /* arrows etc.: not used yet */
+    if (was_extended) {   /* the gray keys: sent as the ANSI escape sequences terminals use */
+        switch (code) {
+        case 0x1C: tty_input("\n", 1); break;          /* keypad Enter */
+        case 0x48: tty_input("\x1b[A", 3); break;      /* Up */
+        case 0x50: tty_input("\x1b[B", 3); break;      /* Down */
+        case 0x4D: tty_input("\x1b[C", 3); break;      /* Right */
+        case 0x4B: tty_input("\x1b[D", 3); break;      /* Left */
+        case 0x47: tty_input("\x1b[H", 3); break;      /* Home */
+        case 0x4F: tty_input("\x1b[F", 3); break;      /* End */
+        case 0x53: tty_input("\x1b[3~", 4); break;     /* Delete */
+        default: break;
+        }
+        return;
     }
     char c = (shift ? shifted : normal)[code];
     if (!c) return;

@@ -12,6 +12,7 @@
 #include <opaline/console.h>
 #include <opaline/errno.h>
 #include <opaline/mm.h>
+#include <opaline/power.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/string.h>
@@ -45,6 +46,7 @@
 #define SYS_rmdir         84
 #define SYS_unlink        87
 #define SYS_getppid      110
+#define SYS_reboot       169
 #define SYS_gettid       186
 #define SYS_getdents64   217
 #define SYS_clock_gettime 228
@@ -442,6 +444,15 @@ static i64 sys_wait4(i64 pid, u64 status_addr, u64 options) {
     return r;
 }
 
+/* reboot(magic1, magic2, cmd): the Linux interface. Any process may call it for now (there are
+   no users yet); stage E15 restricts it to administrators. */
+static i64 sys_reboot(u64 magic1, u64 magic2, u64 cmd) {
+    if ((u32)magic1 != 0xFEE1DEAD || (u32)magic2 != 672274793) return -EINVAL;
+    if ((u32)cmd == 0x4321FEDC) system_poweroff();   /* LINUX_REBOOT_CMD_POWER_OFF */
+    if ((u32)cmd == 0x01234567) system_reboot();     /* LINUX_REBOOT_CMD_RESTART */
+    return -EINVAL;
+}
+
 /* ---- time and processes ------------------------------------------------------------- */
 
 static i64 sys_nanosleep(u64 req, u64 rem) {
@@ -496,6 +507,7 @@ void syscall_dispatch(struct syscall_frame *f) {
     case SYS_sched_yield:   thread_yield(); r = 0; break;
     case SYS_nanosleep:     r = sys_nanosleep(a, b); break;
     case SYS_getpid:        r = (i64)self()->pid; break;
+    case SYS_reboot:        r = sys_reboot(a, b, c); break;
     case SYS_getppid:       r = self()->parent ? (i64)self()->parent->pid : 0; break;
     case SYS_gettid:        r = (i64)thread_current()->id; break;
     case SYS_clock_gettime: r = sys_clock_gettime(a, b); break;

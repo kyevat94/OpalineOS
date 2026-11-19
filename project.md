@@ -619,6 +619,28 @@ OpalineOS/
 - **`tools/efs3.py`**: `ls`, `cat`, `tree` e `check` (fsck) numa imagem de disco, direto do Windows.
   No Git Bash, use `MSYS_NO_PATHCONV=1` antes do comando (senão `/home/...` vira um caminho do Windows).
 
+### 10.1.6 Terminal e energia (depois da E5)
+
+- **Edição de linha no terminal** (`kernel/dev/tty.c`): cursor em bloco piscante; setas ←/→,
+  Home/End, Backspace e Delete em qualquer ponto da linha; inserir no meio do texto; histórico das
+  últimas 16 linhas com ↑/↓. As teclas especiais chegam como sequências ANSI (`ESC [ D`...), as mesmas
+  de um emulador de terminal, prontas para o app Terminal (E10).
+- **A tela sempre mostra o que a linha contém**: o terminal registra quantas células cada byte ocupou
+  ao ser ecoado (um Tab ocupa de 1 a 4) e redesenha o resto da linha a cada mudança no meio. Corrigiu
+  um bug em que Tab + Backspace desalinhava a tela e o comando executado era diferente do visível.
+- **Desligar e reiniciar por ACPI** (`kernel/dev/acpi.c`): RSDP → XSDT → FADT (portas PM1a/PM1b,
+  registrador de reset) e o pacote `\_S5` do DSDT. QEMU usa a porta 0x604 com S5 = 0; o VirtualBox, a
+  porta 0xB004 com S5 = 5 — os dois desligam pelas tabelas, sem depender das portas de reserva.
+  Antes de desligar, o cache do disco é descarregado (`FLUSH CACHE`).
+- **Syscall `reboot` (169)** com os números mágicos do Linux; o shell tem `poweroff` e `reboot`. **Sair
+  do shell principal (`exit` ou Ctrl+D) desliga o computador**; um `sh` aberto dentro de outro só volta
+  ao anterior. Qualquer processo pode desligar por enquanto (não há usuários); a E15 restringe.
+- **Testes**: o teste do shell faz seis edições (Tab+Backspace, setas+Backspace, Home+digitar,
+  Delete, ↑ do histórico, Tab no meio + setas + Delete) e compara a linha pixel a pixel com o mesmo
+  comando digitado direto; no fim digita `exit` e exige que o QEMU desligue sozinho. O teste do
+  VirtualBox também digita `exit` e exige que a VM desligue. Verificado que o teste de edição falha com
+  o `tty.c` anterior.
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
