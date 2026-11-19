@@ -16,6 +16,7 @@
  */
 #include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/spinlock.h>
 #include <opaline/string.h>
 
 #define SLAB_MAGIC   0x534C4142u   /* "SLAB" */
@@ -91,7 +92,7 @@ static struct slab *new_slab(unsigned c) {
     return s;
 }
 
-void *kmalloc(size_t size) {
+static void *kmalloc_unlocked(size_t size) {
     if (size == 0) size = 1;
     if (size <= MAX_SMALL) {
         unsigned c = class_for(size);
@@ -131,7 +132,7 @@ size_t ksize(const void *ptr) {
     panic("ksize: %p was not allocated by kmalloc", ptr);
 }
 
-void kfree(void *ptr) {
+static void kfree_unlocked(void *ptr) {
     if (!ptr) return;
     u64 page = ALIGN_DOWN((u64)ptr, PAGE_SIZE);
     if ((u64)ptr < HHDM_BASE || page == (u64)ptr) panic("kfree: invalid pointer %p", ptr);
@@ -188,4 +189,24 @@ void *krealloc(void *ptr, size_t size) {
     return n;
 }
 
-void heap_get_stats(struct heap_stats *out) { *out = stats; }
+
+static spinlock_t lock = SPINLOCK_INIT;
+
+void *kmalloc(size_t size) {
+    u64 flags = spin_lock(&lock);
+    void *p = kmalloc_unlocked(size);
+    spin_unlock(&lock, flags);
+    return p;
+}
+
+void kfree(void *ptr) {
+    u64 flags = spin_lock(&lock);
+    kfree_unlocked(ptr);
+    spin_unlock(&lock, flags);
+}
+
+void heap_get_stats(struct heap_stats *out) {
+    u64 flags = spin_lock(&lock);
+    *out = stats;
+    spin_unlock(&lock, flags);
+}

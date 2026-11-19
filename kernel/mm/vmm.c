@@ -16,7 +16,10 @@
 #include <opaline/console.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/spinlock.h>
 #include <opaline/string.h>
+
+static spinlock_t lock = SPINLOCK_INIT;
 
 #define PTE_PRESENT  (1ULL << 0)
 #define PTE_WRITE    (1ULL << 1)
@@ -191,15 +194,53 @@ static u64 *find_pte(u64 virt) {
 
 bool vmm_map(u64 virt, u64 phys, u32 flags) {
     if ((virt | phys) % PAGE_SIZE) panic("vmm_map: unaligned %p -> %p", (void *)virt, (void *)phys);
+    u64 f = spin_lock(&lock);
     bool ok = map_4k(kernel_pml4, virt, phys, flags);
     invlpg(virt);
+    spin_unlock(&lock, f);
     return ok;
 }
 
 void vmm_unmap(u64 virt) {
+    u64 f = spin_lock(&lock);
     u64 *pte = find_pte(virt);
     if (pte) *pte = 0;
     invlpg(virt);
+    spin_unlock(&lock, f);
+}
+
+/*
+ * Kernel stacks live in their own region, each below an unmapped guard page:
+ * running off the end of a stack faults (and becomes a double fault, which has
+ * its own IST stack) instead of silently corrupting memory.
+ */
+#define STACK_REGION_BASE 0xFFFFB00000000000ULL
+static u64 stack_region_next = STACK_REGION_BASE;
+
+u64 vmm_alloc_stack(size_t pages) {
+    u64 f = spin_lock(&lock);
+    u64 bottom = stack_region_next + PAGE_SIZE;           /* skip the guard page */
+    stack_region_next = bottom + pages * PAGE_SIZE;
+    spin_unlock(&lock, f);
+    for (size_t i = 0; i < pages; i++) {
+        u64 phys = pmm_alloc_page();
+        if (!phys) {
+            vmm_free_stack(bottom + pages * PAGE_SIZE, i);
+            return 0;
+        }
+        vmm_map(bottom + i * PAGE_SIZE, phys, VMM_WRITE | VMM_GLOBAL);
+    }
+    return bottom + pages * PAGE_SIZE;                     /* the stack grows down from here */
+}
+
+void vmm_free_stack(u64 top, size_t pages) {
+    for (size_t i = 1; i <= pages; i++) {
+        u64 va = top - i * PAGE_SIZE;
+        u64 phys = vmm_translate(va);
+        if (phys == VMM_NOT_MAPPED) continue;
+        vmm_unmap(va);
+        pmm_free_page(phys);
+    }
 }
 
 u64 vmm_translate(u64 virt) {
@@ -221,10 +262,12 @@ u64 vmm_translate(u64 virt) {
 
 void *vmm_map_mmio(u64 phys, size_t size) {
     u64 b = ALIGN_DOWN(phys, PAGE_SIZE), e = ALIGN_UP(phys + size, PAGE_SIZE);
+    u64 f = spin_lock(&lock);
     for (u64 p = b; p < e; p += PAGE_SIZE) {
         if (vmm_translate(HHDM_BASE + p) != VMM_NOT_MAPPED) continue;   /* already in the HHDM */
         map_4k(kernel_pml4, HHDM_BASE + p, p, VMM_WRITE | VMM_GLOBAL | VMM_UC);
         invlpg(HHDM_BASE + p);
     }
+    spin_unlock(&lock, f);
     return phys_to_virt(phys);
 }

@@ -38,8 +38,16 @@ PANIC_END = "The system has stopped."
 TESTS = [
     ("boot", "qemu", None,
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Breakpoint (#BP)", "no-execute on",
-      "Memory self-test passed", "TEST_OK E2 memory", BOOT_OK],
-     ["PANIC", "FAILED"]),
+      "Memory self-test passed", "TEST_OK E2 memory",
+      "Timer: local APIC", "Threads A and B alternating without yielding: ABAB",
+      "Scheduler self-test passed", "TEST_OK E3 scheduler", BOOT_OK],
+     ["PANIC", "FAILED", "unexpected interrupt"]),
+    ("stack-overflow", "qemu", "test=stackoverflow",
+     ["PANIC: Double fault (#DF)", 'Thread: "overflow"', "Cause: kernel stack overflow", PANIC_END],
+     [BOOT_OK]),
+    ("thread-fault", "qemu", "test=threadfault",
+     ["PANIC: Page fault (#PF)", 'Thread: "faulty"', "CR2=0x0000000000000000", PANIC_END],
+     [BOOT_OK]),
     ("page-fault", "qemu", "test=pagefault",
      ["PANIC: Page fault (#PF)", "CR2=0xffffc00000000000", "not-present page on read in kernel mode",
       "Stack trace:", PANIC_END],
@@ -63,8 +71,10 @@ TESTS = [
      ["PANIC: Divide error (#DE)", PANIC_END],
      [BOOT_OK]),
     ("boot", "vbox", None,
-     ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory", BOOT_OK],
-     ["PANIC", "FAILED"]),
+     ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
+      "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",
+      "TEST_OK E3 scheduler", BOOT_OK],
+     ["PANIC", "FAILED", "unexpected interrupt"]),
 ]
 DONE_MARKERS = [BOOT_OK, PANIC_END]
 

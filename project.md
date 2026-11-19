@@ -382,7 +382,7 @@ parede espacial próprio.
 | **E0** ✅ | Toolchain e build: clang/lld/NASM, script de build, imagem de disco GPT/FAT32, QEMU+OVMF | `build` gera a imagem e o QEMU chega ao bootloader. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
 | **E1** ✅ | Bootloader UEFI, kernel 64 bits, GOP, serial, console de texto no framebuffer, GDT/IDT, exceções | "Hello" na tela e no log serial (UTF-8); exceção mostra um diagnóstico. **Concluída em 2026-11-17** (QEMU e VirtualBox) |
 | **E2** ✅ | Memória: alocador físico, paginação, heap do kernel | teste de estresse de alocação passa. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
-| **E3** | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando |
+| **E3** ✅ | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E4** | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel |
 | **E5** | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados |
 | **E6** | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam |
@@ -500,6 +500,36 @@ OpalineOS/
   (`test=nx`) e liberação dupla (`test=doublefree`). Verificado também que o teste de boot **falha**
   se o heap for sabotado (o autoteste acusa o bloco corrompido).
 
+### 10.1.3 Como a E3 funciona
+
+- **Interrupções**: a IDT agora tem os 256 vetores (`isr.asm` gera um *stub* para cada um). O PIC 8259
+  antigo é remapeado para 0x30-0x3F e totalmente mascarado; tudo passa pelo **LAPIC** (vetor 0x20 =
+  timer, 0xFF = espúrio). Drivers registram tratadores com `irq_set_handler`.
+- **Timer**: o timer do LAPIC é medido contra o PIT (canal 2, 10 ms, menor de 3 medições) e roda em
+  modo periódico a **1000 Hz**. `time_ms()` conta a partir daí.
+- **Processos e threads** (`kernel/sched/`): `struct process` (pid, tabela de páginas) e
+  `struct thread` (estado, pilha, processo). Por enquanto só existe o processo do kernel (pid 0); a E4
+  cria processos de usuário com espaço de endereços próprio.
+- **Escalonador**: *round-robin* preemptivo com fatia de **10 ms**. A troca de contexto
+  (`switch.asm`) salva só os registradores *callee-saved*; a troca pode acontecer dentro da
+  interrupção do timer (a thread volta pelo mesmo caminho quando for escolhida de novo). A thread
+  `idle` executa `hlt` quando não há nada pronto e libera threads destacadas que terminaram.
+- **API**: `thread_create`, `thread_yield`, `thread_sleep_ms`, `thread_exit`, `thread_join` (devolve o
+  código de saída e libera a thread), `thread_detach`.
+- **Pilhas de thread**: 16 KiB numa região própria (`0xFFFFB00000000000`), cada uma abaixo de uma
+  **página de guarda** sem mapeamento. Estourar a pilha vira *double fault*, que tem pilha IST própria;
+  a tela de pânico diz "kernel stack overflow" e o nome da thread.
+- **Travas**: `spinlock_t` com `spin_lock`/`spin_unlock`, que também desligam as interrupções.
+  Protegem o alocador de páginas, o heap, as tabelas de páginas e o console (`kprintf` inteiro, para
+  linhas de threads diferentes não se misturarem). Durante um pânico a trava do console é ignorada.
+- **Autoteste do escalonador** (todo boot): duas threads que **nunca cedem a vez** precisam alternar
+  (só o timer pode trocá-las: ~30 alternâncias em 300 ms); `thread_sleep_ms(50)` precisa levar 50-80 ms;
+  32 threads somam 32.000 num contador com trava; o código de saída chega ao `thread_join`; no fim,
+  nenhuma página pode ter vazado. Verificado que o teste **falha** se a preempção for desligada.
+- **Testes da E3**: `test=stackoverflow` (recursão até a página de guarda → *double fault* com
+  "kernel stack overflow") e `test=threadfault` (NULL dentro de uma thread → o pânico mostra o nome da
+  thread).
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -549,6 +579,7 @@ OpalineOS/
 | 2026-11-17 | Licenças: sistema **GPL-3.0-or-later**, bibliotecas para apps **LGPL-3.0-or-later**. Arquivos `COPYING`, `COPYING.LESSER`, `LICENSING.md`; cabeçalho SPDX em cada arquivo-fonte, com copyright "The OpalineOS authors". Repositório git iniciado |
 | 2026-11-17 | **E1 concluída**: kernel de 64 bits no *higher half*, console UTF-8 com fonte própria (DejaVu Sans Mono), GDT/TSS/IDT, diagnóstico de exceções. Bootloader usa só `EfiLoaderData` por causa do VirtualBox |
 | 2026-11-19 | **E2 concluída**: bitmap de páginas físicas, tabelas de páginas próprias do kernel (W^X, NX, sem identidade, framebuffer WC), heap com slabs e detecção de liberação dupla, autoteste de memória em todo boot |
+| 2026-11-19 | **E3 concluída**: LAPIC + timer a 1000 Hz (PIC mascarado), threads do kernel com escalonador round-robin preemptivo (fatia de 10 ms), pilhas com página de guarda, spinlocks no pmm/heap/vmm/console, autoteste do escalonador |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

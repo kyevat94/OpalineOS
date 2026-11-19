@@ -7,7 +7,9 @@
 #include <opaline/arch/cpu.h>
 #include <opaline/arch/idt.h>
 #include <opaline/console.h>
+#include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/sched.h>
 #include <opaline/serial.h>
 #include <opaline/string.h>
 
@@ -47,21 +49,32 @@ static bool panic_begin(void) {
     return true;
 }
 
+bool panic_in_progress(void) { return panicking != 0; }
+
+static void print_thread(void) {
+    struct thread *t = thread_current();
+    if (t) kprintf("  Thread: \"%s\" (id %lu, process %lu)\n", t->name, t->id, t->process ? t->process->pid : 0);
+}
+
 static NORETURN void panic_end(void) {
     console_set_color(COLOR_SECONDARY);
     kprintf("\nThe system has stopped. Restart the computer.\n");
     cpu_halt_forever();
 }
 
-static bool is_kernel_address(u64 a) {
-    return a >= (u64)__kernel_start && a < (u64)__kernel_end;
+/* A frame pointer worth following: in the kernel image or a kernel stack, and mapped. */
+static bool is_stack_address(u64 a) {
+    bool kernel_image = a >= (u64)__kernel_start && a < (u64)__kernel_end;
+    bool thread_stack = a >= 0xFFFFB00000000000ULL && a < 0xFFFFB10000000000ULL;
+    return (kernel_image || thread_stack) && vmm_translate(a) != VMM_NOT_MAPPED &&
+           vmm_translate(a + 8) != VMM_NOT_MAPPED;
 }
 
 /* Follows the RBP chain (the kernel is built with frame pointers). */
 static void stack_trace(u64 rip, u64 rbp) {
     kprintf("Stack trace:\n");
     kprintf("  #0  %p\n", (void *)rip);
-    for (int i = 1; i < 16 && rbp && !(rbp & 7) && is_kernel_address(rbp); i++) {
+    for (int i = 1; i < 16 && rbp && !(rbp & 7) && is_stack_address(rbp); i++) {
         u64 *frame = (u64 *)rbp;
         u64 ret = frame[1];
         if (!ret) break;
@@ -79,6 +92,7 @@ void panic(const char *fmt, ...) {
     va_end(ap);
     kprintf("\n");
     console_set_color(COLOR_TEXT);
+    print_thread();
     stack_trace((u64)__builtin_return_address(0), (u64)__builtin_frame_address(0));
     panic_end();
 }
@@ -97,11 +111,16 @@ void panic_exception(const struct interrupt_frame *f) {
     const char *name = f->vector < 32 ? exception_names[f->vector] : "Unexpected interrupt";
     kprintf("PANIC: %s at RIP=%p\n", name, (void *)f->rip);
     console_set_color(COLOR_TEXT);
+    print_thread();
     kprintf("  Vector %lu, error code %#lx\n", f->vector, f->error);
     if (f->vector == 14) {
         kprintf("  CR2=%p (the address that was accessed)\n", (void *)read_cr2());
         describe_page_fault(f->error);
     }
+    /* a thread stack that ran into its guard page: the stack pointer sits just above an unmapped page */
+    bool in_stack_region = f->rsp >= 0xFFFFB00000000000ULL && f->rsp < 0xFFFFB10000000000ULL;
+    if ((f->vector == 8 || f->vector == 14) && in_stack_region && vmm_translate(f->rsp - 8) == VMM_NOT_MAPPED)
+        kprintf("  Cause: kernel stack overflow (the thread used up its stack and hit the guard page)\n");
     kprintf("\n");
     kprintf("  RAX=%p  RBX=%p  RCX=%p\n", (void *)f->rax, (void *)f->rbx, (void *)f->rcx);
     kprintf("  RDX=%p  RSI=%p  RDI=%p\n", (void *)f->rdx, (void *)f->rsi, (void *)f->rdi);

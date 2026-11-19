@@ -22,5 +22,7 @@
 #define IST_MACHINE_CHECK 3
 
 void gdt_init(void);
+/* Stack the CPU switches to when an interrupt arrives in user mode (stage E4). */
+void tss_set_kernel_stack(u64 top);
 
 #endif

@@ -60,6 +60,8 @@ bool vmm_map(u64 virt, u64 phys, u32 flags);      /* one 4 KiB page in the kerne
 void vmm_unmap(u64 virt);
 u64 vmm_translate(u64 virt);                       /* physical address, or VMM_NOT_MAPPED */
 void *vmm_map_mmio(u64 phys, size_t size);         /* uncached, inside the HHDM */
+u64 vmm_alloc_stack(size_t pages);                 /* kernel stack with a guard page; returns its top, 0 if no memory */
+void vmm_free_stack(u64 top, size_t pages);
 bool vmm_nx_enabled(void);
 
 /* ---- kernel heap ------------------------------------------------------ */

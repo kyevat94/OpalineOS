@@ -2,6 +2,8 @@
  * Copyright (C) 2026 The OpalineOS authors */
 /* printf-style formatting into a callback (no floating point). */
 #include <opaline/console.h>
+#include <opaline/panic.h>
+#include <opaline/spinlock.h>
 #include <opaline/string.h>
 
 typedef void (*sink_fn)(void *ctx, char c);
@@ -124,11 +126,18 @@ static void console_put(void *ctx, char c) {
     }
 }
 
+/* One kprintf at a time, so lines from different threads do not interleave.
+   Skipped during a panic: the panicking code may have been interrupted while holding it. */
+static spinlock_t console_lock = SPINLOCK_INIT;
+
 int kvprintf(const char *fmt, va_list ap) {
+    bool locked = !panic_in_progress();
+    u64 flags = locked ? spin_lock(&console_lock) : 0;
     struct console_sink s;
     s.n = 0;
     int n = format(console_put, &s, fmt, ap);
     if (s.n) console_write(s.buf, s.n);
+    if (locked) spin_unlock(&console_lock, flags);
     return n;
 }
 

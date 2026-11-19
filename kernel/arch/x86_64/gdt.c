@@ -48,3 +48,5 @@ void gdt_init(void) {
     gdt_load(&gdtr);
     tss_load(GDT_TSS);
 }
+
+void tss_set_kernel_stack(u64 top) { tss.rsp[0] = top; }

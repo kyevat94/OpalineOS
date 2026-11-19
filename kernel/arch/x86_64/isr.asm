@@ -1,64 +1,32 @@
 ; SPDX-License-Identifier: GPL-3.0-or-later
 ; Copyright (C) 2026 The OpalineOS authors
 ;
-; Interrupt service routine stubs for the 32 CPU exceptions.
-; Each stub pushes a uniform frame (see struct interrupt_frame in
-; opaline/arch/idt.h) and calls interrupt_dispatch(frame).
+; Interrupt service routine stubs for all 256 vectors (0-31: CPU exceptions,
+; 32-255: hardware and software interrupts). Each stub pushes a uniform frame
+; (see struct interrupt_frame in opaline/arch/idt.h) and calls
+; interrupt_dispatch(frame).
 
 bits 64
 default rel
 
 extern interrupt_dispatch
 
-; exceptions without an error code: push a 0 so the frame is always the same
-%macro ISR_NOERR 1
-isr_%1:
-    push qword 0
-    push qword %1
-    jmp isr_common
-%endmacro
-
-; exceptions where the CPU already pushed an error code
-%macro ISR_ERR 1
-isr_%1:
-    push qword %1
-    jmp isr_common
-%endmacro
-
 section .text
 
-ISR_NOERR 0     ; #DE divide error
-ISR_NOERR 1     ; #DB debug
-ISR_NOERR 2     ;     NMI
-ISR_NOERR 3     ; #BP breakpoint
-ISR_NOERR 4     ; #OF overflow
-ISR_NOERR 5     ; #BR bound range
-ISR_NOERR 6     ; #UD invalid opcode
-ISR_NOERR 7     ; #NM device not available
-ISR_ERR   8     ; #DF double fault
-ISR_NOERR 9     ;     coprocessor segment overrun
-ISR_ERR   10    ; #TS invalid TSS
-ISR_ERR   11    ; #NP segment not present
-ISR_ERR   12    ; #SS stack fault
-ISR_ERR   13    ; #GP general protection
-ISR_ERR   14    ; #PF page fault
-ISR_NOERR 15    ;     reserved
-ISR_NOERR 16    ; #MF x87 floating point
-ISR_ERR   17    ; #AC alignment check
-ISR_NOERR 18    ; #MC machine check
-ISR_NOERR 19    ; #XM SIMD floating point
-ISR_NOERR 20    ; #VE virtualization
-ISR_ERR   21    ; #CP control protection
-ISR_NOERR 22
-ISR_NOERR 23
-ISR_NOERR 24
-ISR_NOERR 25
-ISR_NOERR 26
-ISR_NOERR 27
-ISR_NOERR 28    ; #HV hypervisor injection
-ISR_ERR   29    ; #VC VMM communication
-ISR_ERR   30    ; #SX security
-ISR_NOERR 31
+; Exceptions where the CPU pushes an error code: 8, 10-14, 17, 21, 29, 30.
+; For every other vector the stub pushes a 0 so the frame is always the same.
+%assign i 0
+%rep 256
+isr_ %+ i:
+%if i == 8 || (i >= 10 && i <= 14) || i == 17 || i == 21 || i == 29 || i == 30
+    push qword i
+%else
+    push qword 0
+    push qword i
+%endif
+    jmp isr_common
+%assign i i + 1
+%endrep
 
 isr_common:
     push rax
@@ -80,7 +48,7 @@ isr_common:
     mov rdi, rsp                ; struct interrupt_frame *
     mov rbx, rsp                ; rbx is callee-saved: remember the frame
     and rsp, -16                ; the C ABI wants a 16-byte aligned stack
-    call interrupt_dispatch
+    call interrupt_dispatch     ; may switch to another thread and come back later
     mov rsp, rbx
     pop r15
     pop r14
@@ -104,7 +72,7 @@ section .rodata
 global isr_stubs
 isr_stubs:
 %assign i 0
-%rep 32
+%rep 256
     dq isr_ %+ i
 %assign i i + 1
 %endrep

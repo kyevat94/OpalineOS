@@ -14,7 +14,15 @@ struct interrupt_frame {
     u64 rip, cs, rflags, rsp, ss;    /* pushed by the CPU */
 };
 
+/* Interrupt vectors used by the kernel. */
+#define VECTOR_TIMER        0x20     /* LAPIC timer */
+#define VECTOR_PIC_BASE     0x30     /* legacy PIC, remapped here and fully masked */
+#define VECTOR_SPURIOUS     0xFF     /* LAPIC spurious interrupt */
+
+typedef void (*irq_handler)(struct interrupt_frame *f);
+
 void idt_init(void);
+void irq_set_handler(u8 vector, irq_handler handler);
 void interrupt_dispatch(struct interrupt_frame *f);
 
 #endif

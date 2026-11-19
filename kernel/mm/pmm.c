@@ -11,9 +11,12 @@
 #include <opaline/console.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/spinlock.h>
 #include <opaline/string.h>
 
 #define LOW_MEMORY_LIMIT (1 * MiB)
+
+static spinlock_t lock = SPINLOCK_INIT;
 
 static u64 *bitmap;          /* HHDM pointer */
 static u64 page_count;       /* pages covered by the bitmap */
@@ -65,7 +68,7 @@ void pmm_init(const struct boot_info *bi) {
     total_pages = free_pages;
 }
 
-u64 pmm_alloc_page(void) {
+static u64 alloc_one(void) {
     u64 words = (page_count + 63) / 64;
     for (u64 k = 0; k < words; k++) {
         u64 w = (search_hint + k) % words;
@@ -80,9 +83,7 @@ u64 pmm_alloc_page(void) {
     return 0;
 }
 
-u64 pmm_alloc_pages(size_t count) {
-    if (count == 0) return 0;
-    if (count == 1) return pmm_alloc_page();
+static u64 alloc_run(size_t count) {
     u64 run = 0;
     for (u64 p = 0; p < page_count; p++) {
         if (bit_used(p)) {
@@ -99,19 +100,38 @@ u64 pmm_alloc_pages(size_t count) {
     return 0;
 }
 
+u64 pmm_alloc_page(void) {
+    u64 flags = spin_lock(&lock);
+    u64 phys = alloc_one();
+    spin_unlock(&lock, flags);
+    return phys;
+}
+
+u64 pmm_alloc_pages(size_t count) {
+    if (count == 0) return 0;
+    u64 flags = spin_lock(&lock);
+    u64 phys = count == 1 ? alloc_one() : alloc_run(count);
+    spin_unlock(&lock, flags);
+    return phys;
+}
+
 void pmm_free_pages(u64 phys, size_t count) {
     if (phys % PAGE_SIZE) panic("pmm: freeing unaligned address %p", (void *)phys);
+    u64 flags = spin_lock(&lock);
     for (u64 p = phys / PAGE_SIZE; p < phys / PAGE_SIZE + count; p++) {
         if (p >= page_count) panic("pmm: freeing page %p outside managed memory", (void *)(p * PAGE_SIZE));
         if (!bit_used(p)) panic("pmm: double free of page %p", (void *)(p * PAGE_SIZE));
         bit_clear(p);
         free_pages++;
     }
+    spin_unlock(&lock, flags);
 }
 
 void pmm_free_page(u64 phys) { pmm_free_pages(phys, 1); }
 
 void pmm_get_stats(struct pmm_stats *out) {
+    u64 flags = spin_lock(&lock);
     out->total_pages = total_pages;
     out->free_pages = free_pages;
+    spin_unlock(&lock, flags);
 }

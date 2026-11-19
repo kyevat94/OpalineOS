@@ -9,6 +9,7 @@
 struct interrupt_frame;
 
 NORETURN void panic(const char *fmt, ...) PRINTF(1, 2);
+bool panic_in_progress(void);
 NORETURN void panic_exception(const struct interrupt_frame *f);
 
 #define ASSERT(cond)                                                              \
