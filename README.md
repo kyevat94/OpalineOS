@@ -4,10 +4,12 @@ A light, fast and modern operating system with its own kernel, where **Python is
 the desktop and the apps are written in Python (official CPython) using `opaline-vitrum`, the
 system's GUI toolkit.
 
-> **Status:** stage **E5** — 64-bit kernel with memory management, a preemptive scheduler and
-> isolated user processes, plus **storage and files**: an AHCI (SATA) disk driver, the EFS3 file
-> system with UTF-8 file names, pipes, a terminal with keyboard input and a small shell. Programs
-> are loaded from the disk. Self-tests for memory, scheduling, user space and files run on every boot.
+> **Status:** stage **E6** — 64-bit kernel with memory management, a preemptive scheduler,
+> isolated user processes, storage (AHCI disk, the EFS3 file system with UTF-8 file names), pipes,
+> a terminal and a small shell, plus a **POSIX layer**: ordinary C programs built against
+> **musl** run unmodified, statically linked or through the dynamic linker, with `fork`/`execve`,
+> `mmap`, signals and threads. Self-tests for memory, scheduling, user space, files and POSIX run on
+> every boot.
 
 ![Shell](docs/screenshots/e5-shell.png)
 > The full plan is in [`project.md`](project.md) (in Portuguese) and the toolkit API in
@@ -24,7 +26,8 @@ system's GUI toolkit.
 ## Build, run and test
 
 ```
-python tools/build.py              # builds build/opaline.img (add --clean for a fresh build)
+python tools/build.py              # builds build/opaline.img (add --clean for a fresh build;
+                                   # the first build downloads musl 1.2.6 and checks its SHA-256)
 python tools/vm.py run             # boots in QEMU (window)
 python tools/vm.py run vbox        # boots in VirtualBox (creates the "OpalineOS" VM the first time)
 python tools/vm.py test            # automated boot and exception tests in QEMU and VirtualBox

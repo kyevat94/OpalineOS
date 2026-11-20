@@ -164,6 +164,9 @@ static void test_pipes_and_fds(void) {
     close(p[0]);
     CHECK(pipe(p) == 0, "second pipe");
     close(p[0]);
+    /* such a write also sends SIGPIPE, which ends the process by default: ignore it here */
+    long ignore[4] = {1 /* SIG_IGN */, 0, 0, 0};
+    CHECK(syscall4(13 /* rt_sigaction */, 13 /* SIGPIPE */, (long)ignore, 0, 8) == 0, "ignore SIGPIPE");
     CHECK(write(p[1], "x", 1) == -EPIPE, "write without a reader gives EPIPE");
     close(p[1]);
 

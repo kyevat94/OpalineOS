@@ -16,6 +16,7 @@
 #include <opaline/arch/gdt.h>
 #include <opaline/arch/syscall.h>
 #include <opaline/console.h>
+#include <opaline/errno.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
 #include <opaline/sched.h>
@@ -31,7 +32,7 @@ static struct thread boot_thread;        /* kmain, on the static boot stack */
 static struct thread *current;
 static struct thread *idle_thread;
 static struct thread *ready_head, *ready_tail;
-static struct thread *sleeping;          /* unsorted list */
+static struct thread *sleeping;          /* threads with a timeout, unsorted, via sleep_next */
 static struct thread *dead;
 static struct thread *all_threads;
 
@@ -76,6 +77,37 @@ static void dead_remove(struct thread *t) {
         }
 }
 
+static void sleeping_remove(struct thread *t) {
+    for (struct thread **p = &sleeping; *p; p = &(*p)->sleep_next)
+        if (*p == t) {
+            *p = t->sleep_next;
+            t->sleep_next = NULL;
+            return;
+        }
+}
+
+static void wq_remove(struct thread *t) {
+    struct waitqueue *wq = t->wq;
+    if (!wq) return;
+    for (struct thread **p = &wq->head; *p; p = &(*p)->next)
+        if (*p == t) {
+            *p = t->next;
+            break;
+        }
+    t->wq = NULL;
+    t->next = NULL;
+}
+
+/* Ends a blocked thread's wait with `reason` (interrupts disabled). */
+static void unblock(struct thread *t, int reason) {
+    if (t->state != THREAD_BLOCKED) return;
+    if (t->wake_tick) sleeping_remove(t);
+    t->wake_tick = 0;
+    wq_remove(t);
+    t->wake_reason = reason;
+    ready_push(t);
+}
+
 /* ---- core ---------------------------------------------------------------- */
 
 /* Picks the next thread and switches to it. Interrupts must be disabled. */
@@ -98,6 +130,7 @@ static void schedule(void) {
     }
     u64 page_table = next->process->page_table;
     if (page_table && read_cr3() != page_table) write_cr3(page_table);
+    if (next->process->user) wrmsr(MSR_FS_BASE, next->fs_base);   /* its thread-local storage */
     /* the kernel itself never touches FPU/SSE registers, so they only change here */
     fxsave(old->fpu);
     fxrstor(next->fpu);
@@ -106,14 +139,9 @@ static void schedule(void) {
 
 void sched_tick(void) {
     ticks++;
-    for (struct thread **p = &sleeping; *p;) {   /* wake every sleeper whose time came */
-        struct thread *t = *p;
-        if (t->wake_tick <= ticks) {
-            *p = t->next;
-            ready_push(t);
-        } else {
-            p = &t->next;
-        }
+    for (struct thread *t = sleeping, *n; t; t = n) {   /* wake every thread whose time came */
+        n = t->sleep_next;
+        if (t->wake_tick <= ticks) unblock(t, -ETIMEDOUT);
     }
     if (!current) return;   /* scheduler not started yet */
     if (current == idle_thread ? ready_head != NULL : --slice_left == 0) schedule();
@@ -129,26 +157,32 @@ static void free_thread(struct thread *t) {
     kfree(t);
 }
 
+void sched_free_dead(void) {
+    u64 f = irq_save();
+    for (struct thread **p = &dead; *p;) {   /* free detached threads that finished */
+        struct thread *t = *p;
+        if (!t->joinable && t != current) {
+            *p = t->next;
+            free_thread(t);
+        } else {
+            p = &t->next;
+        }
+    }
+    irq_restore(f);
+}
+
 static void idle_main(void *arg) {
     (void)arg;
     for (;;) {
-        u64 f = irq_save();
-        for (struct thread **p = &dead; *p;) {   /* free detached threads that finished */
-            struct thread *t = *p;
-            if (!t->joinable) {
-                *p = t->next;
-                free_thread(t);
-            } else {
-                p = &t->next;
-            }
-        }
-        irq_restore(f);
+        sched_free_dead();
         __asm__ volatile("sti\n\thlt" ::: "memory");
     }
 }
 
 /* FPU state of a new thread: x87 and SSE reset to their defaults (taken once in sched_init). */
 static u8 fpu_initial[512] ALIGNED(16);
+
+void thread_reset_fpu(void) { fxrstor(fpu_initial); }
 
 struct thread *thread_create(const char *name, thread_fn fn, void *arg) {
     return thread_create_in(&kernel_process, name, fn, arg);
@@ -198,18 +232,55 @@ void thread_yield(void) {
     irq_restore(f);
 }
 
+int thread_block(u64 timeout_ms, bool interruptible) {
+    if (interruptible && current->intr) {
+        wq_remove(current);
+        return -EINTR;
+    }
+    current->state = THREAD_BLOCKED;
+    current->interruptible = interruptible;
+    current->wake_reason = 0;
+    current->wake_tick = 0;
+    if (timeout_ms) {
+        current->wake_tick = ticks + (timeout_ms * TIMER_HZ + 999) / 1000;
+        current->sleep_next = sleeping;
+        sleeping = current;
+    }
+    schedule();
+    current->interruptible = false;
+    return current->wake_reason;
+}
+
+void thread_wake(struct thread *t) { unblock(t, 0); }
+
+void thread_interrupt(struct thread *t) {
+    u64 f = irq_save();
+    t->intr = true;
+    if (t->interruptible) unblock(t, -EINTR);
+    irq_restore(f);
+}
+
+struct thread *sched_all_threads(void) { return all_threads; }
+
 void thread_sleep_ms(u64 ms) {
     if (!ms) {
         thread_yield();
         return;
     }
     u64 f = irq_save();
-    current->state = THREAD_SLEEPING;
-    current->wake_tick = ticks + (ms * TIMER_HZ + 999) / 1000;
-    current->next = sleeping;
-    sleeping = current;
-    schedule();
+    thread_block(ms, false);
     irq_restore(f);
+}
+
+int thread_sleep_intr(u64 ms) {
+    if (!ms) {
+        thread_yield();
+        return current->intr ? -EINTR : 0;
+    }
+    u64 f = irq_save();
+    int r = thread_block(ms, true);
+    irq_restore(f);
+    return r == -EINTR ? -EINTR : 0;
 }
 
 void thread_exit(int code) {
@@ -219,7 +290,7 @@ void thread_exit(int code) {
     current->state = THREAD_DEAD;
     current->next = dead;
     dead = current;
-    if (current->joiner) ready_push(current->joiner);
+    if (current->joiner) unblock(current->joiner, 0);
     schedule();
     panic("thread_exit: a dead thread was scheduled again");
 }
@@ -230,8 +301,7 @@ int thread_join(struct thread *t) {
     if (!t->joinable) panic("thread_join: thread %lu is detached", t->id);
     while (t->state != THREAD_DEAD) {
         t->joiner = current;
-        current->state = THREAD_BLOCKED;
-        schedule();
+        thread_block(0, false);
     }
     int code = t->exit_code;
     dead_remove(t);
@@ -278,22 +348,26 @@ void sched_init(void) {
 
 /* ---- wait queues and mutexes ---------------------------------------------- */
 
-void waitqueue_wait(struct waitqueue *wq) {
-    current->state = THREAD_BLOCKED;
+static void wq_add(struct waitqueue *wq) {
     current->next = wq->head;
     wq->head = current;
-    schedule();
+    current->wq = wq;
+}
+
+void waitqueue_wait(struct waitqueue *wq) {
+    wq_add(wq);
+    thread_block(0, false);
+}
+
+int waitqueue_wait_intr(struct waitqueue *wq) {
+    if (current->intr) return -EINTR;
+    wq_add(wq);
+    return thread_block(0, true) == -EINTR ? -EINTR : 0;
 }
 
 void waitqueue_wake_all(struct waitqueue *wq) {
     u64 f = irq_save();
-    struct thread *t = wq->head;
-    wq->head = NULL;
-    while (t) {
-        struct thread *next = t->next;
-        if (t->state == THREAD_BLOCKED) ready_push(t);
-        t = next;
-    }
+    while (wq->head) unblock(wq->head, 0);   /* unblock removes it from the queue */
     irq_restore(f);
 }
 

@@ -68,3 +68,32 @@ bool user_selftest(void) {
     kprintf("User-space self-test passed: 6 processes, 3 crashes contained, no memory lost\n");
     return true;
 }
+
+/*
+ * Stage E6: the POSIX test (tests/posix/posixtest.c) built against musl, once started
+ * through the dynamic linker and once statically linked. It forks, execs, maps memory and
+ * starts threads; afterwards no memory may be missing.
+ */
+bool posix_selftest(void) {
+    struct pmm_stats before, after;
+    pmm_get_stats(&before);
+    u64 cache_before = block_cache_pages();
+    static const char *const programs[] = {"/apps/posixtest", "/apps/posixtest-static"};
+    for (unsigned i = 0; i < 2; i++) {
+        const char *argv[] = {programs[i], NULL};
+        int err;
+        struct process *p = process_spawn_path(programs[i], argv, NULL, &err);
+        if (!p) FAIL("cannot start %s: error %d", programs[i], err);
+        int code = process_wait(p);
+        if (code != 0) FAIL("%s exited with code %d", programs[i], code);
+    }
+    pmm_get_stats(&after);
+    struct heap_stats hs;
+    heap_get_stats(&hs);
+    u64 cached = block_cache_pages() - cache_before;
+    if (before.free_pages - after.free_pages > hs.slab_pages + cached)
+        FAIL("pages lost after the POSIX test: %lu free before, %lu after", before.free_pages, after.free_pages);
+    console_set_color(COLOR_TEXT);
+    kprintf("POSIX self-test passed: musl programs (dynamic and static), no memory lost\n");
+    return true;
+}

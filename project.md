@@ -385,7 +385,7 @@ parede espacial próprio.
 | **E3** ✅ | Processos, threads e escalonador preemptivo (APIC timer) | duas threads de kernel alternando. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E4** ✅ | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E5** ✅ | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
-| **E6** | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam |
+| **E6** ✅ | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam. **Concluída em 2026-11-20** (QEMU e VirtualBox) |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, blur, sombras, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela de vidro arrastável a 60 fps; digitar "ação, über, ñ" funciona |
 | **E9** | **`opaline.vitrum`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra, dock, lançador) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
@@ -416,7 +416,8 @@ OpalineOS/
 │   └── shell/            # área de trabalho (Python)
 ├── apps/                 # apps em Python (pasta + app.toml + locale/)
 ├── locale/               # catálogos de tradução do sistema (en-US = textos do código, pt_BR.po)
-├── ports/                # receitas de build: musl, cpython, zlib, openssl, libffi, numpy...
+├── ports/                # patches e código nosso dos ports (musl/patches, rt/); receitas em tools/ports/
+├── tests/posix/          # programas de teste em C ligados à musl (E6)
 ├── tools/                # build, imagem de disco, vmctl, testes
 └── build/                # gerado (não versionar)
 ```
@@ -641,6 +642,79 @@ OpalineOS/
   VirtualBox também digita `exit` e exige que a VM desligue. Verificado que o teste de edição falha com
   o `tty.c` anterior.
 
+### 10.1.7 Como a E6 funciona
+
+- **musl 1.2.6** sem modificações (`tools/ports/musl.py`): baixada uma vez de musl.libc.org, conferida
+  pelo **SHA-256** (registrado depois de verificar a assinatura GPG da chave da musl) e com o patch de
+  segurança da `regcomp` (CVE-2026-107891) em `ports/musl/patches/`. Compilada para
+  `x86_64-unknown-linux-musl` por um script Python que reproduz o Makefile (o Windows não tem `make`):
+  `build/sysroot/` com `include/`, `libc.a`, `libc.so` e os `crt*.o`. Graças à ABI mista, o kernel
+  atende as mesmas syscalls do Linux e a musl não sabe que não está no Linux.
+- **Runtime do compilador próprio** (`ports/rt/`, LGPL): `__mulsc3`/`__divdc3`... (multiplicação e
+  divisão de complexos, C99 Anexo G), que no Linux vêm da libgcc/compiler-rt.
+- **Carregador dinâmico**: a `libc.so` da musl também é o `ld.so`; o build a instala como
+  `/lib/ld-musl-x86_64.so.1`. O kernel carrega o programa (ET_EXEC ou PIE em 0x555555554000), vê o
+  `PT_INTERP`, carrega o interpretador em 0x7FF000000000 e começa por ele, com o **vetor auxiliar**
+  (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_RANDOM`, `AT_EXECFN`...) e o ambiente na pilha (ABI System V).
+- **Memória por áreas** (`kernel/mm/uvm.c`): cada processo tem um `mm` com uma lista ordenada de
+  áreas (início, fim, proteção, anônima ou de arquivo). As páginas só são alocadas no primeiro acesso
+  (**paginação sob demanda**): a falta de página em modo usuário consulta as áreas, aloca uma página
+  zerada ou lê o pedaço do arquivo. `mmap` (anônimo e de arquivo, `MAP_FIXED`, posições de cima para
+  baixo abaixo de 0x7F0000000000), `munmap`, `mprotect` (divide áreas), `brk`; `mremap` só encolhe.
+  Pilha principal de 8 MiB reservada e paginada sob demanda. Cada ponteiro recebido numa syscall é
+  conferido contra as áreas e as páginas já são trazidas, então o kernel nunca falha ao copiá-los.
+  Simplificações por enquanto: `MAP_SHARED` age como `MAP_PRIVATE` e o `fork` copia todas as páginas
+  na hora (sem *copy-on-write*).
+- **Processos e threads** (`kernel/proc/process.c`): `fork`, `vfork`, `clone` (threads com
+  `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`;
+  `CLONE_VM|CLONE_VFORK` do `posix_spawn` da musl), `execve` (fecha os descritores `FD_CLOEXEC`, zera
+  os sinais tratados), `exit` (só a thread) e `exit_group` (todas). PIDs e TIDs saem do mesmo contador:
+  o TID da thread principal é o PID, como no Linux. Um processo termina com a última thread, libera
+  memória e arquivos na hora e fica **zumbi** até o pai (ou o kernel) recolher o status. `execve` num
+  processo com várias threads ainda devolve `EAGAIN`.
+- **TLS**: `arch_prctl(ARCH_SET_FS)` guarda a base do FS por thread; o escalonador a recarrega a cada
+  troca. **Futex** (`kernel/proc/futex.c`): `WAIT`, `WAKE`, `REQUEUE`, `CMP_REQUEUE`, `WAIT_BITSET`,
+  com tempo limite — a base dos mutexes, variáveis de condição e do `pthread_join` da musl.
+- **Sinais** (`kernel/proc/signal.c`): `rt_sigaction`, `rt_sigprocmask`, `rt_sigpending`,
+  `rt_sigsuspend`/`pause`, `sigaltstack`, `kill`, `tkill`, `tgkill`. Entrega na volta ao modo usuário,
+  com o mesmo `rt_sigframe` do Linux (registradores, `siginfo`, estado da FPU) e retorno por
+  `rt_sigreturn`; `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND`, `SA_ONSTACK`. Falhas da CPU
+  viram sinais (`SIGSEGV` com `si_addr`, `SIGILL`, `SIGFPE`...) que o programa pode tratar; sem
+  tratador, o processo é encerrado como antes. Ação padrão: terminar (sinais de parada são ignorados
+  por enquanto). `SIGPIPE` ao escrever num pipe sem leitores.
+- **Esperas interrompíveis**: leitura de pipe/terminal, `wait4`, `nanosleep` e futex terminam com
+  `EINTR` quando chega um sinal ou o processo está saindo; o escalonador ganhou bloqueio com tempo
+  limite (`thread_block`) e interrupção (`thread_interrupt`).
+- **Entrada de syscall**: agora salva o mesmo quadro de uma interrupção. A volta normal é por
+  `SYSRET`; quando o kernel reescreve os registradores (tratador de sinal, `rt_sigreturn`, `execve`),
+  a volta é por `IRETQ`. **Correção**: o MSR STAR passou a ter RPL 3 no seletor base — em CPUs AMD o
+  `SYSRET` não força o RPL do SS, e o próximo `IRETQ` de uma interrupção derrubava o kernel (bug
+  latente desde a E4, apareceu no VirtualBox num Ryzen).
+- **Syscalls novas** (numeração Linux): `mmap`, `mprotect`, `munmap`, `brk`, `mremap`, `madvise`,
+  `msync`, `clone`, `fork`, `vfork`, `execve`, `kill`, `tkill`, `tgkill`, `rt_sig*`, `sigaltstack`,
+  `pause`, `futex`, `set_tid_address`, `set_robust_list`, `arch_prctl`, `openat`/`newfstatat`/
+  `faccessat`/`mkdirat`/`unlinkat`/`renameat`/`readlinkat` relativos a um diretório aberto, `fcntl`,
+  `dup3`, `pread64`, `pwrite64`, `access`, `readlink`, `uname`, `getrandom`, `prlimit64`, `getrlimit`,
+  `clock_nanosleep`, `clock_getres`, `gettimeofday`, `time`, `sched_getaffinity`, `getuid`... (um só
+  usuário até a E15). Relógio: todos contam desde o boot (sem RTC ainda).
+- **Ambiente padrão** dos programas iniciados pelo kernel: `HOME=/home`, `PATH=/apps:/system/bin`,
+  `LANG=C.UTF-8`. Aleatoriedade (`AT_RANDOM`, `getrandom`): RDRAND quando existe, misturado ao TSC.
+- **Testes da E6**: `tests/posix/posixtest.c`, programa C comum, compilado duas vezes —
+  `/apps/posixtest` (dinâmico, pelo `ld.so`) e `/apps/posixtest-static` — e executado em todo boot
+  (63 verificações cada): arquivos e diretórios com stdio, `malloc` (2000 blocos + 8 MiB),
+  `mmap`/`mprotect`/`munmap` com `SIGSEGV` capturado por `siglongjmp`, mapeamento de arquivo, sinais
+  (bloqueio, pendentes, `SA_SIGINFO`), `fork` + pipe, 200 KB entre processos, `execve` com argumentos e
+  ambiente, `posix_spawn`, filhos mortos por `SIGABRT` e `SIGTERM`, pthreads (mutex com 4 threads,
+  produtor/consumidor com variável de condição, `__thread`, thread destacada), `uname`, `usleep`,
+  `getrandom`, `printf` de ponto flutuante e números complexos. Depois dos dois, o kernel confere que
+  **nenhuma página de memória se perdeu**. Testes negativos feitos: sem recarregar a base do FS na troca
+  de thread, o teste cai com `#GP`; sem atualizar as páginas no `mprotect`, ele acusa 2 falhas.
+- **Teste do VirtualBox mais confiável** (`tools/vm.py`): a consulta "a VM ainda está ligada?" às vezes
+  respondia "não" com a VM rodando, e o teste a desligava no meio do boot (o log do VirtualBox mostrava
+  o pedido de desligamento vindo de fora). Agora usa o estado da VM (`VMState`) e só acredita em
+  "desligada" se a resposta se repetir 1 s depois. Era a origem das falhas esporádicas do VirtualBox
+  registradas desde a E4; depois da correção, 10 boots seguidos passaram.
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -693,6 +767,7 @@ OpalineOS/
 | 2026-11-19 | **E3 concluída**: LAPIC + timer a 1000 Hz (PIC mascarado), threads do kernel com escalonador round-robin preemptivo (fatia de 10 ms), pilhas com página de guarda, spinlocks no pmm/heap/vmm/console, autoteste do escalonador |
 | 2026-11-19 | **E4 concluída**: processos com espaço de endereços próprio, carregador ELF64, SYSCALL/SYSRET com numeração Linux e verificação de ponteiros, FPU por thread, falhas de programas encerram só o processo. Biblioteca mínima de usuário (`user/lib`) sob LGPL-3.0-or-later |
 | 2026-11-19 | **E5 concluída**: PCI + AHCI, cache de blocos, GPT com partição raiz EFS3, VFS com nomes UTF-8 em NFC, devfs, pipes, TTY canônico, teclado PS/2, syscalls de arquivos com numeração Linux, `spawn` (1000) + `wait4`, shell mínimo. Programas agora vêm do disco (`/apps`, `/system/bin`) |
+| 2026-11-20 | **E6 concluída**: musl 1.2.6 sem modificações (build próprio em Python, SHA-256 conferido, patch da CVE-2026-107891), `libc.so` como `/lib/ld-musl-x86_64.so.1`, runtime do compilador próprio em `ports/rt` (LGPL). Kernel: memória por áreas com paginação sob demanda, `mmap`/`mprotect`/`brk`, `fork`/`vfork`/`clone`/`execve` com ELF dinâmico e vetor auxiliar, threads com TLS e futex, sinais no formato do Linux, esperas interrompíveis. STAR com RPL 3 (correção para CPUs AMD). Simplificações registradas: `MAP_SHARED` privado, `fork` sem copy-on-write, `execve` só em processo de uma thread |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

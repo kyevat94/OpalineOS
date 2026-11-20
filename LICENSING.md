@@ -8,7 +8,9 @@ OpalineOS is free software. Copyright (C) 2026 The OpalineOS authors.
 | Libraries that apps import: `system/opaline/` (the `opaline` Python package, including `opaline.vitrum`, `opaline.system` and `opaline.i18n`) and `system/vitrum/` (the `_vitrum` C core) | **LGPL-3.0-or-later** | [`COPYING.LESSER`](COPYING.LESSER) together with [`COPYING`](COPYING) |
 | User-space library for the first programs: `user/include/` and `user/lib/` | **LGPL-3.0-or-later** | [`COPYING.LESSER`](COPYING.LESSER) together with [`COPYING`](COPYING) |
 | `assets/fonts/console.fnt` (console font, a bitmap rendering of DejaVu Sans Mono) | Bitstream Vera Fonts license + public domain (DejaVu changes) | [`assets/fonts/LICENSE-DejaVu.txt`](assets/fonts/LICENSE-DejaVu.txt) |
-| Third-party code in `ports/` | its own upstream license | in each port |
+| Compiler runtime for C programs: `ports/rt/` | **LGPL-3.0-or-later** | [`COPYING.LESSER`](COPYING.LESSER) together with [`COPYING`](COPYING) |
+| musl, the C library (downloaded by `tools/ports/musl.py`; our patches in `ports/musl/patches/`) | **MIT** (upstream) | `COPYRIGHT` in the musl sources |
+| Other third-party code in `ports/` | its own upstream license | in each port |
 
 Each source file states its license on the first lines with an SPDX identifier, for example
 `SPDX-License-Identifier: GPL-3.0-or-later`. The SPDX line is authoritative for that file.

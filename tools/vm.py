@@ -49,8 +49,10 @@ TESTS = [
       "The process was stopped (exit code 139). The system continues.",
       "User-space self-test passed", "TEST_OK E4 userspace",
       "Disk sata0:", "Root file system: EFS3", "persist:", "fstest: all checks passed", "TEST_OK E5 files",
+      "posixtest (/apps/posixtest): musl", "posixtest (/apps/posixtest-static): musl",
+      "POSIXTEST_OK /apps/posixtest-static", "POSIX self-test passed", "TEST_OK E6 posix",
       BOOT_OK],
-     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen"]),
+     ["PANIC", "FAILED", "  FAIL ", "unexpected interrupt", "this must not happen"]),
     ("stack-overflow", "qemu", "test=stackoverflow",
      ["PANIC: Double fault (#DF)", 'Thread: "overflow"', "Cause: kernel stack overflow", PANIC_END],
      [BOOT_OK]),
@@ -83,9 +85,10 @@ TESTS = [
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
       "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",
       "TEST_OK E3 scheduler", "usertest: all checks passed", "User-space self-test passed",
-      "TEST_OK E4 userspace", "Disk sata0:", "fstest: all checks passed", "TEST_OK E5 files", BOOT_OK,
+      "TEST_OK E4 userspace", "Disk sata0:", "fstest: all checks passed", "TEST_OK E5 files",
+      "POSIXTEST_OK /apps/posixtest-static", "POSIX self-test passed", "TEST_OK E6 posix", BOOT_OK,
       "ACPI: power off via PM1a control port", "Shutting down..."],
-     ["PANIC", "FAILED", "unexpected interrupt", "this must not happen", "the VM did not power off"]),
+     ["PANIC", "FAILED", "  FAIL ", "unexpected interrupt", "this must not happen", "the VM did not power off"]),
 ]
 DONE_MARKERS = [BOOT_OK, PANIC_END]
 
@@ -417,8 +420,25 @@ def vbox(*args, check=True):
     return result.stdout
 
 
+def vbox_state():
+    out = vbox("showvminfo", VM_NAME, "--machinereadable", check=False)
+    for line in out.splitlines():
+        if line.startswith("VMState="):
+            return line.split("=", 1)[1].strip('"')
+    return None   # the query itself failed (VBoxSVC busy): unknown
+
+
 def vbox_running():
-    return f'"{VM_NAME}"' in vbox("list", "runningvms")
+    """True unless VirtualBox says, twice in a row, that the VM is off. A single answer is not
+    trusted: now and then a query reports the VM as stopped while it runs, and the test then
+    powered off a healthy VM in the middle of the boot."""
+    for attempt in range(2):
+        state = vbox_state()
+        if state is None or state not in ("poweroff", "aborted", "saved"):
+            return True
+        if attempt == 0:
+            time.sleep(1)
+    return False
 
 
 def vbox_prepare(serial_log):

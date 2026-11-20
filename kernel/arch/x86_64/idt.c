@@ -4,7 +4,11 @@
 #include <opaline/arch/idt.h>
 #include <opaline/console.h>
 #include <opaline/panic.h>
+#include <opaline/arch/cpu.h>
+#include <opaline/mm.h>
 #include <opaline/proc.h>
+#include <opaline/string.h>
+#include <opaline/uvm.h>
 
 struct idt_entry {
     u16 offset_low;
@@ -52,9 +56,48 @@ void idt_init(void) {
 
 void irq_set_handler(u8 vector, irq_handler handler) { handlers[vector] = handler; }
 
+/* Access type of a page fault, from its error code. */
+static u32 fault_access(u64 error) { return error & 2 ? PROT_WRITE : error & 0x10 ? PROT_EXEC : PROT_READ; }
+
+/*
+ * The kernel touched a user address that is not there. System calls bring user pages in
+ * before using them, so this only happens when another thread of the process unmapped
+ * the memory meanwhile: put a kernel-only zero page there so the access completes, and
+ * end the process (SIGSEGV). A kernel bug still panics.
+ */
+static bool kernel_user_fault(struct interrupt_frame *f) {
+    u64 addr = read_cr2();
+    struct process *p = thread_current() ? thread_current()->process : NULL;
+    if (addr >= USER_TOP || !p || !p->user || !p->mm || p->mm->lock.owner == thread_current()) return false;
+    if (f->rflags & 0x200) __asm__ volatile("sti");
+    bool ok = mm_fault(p->mm, addr, fault_access(f->error));
+    __asm__ volatile("cli");
+    if (ok) return true;
+    u64 page = pmm_alloc_page();
+    if (!page) return false;
+    memset(phys_to_virt(page), 0, PAGE_SIZE);
+    vmm_map_in(p->mm->page_table, ALIGN_DOWN(addr, PAGE_SIZE), page, VMM_WRITE);
+    process_kill(p, SIGSEGV);
+    return true;
+}
+
 void interrupt_dispatch(struct interrupt_frame *f) {
-    /* a CPU exception in user mode ends that process, never the system */
-    if (f->vector < 32 && (f->cs & 3) == 3) process_fault(f);
+    if (f->vector < 32 && (f->cs & 3) == 3) {
+        /* user memory not there yet: bring it in (demand paging) */
+        if (f->vector == 14) {
+            struct process *p = thread_current()->process;
+            __asm__ volatile("sti");
+            bool ok = p->mm && mm_fault(p->mm, read_cr2(), fault_access(f->error));
+            __asm__ volatile("cli");
+            if (!ok) process_fault(f);
+        } else {
+            /* any other CPU exception in user mode becomes a signal: it never stops the system */
+            process_fault(f);
+        }
+        user_return(f);
+        return;
+    }
+    if (f->vector == 14 && kernel_user_fault(f)) return;
     if (f->vector == 3) {   /* breakpoint: report and continue after the int3 */
         kprintf("Breakpoint (#BP) at RIP=%p: handled, continuing\n", (void *)f->rip);
         return;
@@ -63,6 +106,7 @@ void interrupt_dispatch(struct interrupt_frame *f) {
 
     if (handlers[f->vector]) {
         handlers[f->vector](f);
+        if ((f->cs & 3) == 3) user_return(f);   /* signals, or the process is ending */
         return;
     }
     /* spurious interrupts (LAPIC 0xFF, PIC IRQ 7/15) need no acknowledgement */

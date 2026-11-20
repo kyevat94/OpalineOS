@@ -7,6 +7,7 @@
  * closed. Writes of up to 4 KiB are atomic.
  */
 #include <opaline/errno.h>
+#include <opaline/proc.h>
 #include <opaline/mm.h>
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
@@ -27,7 +28,11 @@ static i64 pipe_read(struct vnode *v, u64 off, void *out, u64 n) {
     struct pipe *p = v->priv;
     if (n == 0) return 0;
     u64 f = irq_save();
-    while (p->len == 0 && p->writers > 0) waitqueue_wait(&p->wait);
+    while (p->len == 0 && p->writers > 0)
+        if (waitqueue_wait_intr(&p->wait) < 0) {   /* a signal arrived */
+            irq_restore(f);
+            return -EINTR;
+        }
     u64 got = MIN(n, (u64)p->len);
     for (u64 i = 0; i < got; i++) ((u8 *)out)[i] = p->buf[(p->head + i) % PIPE_SIZE];
     p->head = (u32)((p->head + got) % PIPE_SIZE);
@@ -44,9 +49,15 @@ static i64 pipe_write(struct vnode *v, u64 off, const void *in, u64 n) {
     while (done < n) {
         u64 f = irq_save();
         u64 want = MIN(n - done, (u64)PIPE_SIZE);   /* small writes go in one piece */
-        while (p->readers > 0 && PIPE_SIZE - p->len < want) waitqueue_wait(&p->wait);
+        while (p->readers > 0 && PIPE_SIZE - p->len < want)
+            if (waitqueue_wait_intr(&p->wait) < 0) {
+                irq_restore(f);
+                return done ? (i64)done : -EINTR;
+            }
         if (p->readers == 0) {
             irq_restore(f);
+            struct thread *t = thread_current();
+            if (!done && t->process->user) signal_send_thread(t, SIGPIPE);   /* as POSIX asks */
             return done ? (i64)done : -EPIPE;
         }
         for (u64 i = 0; i < want; i++) p->buf[(p->head + p->len + i) % PIPE_SIZE] = ((const u8 *)in)[done + i];

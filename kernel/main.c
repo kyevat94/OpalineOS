@@ -37,7 +37,7 @@
 #include <opaline/string.h>
 #include <opaline/vfs.h>
 
-#define OPALINE_VERSION "0.5.0-e5"
+#define OPALINE_VERSION "0.6.0-e6"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",
@@ -228,14 +228,20 @@ void kmain(struct boot_info *bi) {
     static const char user_marker[] = "TEST_OK E4 userspace\n";
     serial_write(user_marker, sizeof user_marker - 1);
 
-    if (run_program("/apps/fstest") != 0) panic("file system self-test (/apps/fstest) failed");
+    int fs_result = run_program("/apps/fstest");
+    if (fs_result != 0) panic("file system self-test (/apps/fstest) failed (result %d)", fs_result);
     static const char fs_marker[] = "TEST_OK E5 files\n";
     serial_write(fs_marker, sizeof fs_marker - 1);
+
+    /* C programs on musl: through the dynamic linker, then statically linked */
+    if (!posix_selftest()) panic("POSIX self-test failed");
+    static const char posix_marker[] = "TEST_OK E6 posix\n";
+    serial_write(posix_marker, sizeof posix_marker - 1);
 
     run_self_test(bi->cmdline);
 
     console_set_color(COLOR_SUCCESS);
-    kprintf("Stage E5 complete.\n\n");
+    kprintf("Stage E6 complete.\n\n");
     console_set_color(COLOR_TEXT);
     static const char marker[] = "TEST_OK boot complete\n";
     serial_write(marker, sizeof marker - 1);

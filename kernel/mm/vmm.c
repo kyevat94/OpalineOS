@@ -294,6 +294,22 @@ bool vmm_map_in(u64 page_table, u64 virt, u64 phys, u32 flags) {
     return ok;
 }
 
+u64 vmm_unmap_in(u64 page_table, u64 virt) {
+    u64 f = spin_lock(&lock);
+    u64 *pml4 = phys_to_virt(page_table);
+    u64 *pdpt = next_table(pml4, (virt >> 39) & 511, false, false);
+    u64 *pd = pdpt ? next_table(pdpt, (virt >> 30) & 511, false, false) : NULL;
+    u64 *pt = pd ? next_table(pd, (virt >> 21) & 511, false, false) : NULL;
+    u64 phys = VMM_NOT_MAPPED;
+    if (pt && (pt[(virt >> 12) & 511] & PTE_PRESENT)) {
+        phys = pt[(virt >> 12) & 511] & PTE_ADDR;
+        pt[(virt >> 12) & 511] = 0;
+        if (read_cr3() == page_table) invlpg(virt);
+    }
+    spin_unlock(&lock, f);
+    return phys;
+}
+
 u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte_out) {
     u64 *pml4 = phys_to_virt(page_table);
     u64 *pdpt = next_table(pml4, (virt >> 39) & 511, false, false);
@@ -303,17 +319,6 @@ u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte_out) {
     if (pte_out) *pte_out = e;
     if (!(e & PTE_PRESENT)) return VMM_NOT_MAPPED;
     return (e & PTE_ADDR) + (virt & (PAGE_SIZE - 1));
-}
-
-bool vmm_user_range_ok(u64 page_table, u64 addr, u64 len, bool write) {
-    if (len == 0) return addr < USER_TOP;
-    if (addr + len < addr || addr + len > USER_TOP) return false;
-    for (u64 page = ALIGN_DOWN(addr, PAGE_SIZE); page < addr + len; page += PAGE_SIZE) {
-        u64 pte;
-        if (vmm_translate_in(page_table, page, &pte) == VMM_NOT_MAPPED) return false;
-        if (!(pte & PTE_USER) || (write && !(pte & PTE_WRITE))) return false;
-    }
-    return true;
 }
 
 void vmm_destroy_address_space(u64 page_table) {

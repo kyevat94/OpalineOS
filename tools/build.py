@@ -7,9 +7,12 @@
 
 Outputs (in build/):
     BOOTX64.EFI     the UEFI bootloader
-    user/*.elf      user programs
+    user/*.elf      user programs (the minimal user/lib library)
+    sysroot/        musl, the C library (tools/ports/musl.py; downloaded once)
+    posix/*         C programs built against musl: tests/posix/<name>.c becomes <name> (dynamic,
+                    through /lib/ld-musl-x86_64.so.1) and <name>-static
     root/           the tree copied into the EFS3 root partition: rootfs/ plus the programs
-                    (/apps/<name>, the shell as /system/bin/sh)
+                    (/apps/<name>, the shell as /system/bin/sh, the C library as /lib/...)
     KERNEL.ELF      the kernel
     opaline.img     raw GPT disk image (128 MiB) with the EFI System Partition
     opaline.vmdk    VirtualBox descriptor pointing at opaline.img (created once)
@@ -34,6 +37,13 @@ USER_BUILD = os.path.join(BUILD, "user")
 ROOT_TREE = os.path.join(BUILD, "root")
 ROOTFS_SRC = os.path.join(ROOT, "rootfs")
 SYSTEM_PROGRAMS = {"sh": "system/bin/sh"}   # everything else goes to /apps/<name>
+POSIX_SRC = os.path.join(ROOT, "tests", "posix")
+POSIX_BUILD = os.path.join(BUILD, "posix")
+SYSROOT = os.path.join(BUILD, "sysroot")
+LDSO = "/lib/ld-musl-x86_64.so.1"
+
+sys.path.insert(0, os.path.join(TOOLS, "ports"))
+import musl  # noqa: E402  (tools/ports/musl.py)
 
 LLVM_DIRS = [r"C:\Program Files\LLVM\bin"]
 NASM_DIRS = [r"C:\Program Files\NASM", os.path.join(os.environ.get("LOCALAPPDATA", ""), "bin", "NASM")]
@@ -143,8 +153,36 @@ def build_user():
     return programs
 
 
-def make_root_tree(programs):
-    """build/root = rootfs/ + the user programs."""
+POSIX_CFLAGS = [
+    "--target=x86_64-unknown-linux-musl", "-std=c11", "-O2", "-g0", "-nostdinc",
+    "-isystem", os.path.join(SYSROOT, "include"), "-fno-pic", "-fno-pie",
+] + WARNINGS
+
+
+def build_posix():
+    """Builds tests/posix/<name>.c against musl: build/posix/<name> (dynamic) and <name>-static."""
+    clang = tool("clang", LLVM_DIRS)
+    ld = tool("ld.lld", LLVM_DIRS)
+    lib = os.path.join(SYSROOT, "lib")
+    crt = [os.path.join(lib, n) for n in ("crt1.o", "crti.o")]
+    os.makedirs(POSIX_BUILD, exist_ok=True)
+    programs = []
+    for src in sources(POSIX_SRC, ".c"):
+        name = os.path.splitext(os.path.basename(src))[0]
+        obj = obj_path(src, "posix")
+        os.makedirs(os.path.dirname(obj), exist_ok=True)
+        run([clang] + POSIX_CFLAGS + ["-c", src, "-o", obj])
+        common = [ld, "-nostdlib", "-no-pie", "-z", "max-page-size=4096", "-z", "noexecstack", "--gc-sections"]
+        run(common + ["-static", "-o", os.path.join(POSIX_BUILD, name + "-static")] + crt +
+            [obj, os.path.join(lib, "libc.a"), os.path.join(lib, "libopaline_rt.a"), os.path.join(lib, "crtn.o")])
+        run(common + ["--dynamic-linker", LDSO, "-o", os.path.join(POSIX_BUILD, name)] + crt +
+            [obj, "-L", lib, "-lc", os.path.join(lib, "crtn.o")])
+        programs += [name, name + "-static"]
+    return programs
+
+
+def make_root_tree(programs, posix_programs=()):
+    """build/root = rootfs/ + the user programs + the C library and the programs built with it."""
     if os.path.isdir(ROOT_TREE):
         shutil.rmtree(ROOT_TREE)
     shutil.copytree(ROOTFS_SRC, ROOT_TREE)
@@ -154,6 +192,11 @@ def make_root_tree(programs):
         dest = os.path.join(ROOT_TREE, *SYSTEM_PROGRAMS.get(name, "apps/" + name).split("/"))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copyfile(os.path.join(USER_BUILD, name + ".elf"), dest)
+    ldso = os.path.join(ROOT_TREE, *LDSO.strip("/").split("/"))
+    os.makedirs(os.path.dirname(ldso), exist_ok=True)
+    shutil.copyfile(os.path.join(SYSROOT, "lib", "libc.so"), ldso)   # libc.so is also the dynamic linker
+    for name in posix_programs:
+        shutil.copyfile(os.path.join(POSIX_BUILD, name), os.path.join(ROOT_TREE, "apps", name))
 
 
 def build_kernel():
@@ -233,14 +276,16 @@ def main():
             shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
     os.makedirs(BUILD, exist_ok=True)
 
-    print("[1/4] bootloader", flush=True)
+    print("[1/5] bootloader", flush=True)
     build_bootloader()
-    print("[2/4] user programs", flush=True)
+    print("[2/5] C library (musl)", flush=True)
+    musl.build()
+    print("[3/5] user programs", flush=True)
     programs = build_user()
-    make_root_tree(programs)
-    print("[3/4] kernel", flush=True)
+    make_root_tree(programs, build_posix())
+    print("[4/5] kernel", flush=True)
     build_kernel()
-    print("[4/4] disk image", flush=True)
+    print("[5/5] disk image", flush=True)
     make_image(IMAGE)
     write_vmdk()
     print(f"OK: {os.path.relpath(IMAGE, ROOT)}")

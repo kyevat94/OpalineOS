@@ -300,7 +300,11 @@ static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
     (void)v, (void)off;
     if (len == 0) return 0;
     u64 f = irq_save();
-    while (tty.ready_len == 0 && tty.eof_pending == 0) waitqueue_wait(&tty.readers);
+    while (tty.ready_len == 0 && tty.eof_pending == 0)
+        if (waitqueue_wait_intr(&tty.readers) < 0) {   /* a signal arrived */
+            irq_restore(f);
+            return -EINTR;
+        }
     if (tty.ready_len == 0) {   /* Ctrl+D on an empty line */
         tty.eof_pending--;
         irq_restore(f);

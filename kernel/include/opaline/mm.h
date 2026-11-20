@@ -73,8 +73,7 @@ u64 vmm_kernel_page_table(void);
 u64 vmm_create_address_space(void);                        /* 0 if out of memory */
 bool vmm_map_in(u64 page_table, u64 virt, u64 phys, u32 flags);
 u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte);  /* pte: raw entry, may be NULL */
-/* True if [addr, addr+len) is user memory mapped in `page_table` (and writable if `write`). */
-bool vmm_user_range_ok(u64 page_table, u64 addr, u64 len, bool write);
+u64 vmm_unmap_in(u64 page_table, u64 virt);                /* the page's physical address, or VMM_NOT_MAPPED */
 /* Frees every user page and page table of the address space, then the PML4. */
 void vmm_destroy_address_space(u64 page_table);
 bool vmm_nx_enabled(void);

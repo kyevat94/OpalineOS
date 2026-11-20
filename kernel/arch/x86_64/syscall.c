@@ -16,8 +16,10 @@ void syscall_entry(void);
 
 void syscall_init(void) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
-    /* SYSCALL loads CS=0x08/SS=0x10; SYSRET loads CS=0x10+16 (user code), SS=0x10+8 (user data) */
-    wrmsr(MSR_STAR, ((u64)(GDT_KERNEL_DATA | 0) << 48) | ((u64)GDT_KERNEL_CODE << 32));
+    /* SYSCALL loads CS=0x08/SS=0x10; SYSRET loads CS=base+16 (user code), SS=base+8 (user data).
+       The base carries RPL 3: Intel CPUs force RPL 3 on both, but AMD ones take SS's RPL from
+       here, and a user SS with RPL 0 makes the next IRETQ back to user mode fault. */
+    wrmsr(MSR_STAR, ((u64)(GDT_KERNEL_DATA | 3) << 48) | ((u64)GDT_KERNEL_CODE << 32));
     wrmsr(MSR_LSTAR, (u64)syscall_entry);
     /* cleared on entry: TF (0x100), IF (0x200), DF (0x400), AC (0x40000) */
     wrmsr(MSR_FMASK, 0x40700);

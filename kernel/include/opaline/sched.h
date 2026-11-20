@@ -22,34 +22,56 @@
 enum thread_state {
     THREAD_READY,
     THREAD_RUNNING,
-    THREAD_SLEEPING,
     THREAD_BLOCKED,
     THREAD_DEAD,
 };
 
 struct file;
 struct vnode;
+struct mm;
 
 #define PROCESS_MAX_FDS 64
+#define NSIG 65                   /* signals 1..64, as in Linux */
+
+/* What a process does with a signal (struct k_sigaction of Linux rt_sigaction). */
+struct sigaction_k {
+    u64 handler;              /* 0 = default, 1 = ignore, else the handler address */
+    u64 flags;                /* SA_* */
+    u64 restorer;             /* where the handler returns to (SA_RESTORER) */
+    u64 mask;                 /* signals blocked while the handler runs */
+};
+
+enum process_state { PROCESS_ALIVE, PROCESS_ZOMBIE };
 
 struct process {
     u64 pid;
     char name[32];
-    u64 page_table;           /* physical address of the PML4 */
-    u64 thread_count;
+    u64 page_table;           /* physical address of the PML4 (mm->page_table for user processes) */
+    u64 thread_count;         /* threads not yet freed (maintained by the scheduler) */
     bool user;                /* has a user-mode address space */
     struct thread *main_thread;
-    u64 user_entry;           /* where the main thread enters user mode */
-    u64 user_stack;           /* its initial user stack pointer */
+    struct mm *mm;            /* user memory (stage E6); shared by CLONE_VM */
     /* files (stage E5) */
     struct file *fds[PROCESS_MAX_FDS];
+    u8 fd_flags[PROCESS_MAX_FDS];   /* FD_CLOEXEC */
     struct vnode *cwd;
     char cwd_path[256];
-    /* family */
+    /* family and lifetime (stage E6) */
     struct process *parent;   /* NULL: started by the kernel, or its parent ended */
     bool orphan;              /* nobody will wait: freed when it ends */
-    int signal;               /* set when killed by a CPU exception (POSIX signal number) */
+    enum process_state state;
+    int refs;                 /* one per thread not yet freed, one until reaped */
+    int live_threads;         /* threads that have not exited */
+    struct thread *threads;   /* linked through thread->proc_next */
+    bool exiting;             /* exit_group or a fatal signal: every thread must leave */
+    int exit_code;            /* for exit_group */
+    int signal;               /* set when killed by a signal (POSIX signal number) */
+    bool vfork_done;          /* a CLONE_VFORK child exec'd or ended */
+    /* signals (stage E6) */
+    struct sigaction_k sigactions[NSIG];
+    u64 sigpending;           /* sent to the process, taken by any thread that does not block it */
     struct process *all_next;
+    struct process *reap_next;   /* temporary list while a parent ends */
 };
 
 struct thread {
@@ -60,13 +82,31 @@ struct thread {
     struct process *process;
     u64 rsp;                  /* saved stack pointer while not running */
     u64 stack_top;            /* 0 for the boot thread (static stack) */
-    u64 wake_tick;            /* when a sleeping thread becomes ready */
+    u64 wake_tick;            /* when a blocked thread times out (0: no timeout) */
     int exit_code;
     bool joinable;
+    bool interruptible;       /* blocked in a wait that thread_interrupt may end */
+    int wake_reason;          /* result of thread_block: 0, -ETIMEDOUT or -EINTR */
+    volatile bool intr;       /* a signal or exit is pending: interruptible waits end at once */
+    struct waitqueue *wq;     /* wait queue the thread is blocked on */
     struct thread *joiner;    /* thread waiting in thread_join */
     void (*on_free)(struct thread *t);   /* called just before the thread is freed */
-    struct thread *next;      /* run queue / sleep list / dead list */
+    struct thread *next;      /* run queue / wait queue / dead list */
+    struct thread *sleep_next;/* list of threads with a timeout */
     struct thread *all_next;  /* list of every thread */
+    /* user threads (stage E6) */
+    u64 tid;                  /* thread id seen by programs (the pid for the main thread) */
+    struct thread *proc_next; /* the process's threads */
+    u64 fs_base;              /* FS segment base: thread-local storage */
+    u64 clear_child_tid;      /* user address zeroed and futex-woken at exit */
+    u64 sigmask;              /* blocked signals */
+    u64 sigpending;           /* sent to this thread */
+    u64 saved_sigmask;        /* sigsuspend: the mask to restore */
+    bool restore_sigmask;
+    u64 altstack_sp, altstack_size;
+    int altstack_flags;
+    bool iret_return;         /* the user registers were rewritten: return through IRETQ */
+    void *start_frame;        /* new user thread: the registers it starts with (kmalloc'd) */
 };
 
 typedef void (*thread_fn)(void *arg);
@@ -83,6 +123,8 @@ struct process *sched_kernel_process(void);
 struct thread *thread_current(void);
 void thread_yield(void);
 void thread_sleep_ms(u64 ms);
+/* Sleeps unless interrupted: 0 when the time passed, -EINTR if thread_interrupt woke it. */
+int thread_sleep_intr(u64 ms);
 NORETURN void thread_exit(int code);
 int thread_join(struct thread *t);    /* waits for t to finish, frees it, returns its exit code */
 void thread_detach(struct thread *t); /* nobody will join: freed automatically when it exits */
@@ -94,12 +136,31 @@ void thread_detach(struct thread *t); /* nobody will join: freed automatically w
  *     while (!condition) waitqueue_wait(&wq);
  *     ...
  *     irq_restore(f);
+ * waitqueue_wait_intr() also returns -EINTR when the thread is interrupted (a signal
+ * arrived, or the process is ending); the caller then gives up and returns -EINTR.
  */
 struct waitqueue {
     struct thread *head;
 };
 void waitqueue_wait(struct waitqueue *wq);      /* interrupts disabled */
+int waitqueue_wait_intr(struct waitqueue *wq);  /* interrupts disabled; 0 or -EINTR */
 void waitqueue_wake_all(struct waitqueue *wq);
+
+/*
+ * Lower-level blocking (interrupts disabled): the current thread blocks until
+ * thread_wake(), the timeout (ms, 0 = none) or, if `interruptible`,
+ * thread_interrupt(). Returns 0, -ETIMEDOUT or -EINTR.
+ */
+int thread_block(u64 timeout_ms, bool interruptible);
+void thread_wake(struct thread *t);             /* interrupts disabled */
+/* Sets t->intr and ends an interruptible wait of t. */
+void thread_interrupt(struct thread *t);
+/* Every thread (for lookups by the process code); interrupts disabled while walking it. */
+struct thread *sched_all_threads(void);
+/* Frees the dead threads nobody joins now, instead of waiting for the idle thread. */
+void sched_free_dead(void);
+/* Loads the initial FPU/SSE state into the registers (a new program starts clean). */
+void thread_reset_fpu(void);
 
 /* Sleeping lock: the waiting thread blocks instead of spinning (may be held across disk I/O). */
 struct mutex {

@@ -12,14 +12,8 @@
 
 #include <opaline/types.h>
 
-/* Registers saved by syscall_entry (kernel/arch/x86_64/syscall.asm), lowest address first. */
-struct syscall_frame {
-    u64 r15, r14, r13, r12, r9, r8, r10, rdx, rsi, rdi, rbp, rbx;
-    u64 rax;          /* system call number on entry, result on exit */
-    u64 rip;          /* user return address (RCX) */
-    u64 rflags;       /* user flags (R11) */
-    u64 rsp;          /* user stack pointer */
-};
+struct interrupt_frame;   /* syscall_entry saves the same frame as an interrupt (opaline/arch/idt.h) */
+#define SYSCALL_VECTOR 0x100     /* frame.vector of a system call */
 
 /* Programs the SYSCALL MSRs and the per-CPU data block. */
 void syscall_init(void);
@@ -27,8 +21,10 @@ void syscall_init(void);
 void cpu_set_syscall_stack(u64 top);
 /* Leaves the kernel: starts executing user code at `rip` with stack `rsp`. */
 NORETURN void jump_to_user(u64 rip, u64 rsp);
+/* Leaves the kernel with every register taken from `f`, which must be on the current kernel stack. */
+NORETURN void return_to_user(struct interrupt_frame *f);
 
-/* Implemented in kernel/proc/syscalls.c. */
-void syscall_dispatch(struct syscall_frame *f);
+/* Implemented in kernel/proc/syscalls.c. Returns non-zero when the frame must be restored with IRETQ. */
+int syscall_dispatch(struct interrupt_frame *f);
 
 #endif
