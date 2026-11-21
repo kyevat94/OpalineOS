@@ -31,7 +31,25 @@ struct block_device *block_first_disk(void) {
 
 /* ---- raw block I/O (partitions add their offset) ----------------------- */
 
+static bool cut_armed, cut_hit;
+static u64 cut_allowed, writes_done;
+
+void block_powercut_arm(u64 writes) {
+    cut_armed = true;
+    cut_hit = false;
+    cut_allowed = writes;
+    writes_done = 0;
+}
+
+u64 block_writes(void) { return writes_done; }
+bool block_powercut_hit(void) { return cut_hit; }
+
 static bool raw_io(struct block_device *dev, u64 block, u64 phys, bool write) {
+    if (write && cut_armed && ++writes_done > cut_allowed) {
+        if (!cut_hit) kprintf("POWERCUT: the disk lost power after %lu writes\n", cut_allowed);
+        cut_hit = true;
+        return true;   /* the write "succeeds" but never reaches the disk */
+    }
     u64 lba = block * SECTORS_PER_BLOCK;
     if (lba + SECTORS_PER_BLOCK > dev->sector_count) return false;   /* past the end of the partition */
     while (dev->parent) {
@@ -105,8 +123,15 @@ bool block_write(struct block_device *dev, u64 block, const void *data) {
 }
 
 bool block_flush(struct block_device *dev) {
+    if (cut_hit) return true;
     while (dev->parent) dev = dev->parent;
     return dev->flush ? dev->flush(dev) : true;
+}
+
+bool block_write_phys(struct block_device *dev, u64 block, u64 phys) {
+    struct cache_entry *e = lookup(dev, block);
+    if (e) e->dev = NULL;   /* the cached copy is no longer current */
+    return raw_io(dev, block, phys, true);
 }
 
 void block_cache_stats(u64 *h, u64 *m) {

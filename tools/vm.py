@@ -90,7 +90,8 @@ TESTS = [
       "ACPI: power off via PM1a control port", "Shutting down..."],
      ["PANIC", "FAILED", "  FAIL ", "unexpected interrupt", "this must not happen", "the VM did not power off"]),
 ]
-DONE_MARKERS = [BOOT_OK, PANIC_END]
+POWERCUT_OK = "TEST_OK powercut"
+DONE_MARKERS = [BOOT_OK, PANIC_END, POWERCUT_OK]
 
 
 def find(name, dirs):
@@ -157,7 +158,7 @@ def qemu_cmd(image, serial_log, headless, extra=()):
     cmd = [qemu, "-machine", "q35", "-m", "512", "-no-reboot",
            "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
            "-drive", f"if=pflash,format=raw,file={vars_copy}",
-           "-drive", f"format=raw,file={image}",
+           "-drive", f"format=raw,file={image},cache=unsafe",   # fast flushes; power cuts are simulated in the guest
            "-serial", f"file:{serial_log}", *extra]
     if headless:
         cmd += ["-display", "none"]
@@ -404,7 +405,7 @@ def persistence_test():
         if not ok or expect not in log:
             problems.append(f"boot {boot}: {expect!r} not printed")
             break
-        fs = efs3.Efs3.from_disk(path)
+        fs = efs3.Efs3.from_disk(path, replay=False)   # after a clean run the journal must be empty
         counter = fs.read(fs.lookup("/home/persist.txt")).decode()
         if counter != f"{boot}\n":
             problems.append(f"boot {boot}: /home/persist.txt read on the host is {counter!r}, expected {boot!r}")
@@ -414,7 +415,69 @@ def persistence_test():
     return not problems, log, problems
 
 
-SESSION_TESTS = [("shell", "qemu", shell_test), ("persistence", "qemu", persistence_test)]
+def powercut_test():
+    """Stage SE2: the disk loses power in the middle of a file system workload (the kernel drops every
+    block write after the N-th: "test=powercut:N"); the next normal boot must repair it from the EFS3
+    journal, and the host's fsck must then find nothing wrong. N runs over the whole workload."""
+    import re
+    import efs3
+    path = os.path.join(BUILD, "powercut.img")
+    log = os.path.join(BUILD, "serial-powercut.log")
+    problems, texts = [], []
+
+    def boot(img):
+        proc = qemu_boot(img, log)
+        try:
+            return wait_for_done(log, lambda: proc.poll() is None)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def cut_and_repair(n):
+        cmd = f"test=powercut:{n}"
+        build.make_image(path, cmd)
+        text1 = boot(path)
+        texts.append(text1)
+        if POWERCUT_OK not in text1:
+            return False, [f"cut after {n} writes: the workload did not reach its end"], text1
+        with open(path, "r+b") as f:   # the second boot is a normal one: blank out the command line
+            data = f.read()
+            at = data.find(cmd.encode())
+            if at < 0:
+                return False, [f"cut after {n} writes: the command line is not in the image"], text1
+            f.seek(at)
+            f.write(b" " * len(cmd))
+        text2 = boot(path)
+        texts.append(text2)
+        if BOOT_OK not in text2:
+            return False, [f"cut after {n} writes: the next boot did not complete"], text2
+        errors = efs3.Efs3.from_disk(path, replay=False).check()
+        return "journal replayed" in text2, [f"cut after {n} writes: fsck: {e}" for e in errors[:4]], text2
+
+    # first the whole workload, to learn how many writes it makes
+    build.make_image(path, "test=powercut:0")
+    text = boot(path)
+    m = re.search(r"POWERCUT workload finished: (\d+) writes", text)
+    if not m:
+        os.remove(path)
+        return False, text, ["the power-cut workload did not finish"]
+    total = int(m.group(1))
+    points = sorted({1, 2, *(total * k // 8 for k in range(1, 8)), total - 1})
+    replays = 0
+    for n in points:
+        replayed, errors, text = cut_and_repair(n)
+        replays += replayed
+        problems += errors
+    if not problems and not replays:
+        problems.append("no power cut needed the journal: the test did not exercise it")
+    os.remove(path)
+    summary = f"[vm.py: {total} writes in the workload; cut after {points}; journal replayed {replays} times]"
+    return not problems, "\n".join(texts) + "\n" + summary + "\n", problems + ([] if problems else [])
+
+
+SESSION_TESTS = [("shell", "qemu", shell_test), ("persistence", "qemu", persistence_test),
+                 ("powercut", "qemu", powercut_test)]
 
 
 # ---- VirtualBox ---------------------------------------------------------

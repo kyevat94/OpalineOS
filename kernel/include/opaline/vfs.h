@@ -24,7 +24,7 @@
 #define PATH_MAX  1024
 #define MAX_FDS   64
 
-enum vnode_type { VN_FILE = 1, VN_DIR, VN_CHARDEV, VN_PIPE };
+enum vnode_type { VN_FILE = 1, VN_DIR, VN_CHARDEV, VN_PIPE, VN_SYMLINK };
 
 /* Linux open() flags */
 #define O_ACCMODE   0x0003
@@ -37,6 +37,7 @@ enum vnode_type { VN_FILE = 1, VN_DIR, VN_CHARDEV, VN_PIPE };
 #define O_APPEND    0x0400
 #define O_NONBLOCK  0x0800
 #define O_DIRECTORY 0x10000
+#define O_NOFOLLOW  0x20000
 #define O_CLOEXEC   0x80000
 
 struct vnode;
@@ -95,6 +96,10 @@ struct vnode_ops {
     int (*readdir)(struct vnode *dir, u64 *cookie, struct dir_entry *out);   /* 1 entry, 0 end, <0 error */
     int (*stat)(struct vnode *v, struct vnode_stat *out);
     int (*setattr)(struct vnode *v, const struct vnode_attr *attr);   /* also sets ctime */
+    /* symbolic and hard links (stage SE2) */
+    int (*symlink)(struct vnode *dir, const char *name, u32 len, const char *target, const struct vnode_attr *attr);
+    int (*readlink)(struct vnode *v, char *buf, u32 size);            /* the target's length */
+    int (*link)(struct vnode *dir, const char *name, u32 len, struct vnode *target);
     int (*ioctl)(struct vnode *v, u64 request, u64 arg);
     int (*sync)(struct vnode *v);
     void (*close)(struct vnode *v, u32 open_flags);   /* an open file of this vnode was closed */
@@ -136,8 +141,10 @@ int vfs_mount_root(struct vnode *root);
 int vfs_mount(const char *path, struct vnode *root);
 struct vnode *vfs_root(void);
 
-/* Path lookup relative to `cwd` (NULL = root). */
+/* Path lookup relative to `cwd` (NULL = root). Symbolic links are followed (at most 40 in one
+   lookup, then -ELOOP); vfs_lookup_nofollow does not follow the last component. */
 int vfs_lookup(const char *path, struct vnode *cwd, struct vnode **out);
+int vfs_lookup_nofollow(const char *path, struct vnode *cwd, struct vnode **out);
 /* Finds the parent directory of `path` and copies the final (normalized) name. */
 int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len);
 
@@ -162,6 +169,13 @@ int vfs_mkdir(const char *path, struct vnode *cwd, u32 mode);
 int vfs_remove(const char *path, struct vnode *cwd, bool is_dir);
 int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd);
 int vfs_stat(const char *path, struct vnode *cwd, struct vnode_stat *out);
+int vfs_lstat(const char *path, struct vnode *cwd, struct vnode_stat *out);   /* a link itself */
+int vfs_symlink(const char *target, const char *path, struct vnode *cwd);
+int vfs_readlink(const char *path, struct vnode *cwd, char *buf, u32 size);
+/* A hard link `new_path` to `old_path` (follow: a symbolic link old_path is resolved first). */
+int vfs_link(const char *old_path, struct vnode *old_cwd, const char *new_path, struct vnode *new_cwd, bool follow);
+/* The absolute path of a directory, found by walking ".." up to the root (for getcwd). */
+int vfs_path_of(struct vnode *dir, char *out, u64 size);
 /* Permission checks with the calling process's credentials (opaline/cred.h): 0 or -EACCES. */
 int vfs_permission(struct vnode *v, int want);
 int vfs_access(const char *path, struct vnode *cwd, int want, bool real_ids);
@@ -177,6 +191,7 @@ void efs3_info(struct vnode *root, u64 *total_blocks, u64 *free_blocks, char *la
 struct vnode *devfs_init(void);
 int pipe_create(struct file **read_end, struct file **write_end);
 struct vnode *tty_vnode(void);
+void powercut_test(u64 cut_after);              /* kernel/fs/powercut.c */
 void tty_set_foreground(u64 sid, u64 pgid);    /* job control (stage SE1) */
 u64 tty_session(void);
 void tty_input(const char *utf8, u32 len);     /* keyboard -> terminal */

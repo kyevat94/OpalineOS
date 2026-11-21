@@ -38,7 +38,7 @@
 #include <opaline/string.h>
 #include <opaline/vfs.h>
 
-#define OPALINE_VERSION "0.6.1-se1"
+#define OPALINE_VERSION "0.6.2-se2"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",
@@ -117,7 +117,21 @@ static void faulty_thread(void *arg) {
     __asm__ volatile("mov (%0), %%rax" : : "r"(0ULL) : "rax", "memory");
 }
 
+/* The number after "test=powercut:" in the command line, or -1. */
+static i64 powercut_arg(const char *cmdline) {
+    static const char key[] = "test=powercut:";
+    for (const char *p = cmdline; *p; p++) {
+        if (strncmp(p, key, sizeof key - 1) || (p != cmdline && p[-1] != ' ')) continue;
+        i64 n = 0;
+        for (p += sizeof key - 1; *p >= '0' && *p <= '9'; p++) n = n * 10 + (*p - '0');
+        return n;
+    }
+    return -1;
+}
+
 static void run_self_test(const char *cmdline) {
+    i64 cut = powercut_arg(cmdline);
+    if (cut >= 0) powercut_test((u64)cut);   /* does not return */
     if (has_word(cmdline, "test=stackoverflow")) {
         kprintf("Self-test: overflowing a thread's stack...\n");
         thread_join(thread_create("overflow", overflow_thread, NULL));

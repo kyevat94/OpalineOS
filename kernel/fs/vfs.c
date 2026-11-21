@@ -205,11 +205,20 @@ static int step(struct vnode *cur, const char *name, u32 len, struct vnode **nex
     return 0;
 }
 
-/* Walks `path` up to (not including) its last component when `stop_before_last`. */
-static int walk(const char *path, struct vnode *cwd, bool stop_before_last, struct vnode **out, const char **last,
-                u32 *last_len) {
+#define SYMLINK_MAX 40
+
+/*
+ * Walks `path` from `cwd`, following symbolic links (a link's target replaces it in the
+ * path: relative targets start from the link's directory). The last component is followed
+ * only with `follow_last`. With `want_parent`, stops before the last component, returns its
+ * directory and copies the name (raw) into `last` (NAME_MAX + 1 bytes).
+ */
+static int walk(const char *path, struct vnode *cwd, bool want_parent, bool follow_last, struct vnode **out,
+                char *last, u32 *last_len) {
     if (!root) return -ENOENT;
     if (!path[0]) return -ENOENT;
+    char *buf = NULL;   /* the path once a link was expanded */
+    int links = 0, r = 0;
     struct vnode *cur = (path[0] == '/' || !cwd) ? root : cwd;
     vnode_ref(cur);
     const char *p = path;
@@ -222,43 +231,88 @@ static int walk(const char *path, struct vnode *cwd, bool stop_before_last, stru
         while (*rest == '/') rest++;
         if (len == 0) break;                          /* trailing slash or the root itself */
         if (len > NAME_MAX) {
-            vnode_put(cur);
-            return -ENAMETOOLONG;
+            r = -ENAMETOOLONG;
+            goto fail;
         }
-        if (stop_before_last && !*rest) {
-            *last = start;
+        bool final = !*rest;
+        if (want_parent && final) {
+            memcpy(last, start, len);
+            last[len] = 0;
             *last_len = len;
             *out = cur;
+            kfree(buf);
             return 0;
         }
         struct vnode *next;
-        int r = step(cur, start, len, &next);
+        r = step(cur, start, len, &next);
+        if (r < 0) goto fail;
+        if (next->type == VN_SYMLINK && (!final || follow_last)) {
+            char *target = kmalloc(PATH_MAX), *nb = kmalloc(PATH_MAX);
+            int n = !target || !nb ? -ENOMEM : ++links > SYMLINK_MAX ? -ELOOP
+                  : next->ops->readlink ? next->ops->readlink(next, target, PATH_MAX - 1) : -EINVAL;
+            vnode_put(next);
+            u64 rlen = strlen(rest);
+            if (n == 0) n = -ENOENT;
+            if (n > 0 && (u64)n + 1 + rlen >= PATH_MAX) n = -ENAMETOOLONG;
+            if (n < 0) {
+                kfree(target);
+                kfree(nb);
+                r = n;
+                goto fail;
+            }
+            memcpy(nb, target, (u64)n);   /* the target, then what was left of the path */
+            u64 at = (u64)n;
+            if (rlen) {
+                nb[at++] = '/';
+                memcpy(nb + at, rest, rlen);
+                at += rlen;
+            }
+            nb[at] = 0;
+            kfree(target);
+            kfree(buf);
+            buf = nb;
+            p = nb;
+            if (nb[0] == '/') {   /* absolute target: from the root again */
+                vnode_put(cur);
+                cur = root;
+                vnode_ref(cur);
+            }
+            continue;   /* a relative target starts from the link's directory, which is cur */
+        }
         vnode_put(cur);
-        if (r < 0) return r;
         cur = next;
     }
-    if (stop_before_last) {   /* "/" or "dir/": there is no final name */
-        vnode_put(cur);
-        return -EINVAL;
+    if (want_parent) {   /* "/" or "dir/": there is no final name */
+        r = -EINVAL;
+        goto fail;
     }
     *out = cur;
+    kfree(buf);
     return 0;
+fail:
+    vnode_put(cur);
+    kfree(buf);
+    return r;
 }
 
 int vfs_lookup(const char *path, struct vnode *cwd, struct vnode **out) {
-    return walk(path, cwd, false, out, NULL, NULL);
+    return walk(path, cwd, false, true, out, NULL, NULL);
+}
+
+int vfs_lookup_nofollow(const char *path, struct vnode *cwd, struct vnode **out) {
+    return walk(path, cwd, false, false, out, NULL, NULL);
 }
 
 int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len) {
-    const char *last;
-    u32 last_len;
-    int r = walk(path, cwd, true, parent, &last, &last_len);
+    char raw[NAME_MAX + 1];
+    u32 raw_len;
+    int r = walk(path, cwd, true, true, parent, raw, &raw_len);
     if (r < 0) return r;
-    if (is_dot(last, last_len)) {
+    if (is_dot(raw, raw_len)) {
         vnode_put(*parent);
         return -EINVAL;
     }
-    int n = vfs_normalize_name(last, last_len, name);
+    int n = vfs_normalize_name(raw, raw_len, name);
     if (n < 0) {
         vnode_put(*parent);
         return n;
@@ -296,7 +350,11 @@ void file_put(struct file *f) {
 
 int vfs_open(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct file **out) {
     struct vnode *v;
-    int r = vfs_lookup(path, cwd, &v);
+    int r = (flags & O_NOFOLLOW) ? vfs_lookup_nofollow(path, cwd, &v) : vfs_lookup(path, cwd, &v);
+    if (r == 0 && v->type == VN_SYMLINK) {   /* only with O_NOFOLLOW: a link cannot be opened */
+        vnode_put(v);
+        return -ELOOP;
+    }
     bool created = false;
     if (r == -ENOENT && (flags & O_CREAT)) {
         struct vnode *parent;
@@ -469,6 +527,122 @@ int vfs_stat(const char *path, struct vnode *cwd, struct vnode_stat *out) {
     if (r < 0) return r;
     r = v->ops->stat(v, out);
     vnode_put(v);
+    return r;
+}
+
+int vfs_lstat(const char *path, struct vnode *cwd, struct vnode_stat *out) {
+    struct vnode *v;
+    int r = vfs_lookup_nofollow(path, cwd, &v);
+    if (r < 0) return r;
+    r = v->ops->stat(v, out);
+    vnode_put(v);
+    return r;
+}
+
+int vfs_symlink(const char *target, const char *path, struct vnode *cwd) {
+    if (!target[0]) return -ENOENT;
+    struct vnode *parent;
+    char name[NAME_MAX + 1];
+    u32 len;
+    int r = vfs_lookup_parent(path, cwd, &parent, name, &len);
+    if (r < 0) return r;
+    struct vnode_attr attr;
+    r = may(parent, MAY_WRITE | MAY_EXEC, false);
+    if (r == 0) r = new_attr(parent, VN_SYMLINK, 0777, &attr);
+    attr.mode = 0777;   /* links are always rwx for everyone: the target's mode is what counts */
+    if (r == 0) r = parent->ops->symlink ? parent->ops->symlink(parent, name, len, target, &attr) : -EPERM;
+    vnode_put(parent);
+    return r;
+}
+
+int vfs_readlink(const char *path, struct vnode *cwd, char *buf, u32 size) {
+    struct vnode *v;
+    int r = vfs_lookup_nofollow(path, cwd, &v);
+    if (r < 0) return r;
+    r = v->type == VN_SYMLINK && v->ops->readlink ? v->ops->readlink(v, buf, size) : -EINVAL;
+    vnode_put(v);
+    return r;
+}
+
+int vfs_link(const char *old_path, struct vnode *old_cwd, const char *new_path, struct vnode *new_cwd, bool follow) {
+    struct vnode *v, *parent;
+    int r = follow ? vfs_lookup(old_path, old_cwd, &v) : vfs_lookup_nofollow(old_path, old_cwd, &v);
+    if (r < 0) return r;
+    if (v->type == VN_DIR) {
+        vnode_put(v);
+        return -EPERM;   /* no hard links to directories */
+    }
+    char name[NAME_MAX + 1];
+    u32 len;
+    r = vfs_lookup_parent(new_path, new_cwd, &parent, name, &len);
+    if (r < 0) {
+        vnode_put(v);
+        return r;
+    }
+    r = may(parent, MAY_WRITE | MAY_EXEC, false);
+    if (r == 0 && parent->fs != v->fs) r = -EXDEV;
+    if (r == 0) r = parent->ops->link ? parent->ops->link(parent, name, len, v) : -EPERM;
+    vnode_put(parent);
+    vnode_put(v);
+    return r;
+}
+
+int vfs_path_of(struct vnode *dir, char *out, u64 size) {
+    char *tmp = kmalloc(PATH_MAX);
+    struct dir_entry *de = kmalloc(sizeof *de);
+    if (!tmp || !de) {
+        kfree(tmp);
+        kfree(de);
+        return -ENOMEM;
+    }
+    u64 pos = PATH_MAX - 1;
+    tmp[pos] = 0;
+    struct vnode *cur = dir;
+    vnode_ref(cur);
+    int r = 0;
+    for (int depth = 0; cur != root; depth++) {
+        if (depth > 256) {
+            r = -ELOOP;
+            break;
+        }
+        if (cur->covers) {   /* the root of a mounted file system: continue from the mount point */
+            struct vnode *c = cur->covers;
+            vnode_ref(c);
+            vnode_put(cur);
+            cur = c;
+            continue;
+        }
+        struct vnode *parent;
+        r = cur->ops->lookup ? cur->ops->lookup(cur, "..", 2, &parent) : -ENOENT;
+        if (r < 0) break;
+        u64 cookie = 0;
+        bool found = false;
+        while ((r = parent->ops->readdir(parent, &cookie, de)) > 0)
+            if (de->ino == cur->ino && !is_dot(de->name, de->name_len)) {
+                found = true;
+                break;
+            }
+        if (!found || pos < (u64)de->name_len + 2) {
+            vnode_put(parent);
+            r = r < 0 ? r : !found ? -ENOENT : -ENAMETOOLONG;
+            break;
+        }
+        pos -= de->name_len;
+        memcpy(tmp + pos, de->name, de->name_len);
+        tmp[--pos] = '/';
+        vnode_put(cur);
+        cur = parent;
+        r = 0;
+    }
+    vnode_put(cur);
+    if (r == 0) {
+        if (pos == PATH_MAX - 1) tmp[--pos] = '/';   /* the root itself */
+        u64 n = PATH_MAX - pos;                      /* with the terminating zero */
+        if (n > size) r = -ERANGE;
+        else memcpy(out, tmp + pos, n);
+    }
+    kfree(tmp);
+    kfree(de);
     return r;
 }
 

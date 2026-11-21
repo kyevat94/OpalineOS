@@ -6,14 +6,26 @@
  *
  * Every operation runs under one mutex per mounted file system. Inodes are not
  * kept in memory: they are read and written through the block cache, which is
- * write-through, so each operation is on disk when it returns. There is no
- * journal yet: a power cut in the middle of an operation can leave
- * inconsistencies.
+ * write-through, so each operation is on disk when it returns.
+ *
+ * Journal (format version 2): each operation is one transaction. Its metadata
+ * blocks (superblock, bitmaps, inodes, directories, indirect blocks, symbolic
+ * links) are staged in memory while it runs; at the end they are written to the
+ * journal with a commit block that carries a checksum, then to their own places,
+ * then the transaction is marked done. File contents go straight to the disk
+ * before the commit ("ordered" mode, as in ext4), so a file never points to
+ * garbage. At mount, a committed transaction that was not marked done is written
+ * again (replayed), so a power cut never leaves the file system inconsistent; the
+ * contents of a write that was cut may be half new. Blocks freed by a transaction
+ * are only freed in the bitmap when it commits, so the same transaction cannot
+ * reuse them while committed metadata may still point to them. Version 1 images
+ * (no journal) still mount, without that protection.
  *
  * A file that is deleted while open keeps its data until the last reference
  * to it is dropped (as in POSIX).
  */
 #include <opaline/block.h>
+#include <opaline/console.h>
 #include <opaline/errno.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
@@ -27,6 +39,7 @@
 #define PTRS (BLOCK_SIZE / 4)
 #define FT_FILE 1
 #define FT_DIR  2
+#define FT_SYMLINK 3
 
 struct efs3_super {
     char magic[4];
@@ -34,7 +47,29 @@ struct efs3_super {
     u32 inode_table, inode_table_blocks, first_data, root_inode, free_blocks, free_inodes, reserved;
     char label[32];
     u8 uuid[16];
+    u32 journal_start, journal_blocks;   /* version 2 */
 } PACKED;
+
+/* Journal blocks (relative to journal_start): 0 header, 1 descriptor, 2.. copies, then the commit. */
+struct jheader {
+    char magic[4];               /* "EFJH" */
+    u32 version;
+    u64 seq;                     /* the next transaction's number: older ones are done */
+} PACKED;
+struct jdesc {
+    char magic[4];               /* "EFJD" */
+    u32 count;
+    u64 seq;
+    u32 blocks[];                /* where each copy belongs */
+} PACKED;
+struct jcommit {
+    char magic[4];               /* "EFJC" */
+    u32 count;
+    u64 seq;
+    u32 checksum;                /* FNV-1a of the descriptor's seq, count and block list, then of every copy */
+} PACKED;
+
+#define TX_MAX 200               /* metadata blocks one transaction may stage */
 
 struct efs3_inode {
     u16 mode, links;
@@ -62,24 +97,178 @@ struct efs3 {
     struct mutex lock;
     struct vnode *cache;          /* vnodes of this file system, one per inode */
     u32 block_hint, inode_hint;
+    /* journal */
+    u32 jstart, jblocks;          /* 0: no journal (version 1) */
+    u64 jseq;                     /* number of the next transaction */
+    u64 jpage;                    /* scratch page for the descriptor, commit and header */
+    u32 tx_count;
+    u32 tx_block[TX_MAX];
+    u64 tx_phys[TX_MAX];          /* the staged contents, one page each */
+    u32 *tx_free;                 /* blocks to free in the bitmap when the transaction commits */
+    u32 tx_free_count, tx_free_cap;
 };
 
 static const struct vnode_ops efs3_ops;
+
+/* ---- transactions ------------------------------------------------------------ */
+
+static u32 tx_capacity(struct efs3 *fs) { return fs->jblocks ? MIN((u32)TX_MAX, fs->jblocks - 3) : TX_MAX; }
+
+/* A block as this transaction sees it: the staged copy, or the cache. */
+static u8 *bread(struct efs3 *fs, u64 b) {
+    for (u32 i = 0; i < fs->tx_count; i++)
+        if (fs->tx_block[i] == b) return phys_to_virt(fs->tx_phys[i]);
+    return block_read(fs->dev, b);
+}
+
+/* Stages a metadata block (written at commit). */
+static bool bwrite(struct efs3 *fs, u64 b, const void *data) {
+    for (u32 i = 0; i < fs->tx_count; i++)
+        if (fs->tx_block[i] == b) {
+            if (phys_to_virt(fs->tx_phys[i]) != data) memcpy(phys_to_virt(fs->tx_phys[i]), data, BLOCK_SIZE);
+            return true;
+        }
+    if (fs->tx_count == tx_capacity(fs)) panic("efs3: a transaction needs more than %u metadata blocks", tx_capacity(fs));
+    u64 phys = pmm_alloc_page();
+    if (!phys) return false;
+    memcpy(phys_to_virt(phys), data, BLOCK_SIZE);
+    fs->tx_block[fs->tx_count] = (u32)b;
+    fs->tx_phys[fs->tx_count++] = phys;
+    return true;
+}
+
 static u8 zero_block[BLOCK_SIZE] ALIGNED(16);
+
+/* A block just allocated: zero on the disk (it was free, so nothing committed points to it). */
+static void zero_new_block(struct efs3 *fs, u32 b) {
+    for (u32 i = 0; i < fs->tx_count; i++)
+        if (fs->tx_block[i] == b) {
+            memset(phys_to_virt(fs->tx_phys[i]), 0, BLOCK_SIZE);
+            return;
+        }
+    block_write(fs->dev, b, zero_block);
+}
+
+static u32 fnv1a(u32 h, const void *data, u64 len) {
+    const u8 *p = data;
+    for (u64 i = 0; i < len; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+static u32 journal_checksum(const struct jdesc *d, const u64 *phys, struct block_device *dev, u32 jstart) {
+    u32 h = fnv1a(2166136261u, &d->count, 4);
+    h = fnv1a(h, &d->seq, 8);
+    h = fnv1a(h, d->blocks, d->count * 4);
+    for (u32 i = 0; i < d->count; i++) {
+        const u8 *data = phys ? phys_to_virt(phys[i]) : block_read(dev, jstart + 2 + i);
+        if (!data) return 0;
+        h = fnv1a(h, data, BLOCK_SIZE);
+    }
+    return h;
+}
+
+static void bitmap_clear(struct efs3 *fs, u32 first_block, u32 bit);
+static bool write_super(struct efs3 *fs);
+
+/* Ends the transaction: journal, commit, write in place, mark done. */
+static void tx_commit(struct efs3 *fs) {
+    for (u32 i = 0; i < fs->tx_free_count; i++) {   /* the deferred frees */
+        bitmap_clear(fs, fs->sb.block_bitmap, fs->tx_free[i]);
+        fs->sb.free_blocks++;
+    }
+    if (fs->tx_free_count) write_super(fs);
+    fs->tx_free_count = 0;
+    if (!fs->tx_count) return;
+    if (fs->jblocks) {
+        struct jdesc *d = phys_to_virt(fs->jpage);
+        memset(d, 0, BLOCK_SIZE);
+        memcpy(d->magic, "EFJD", 4);
+        d->count = fs->tx_count;
+        d->seq = fs->jseq;
+        memcpy(d->blocks, fs->tx_block, fs->tx_count * 4);
+        u32 sum = journal_checksum(d, fs->tx_phys, fs->dev, fs->jstart);
+        for (u32 i = 0; i < fs->tx_count; i++) block_write_phys(fs->dev, fs->jstart + 2 + i, fs->tx_phys[i]);
+        block_write_phys(fs->dev, fs->jstart + 1, fs->jpage);
+        block_flush(fs->dev);
+        struct jcommit *c = phys_to_virt(fs->jpage);
+        memset(c, 0, BLOCK_SIZE);
+        memcpy(c->magic, "EFJC", 4);
+        c->count = fs->tx_count;
+        c->seq = fs->jseq;
+        c->checksum = sum;
+        block_write_phys(fs->dev, fs->jstart + 2 + fs->tx_count, fs->jpage);
+        block_flush(fs->dev);   /* committed: from here on a power cut is repaired at the next mount */
+    }
+    for (u32 i = 0; i < fs->tx_count; i++) block_write(fs->dev, fs->tx_block[i], phys_to_virt(fs->tx_phys[i]));
+    if (fs->jblocks) {
+        block_flush(fs->dev);
+        struct jheader *h = phys_to_virt(fs->jpage);
+        memset(h, 0, BLOCK_SIZE);
+        memcpy(h->magic, "EFJH", 4);
+        h->version = 1;
+        h->seq = ++fs->jseq;   /* done */
+        block_write_phys(fs->dev, fs->jstart, fs->jpage);
+        block_flush(fs->dev);
+    }
+    for (u32 i = 0; i < fs->tx_count; i++) pmm_free_page(fs->tx_phys[i]);
+    fs->tx_count = 0;
+}
+
+/* Writes a committed transaction found in the journal again (at mount). Returns its number, or 0. */
+static u64 journal_replay(struct block_device *dev, u32 jstart, u32 jblocks, u64 *next_seq) {
+    struct jheader h;
+    u8 *b = block_read(dev, jstart);
+    if (!b) return 0;
+    memcpy(&h, b, sizeof h);
+    *next_seq = memcmp(h.magic, "EFJH", 4) ? 1 : h.seq;
+    struct jdesc *d = kmalloc(BLOCK_SIZE);
+    if (!d || !(b = block_read(dev, jstart + 1))) {
+        kfree(d);
+        return 0;
+    }
+    memcpy(d, b, BLOCK_SIZE);
+    u64 replayed = 0;
+    if (!memcmp(d->magic, "EFJD", 4) && d->count && d->count <= jblocks - 3 && d->seq >= *next_seq &&
+        (b = block_read(dev, jstart + 2 + d->count))) {
+        struct jcommit c;
+        memcpy(&c, b, sizeof c);
+        if (!memcmp(c.magic, "EFJC", 4) && c.seq == d->seq && c.count == d->count &&
+            c.checksum == journal_checksum(d, NULL, dev, jstart)) {
+            for (u32 i = 0; i < d->count; i++) {
+                u8 *copy = block_read(dev, jstart + 2 + i);
+                if (copy) block_write(dev, d->blocks[i], copy);
+            }
+            block_flush(dev);
+            replayed = d->seq;
+            *next_seq = d->seq + 1;
+            b = block_read(dev, jstart);
+            if (b) {
+                memcpy(h.magic, "EFJH", 4);
+                h.version = 1;
+                h.seq = *next_seq;
+                memcpy(b, &h, sizeof h);
+                block_write(dev, jstart, b);
+                block_flush(dev);
+            }
+        }
+    }
+    kfree(d);
+    return replayed;
+}
 
 /* ---- superblock, inodes, bitmaps ------------------------------------------ */
 
 static bool write_super(struct efs3 *fs) {
-    u8 *b = block_read(fs->dev, 0);
+    u8 *b = bread(fs, 0);
     if (!b) return false;
     memcpy(b, &fs->sb, sizeof fs->sb);
-    return block_write(fs->dev, 0, b);
+    return bwrite(fs, 0, b);
 }
 
 static bool inode_get(struct efs3 *fs, u32 ino, struct efs3_inode *out) {
     if (ino == 0 || ino >= fs->sb.inode_count) return false;
     u64 pos = (u64)ino * INODE_SIZE;
-    u8 *b = block_read(fs->dev, fs->sb.inode_table + pos / BLOCK_SIZE);
+    u8 *b = bread(fs, fs->sb.inode_table + pos / BLOCK_SIZE);
     if (!b) return false;
     memcpy(out, b + pos % BLOCK_SIZE, INODE_SIZE);
     return true;
@@ -88,10 +277,10 @@ static bool inode_get(struct efs3 *fs, u32 ino, struct efs3_inode *out) {
 static bool inode_put(struct efs3 *fs, u32 ino, const struct efs3_inode *in) {
     u64 pos = (u64)ino * INODE_SIZE;
     u64 block = fs->sb.inode_table + pos / BLOCK_SIZE;
-    u8 *b = block_read(fs->dev, block);
+    u8 *b = bread(fs, block);
     if (!b) return false;
     memcpy(b + pos % BLOCK_SIZE, in, INODE_SIZE);
-    return block_write(fs->dev, block, b);
+    return bwrite(fs, block, b);
 }
 
 /* Finds a clear bit in a bitmap spread over consecutive blocks, sets it and returns it (0 = none). */
@@ -100,14 +289,14 @@ static u32 bitmap_alloc(struct efs3 *fs, u32 first_block, u32 nbits, u32 *hint) 
     for (u32 k = 0; k < nbits; k += 8) {
         u32 bit = ((*hint + k) % nbits) & ~7u;
         u64 block = first_block + bit / bits_per_block;
-        u8 *b = block_read(fs->dev, block);
+        u8 *b = bread(fs, block);
         if (!b) return 0;
         u32 byte = (bit % bits_per_block) / 8;
         if (b[byte] == 0xFF) continue;
         u32 i = (u32)__builtin_ctz(~(u32)b[byte] & 0xFF);
         if (bit + i >= nbits) continue;
         b[byte] |= (u8)(1 << i);
-        if (!block_write(fs->dev, block, b)) return 0;
+        if (!bwrite(fs, block, b)) return 0;
         *hint = bit + i;
         return bit + i;
     }
@@ -116,10 +305,10 @@ static u32 bitmap_alloc(struct efs3 *fs, u32 first_block, u32 nbits, u32 *hint) 
 
 static void bitmap_clear(struct efs3 *fs, u32 first_block, u32 bit) {
     u64 block = first_block + bit / (BLOCK_SIZE * 8);
-    u8 *b = block_read(fs->dev, block);
+    u8 *b = bread(fs, block);
     if (!b) return;
     b[(bit % (BLOCK_SIZE * 8)) / 8] &= (u8)~(1 << (bit % 8));
-    block_write(fs->dev, block, b);
+    bwrite(fs, block, b);
 }
 
 static u32 alloc_block(struct efs3 *fs) {
@@ -129,15 +318,25 @@ static u32 alloc_block(struct efs3 *fs) {
     if (b < fs->sb.first_data) panic("efs3: block bitmap hands out metadata block %u", b);
     fs->sb.free_blocks--;
     write_super(fs);
-    block_write(fs->dev, b, zero_block);
+    zero_new_block(fs, b);
     return b;
 }
 
 static void free_block(struct efs3 *fs, u32 b) {
     if (!b) return;
-    bitmap_clear(fs, fs->sb.block_bitmap, b);
-    fs->sb.free_blocks++;
-    write_super(fs);
+    if (fs->tx_free_count == fs->tx_free_cap) {   /* freed in the bitmap when the transaction commits */
+        u32 cap = fs->tx_free_cap ? fs->tx_free_cap * 2 : 256;
+        u32 *n = krealloc(fs->tx_free, cap * sizeof *n);
+        if (!n) {   /* no memory: free it now (it cannot be reused before the commit anyway: rare) */
+            bitmap_clear(fs, fs->sb.block_bitmap, b);
+            fs->sb.free_blocks++;
+            write_super(fs);
+            return;
+        }
+        fs->tx_free = n;
+        fs->tx_free_cap = cap;
+    }
+    fs->tx_free[fs->tx_free_count++] = b;
 }
 
 static u32 alloc_inode(struct efs3 *fs) {
@@ -159,16 +358,16 @@ static void free_inode(struct efs3 *fs, u32 n) {
 
 /* Reads entry i of an indirect block; with `alloc`, allocates a block for an empty entry. */
 static u32 indirect_entry(struct efs3 *fs, u32 table, u32 i, bool alloc) {
-    u8 *b = block_read(fs->dev, table);
+    u8 *b = bread(fs, table);
     if (!b) return 0;
     u32 v = ((u32 *)b)[i];
     if (v || !alloc) return v;
     v = alloc_block(fs);   /* invalidates b */
     if (!v) return 0;
-    b = block_read(fs->dev, table);
+    b = bread(fs, table);
     if (!b) return 0;
     ((u32 *)b)[i] = v;
-    block_write(fs->dev, table, b);
+    bwrite(fs, table, b);
     return v;
 }
 
@@ -199,11 +398,13 @@ static void free_from(struct efs3 *fs, struct efs3_inode *in, u64 first) {
     if (in->indirect) {
         u64 start = first > 12 ? first - 12 : 0;
         for (u64 i = start; i < PTRS; i++) {
-            u8 *b = block_read(fs->dev, in->indirect);
+            u8 *b = bread(fs, in->indirect);
             u32 v = b ? ((u32 *)b)[i] : 0;
             if (!v) continue;
-            ((u32 *)b)[i] = 0;
-            block_write(fs->dev, in->indirect, b);
+            if (start) {   /* the table stays: clear the entry */
+                ((u32 *)b)[i] = 0;
+                bwrite(fs, in->indirect, b);
+            }
             free_block(fs, v);
         }
         if (start == 0) {
@@ -214,23 +415,27 @@ static void free_from(struct efs3 *fs, struct efs3_inode *in, u64 first) {
     if (in->dindirect) {
         u64 start = first > 12 + PTRS ? first - 12 - PTRS : 0;
         for (u64 j = start / PTRS; j < PTRS; j++) {
-            u8 *outer = block_read(fs->dev, in->dindirect);
+            u8 *outer = bread(fs, in->dindirect);
             u32 inner = outer ? ((u32 *)outer)[j] : 0;
             if (!inner) continue;
             u64 from = j == start / PTRS ? start % PTRS : 0;
             for (u64 i = from; i < PTRS; i++) {
-                u8 *b = block_read(fs->dev, inner);
+                u8 *b = bread(fs, inner);
                 u32 v = b ? ((u32 *)b)[i] : 0;
                 if (!v) continue;
-                ((u32 *)b)[i] = 0;
-                block_write(fs->dev, inner, b);
+                if (from) {
+                    ((u32 *)b)[i] = 0;
+                    bwrite(fs, inner, b);
+                }
                 free_block(fs, v);
             }
             if (from == 0) {
-                outer = block_read(fs->dev, in->dindirect);
-                if (outer) {
-                    ((u32 *)outer)[j] = 0;
-                    block_write(fs->dev, in->dindirect, outer);
+                if (start) {   /* the outer table stays */
+                    outer = bread(fs, in->dindirect);
+                    if (outer) {
+                        ((u32 *)outer)[j] = 0;
+                        bwrite(fs, in->dindirect, outer);
+                    }
                 }
                 free_block(fs, inner);
             }
@@ -255,7 +460,7 @@ static i64 data_read(struct efs3 *fs, const struct efs3_inode *in, u64 off, u8 *
         if (!b) {
             memset(buf + done, 0, n);
         } else {
-            u8 *data = block_read(fs->dev, b);
+            u8 *data = bread(fs, b);
             if (!data) return done ? (i64)done : -EIO;
             memcpy(buf + done, data + within, n);
         }
@@ -275,7 +480,7 @@ static i64 data_write(struct efs3 *fs, struct efs3_inode *in, u64 off, const u8 
         if (n == BLOCK_SIZE) {
             if (!block_write(fs->dev, b, buf + done)) break;
         } else {
-            u8 *data = block_read(fs->dev, b);
+            u8 *data = bread(fs, b);
             if (!data) break;
             memcpy(data + within, buf + done, n);
             if (!block_write(fs->dev, b, data)) break;
@@ -292,7 +497,7 @@ static void set_size(struct efs3 *fs, struct efs3_inode *in, u64 size) {
         free_from(fs, in, ALIGN_UP(size, BLOCK_SIZE) / BLOCK_SIZE);
         if (size % BLOCK_SIZE) {   /* zero the rest of the last block, so growing later shows zeros */
             u32 b = bmap(fs, in, size / BLOCK_SIZE, false);
-            u8 *data = b ? block_read(fs->dev, b) : NULL;
+            u8 *data = b ? bread(fs, b) : NULL;
             if (data) {
                 memset(data + size % BLOCK_SIZE, 0, BLOCK_SIZE - size % BLOCK_SIZE);
                 block_write(fs->dev, b, data);
@@ -311,7 +516,7 @@ static bool dir_iterate(struct efs3 *fs, struct efs3_inode *dir, record_fn fn, v
     *stopped = false;
     for (u64 fb = 0; fb < dir->size / BLOCK_SIZE; fb++) {
         u32 b = bmap(fs, dir, fb, false);
-        u8 *data = b ? block_read(fs->dev, b) : NULL;
+        u8 *data = b ? bread(fs, b) : NULL;
         if (!data) return false;
         for (u32 off = 0; off < BLOCK_SIZE;) {
             struct dirent_raw *r = (struct dirent_raw *)(data + off);
@@ -321,7 +526,7 @@ static bool dir_iterate(struct efs3 *fs, struct efs3_inode *dir, record_fn fn, v
                 *stopped = true;
                 return true;
             }
-            data = block_read(fs->dev, b);   /* fn may have used the cache */
+            data = bread(fs, b);   /* fn may have used the cache */
             if (!data) return false;
             off += ((struct dirent_raw *)(data + off))->rec_len;
         }
@@ -369,7 +574,7 @@ static bool add_fn(struct dirent_raw *r, u32 block, u32 offset, void *p) {
     u16 need = record_size(c->len);
     u16 used = r->ino ? record_size(r->name_len) : 0;
     if (r->rec_len - used < need) return false;
-    u8 *data = block_read(c->fs->dev, block);
+    u8 *data = bread(c->fs, block);
     if (!data) return false;
     r = (struct dirent_raw *)(data + offset);
     struct dirent_raw *n = r;
@@ -382,7 +587,7 @@ static bool add_fn(struct dirent_raw *r, u32 block, u32 offset, void *p) {
     n->name_len = (u8)c->len;
     n->type = c->type;
     memcpy(n->name, c->name, c->len);
-    block_write(c->fs->dev, block, data);
+    bwrite(c->fs, block, data);
     return true;
 }
 
@@ -395,7 +600,7 @@ static int dir_add(struct efs3 *fs, u32 dir_ino, struct efs3_inode *dir, const c
     u64 fb = dir->size / BLOCK_SIZE;
     u32 b = bmap(fs, dir, fb, true);
     if (!b) return -ENOSPC;
-    u8 *data = block_read(fs->dev, b);
+    u8 *data = bread(fs, b);
     if (!data) return -EIO;
     struct dirent_raw *r = (struct dirent_raw *)data;
     r->ino = ino;
@@ -403,7 +608,7 @@ static int dir_add(struct efs3 *fs, u32 dir_ino, struct efs3_inode *dir, const c
     r->name_len = (u8)len;
     r->type = type;
     memcpy(r->name, name, len);
-    block_write(fs->dev, b, data);
+    bwrite(fs, b, data);
     dir->size += BLOCK_SIZE;
     return inode_put(fs, dir_ino, dir) ? 0 : -EIO;
 }
@@ -425,7 +630,7 @@ static bool remove_fn(struct dirent_raw *r, u32 block, u32 offset, void *p) {
         c->prev_offset = offset;
         return false;
     }
-    u8 *data = block_read(c->fs->dev, block);
+    u8 *data = bread(c->fs, block);
     if (!data) return true;
     r = (struct dirent_raw *)(data + offset);
     if (c->have_prev && c->prev_block == block) {   /* merge into the previous record */
@@ -433,7 +638,7 @@ static bool remove_fn(struct dirent_raw *r, u32 block, u32 offset, void *p) {
     } else {
         r->ino = 0;
     }
-    block_write(c->fs->dev, block, data);
+    bwrite(c->fs, block, data);
     return true;
 }
 
@@ -469,7 +674,7 @@ static struct vnode *get_vnode(struct efs3 *fs, u32 ino) {
     if (!inode_get(fs, ino, &in)) return NULL;
     struct vnode *v = kcalloc(1, sizeof *v);
     if (!v) return NULL;
-    v->type = (in.mode & S_IFMT) == S_IFDIR ? VN_DIR : VN_FILE;
+    v->type = (in.mode & S_IFMT) == S_IFDIR ? VN_DIR : (in.mode & S_IFMT) == S_IFLNK ? VN_SYMLINK : VN_FILE;
     v->refs = 1;
     v->ino = ino;
     v->ops = &efs3_ops;
@@ -506,6 +711,7 @@ static void efs3_release(struct vnode *v) {
         }
     struct efs3_inode in;
     if (inode_get(fs, (u32)v->ino, &in) && in.links == 0) destroy_inode(fs, (u32)v->ino, &in);   /* deleted while open */
+    tx_commit(fs);
     mutex_unlock(&fs->lock);
     kfree(v);
 }
@@ -534,6 +740,18 @@ static void touch_dir(struct efs3 *fs, u32 ino) {
         _r;                           \
     })
 
+/* An operation that changes the file system: one transaction. */
+#define TX(fs, expr)                  \
+    ({                                \
+        mutex_lock(&(fs)->lock);      \
+        __typeof__(expr) _r = (expr); \
+        tx_commit(fs);                \
+        mutex_unlock(&(fs)->lock);    \
+        _r;                           \
+    })
+
+static u8 file_type(u16 mode) { return (mode & S_IFMT) == S_IFDIR ? FT_DIR : (mode & S_IFMT) == S_IFLNK ? FT_SYMLINK : FT_FILE; }
+
 static i64 do_read(struct efs3 *fs, struct vnode *v, u64 off, void *buf, u64 len) {
     struct efs3_inode in;
     if (!inode_get(fs, (u32)v->ino, &in)) return -EIO;
@@ -558,7 +776,16 @@ static i64 do_write(struct efs3 *fs, struct vnode *v, u64 off, const void *buf, 
 static i64 efs3_write(struct vnode *v, u64 off, const void *buf, u64 len) {
     struct efs3 *fs = v->fs;
     if (v->type == VN_DIR) return -EISDIR;
-    return LOCKED(fs, do_write(fs, v, off, buf, len));
+    /* big writes in pieces of 256 KiB, one transaction each, so the metadata of one fits the journal */
+    u64 done = 0;
+    while (done < len) {
+        u64 n = MIN(len - done, 256 * KiB);
+        i64 r = TX(fs, do_write(fs, v, off + done, (const u8 *)buf + done, n));
+        if (r < 0) return done ? (i64)done : r;
+        done += (u64)r;
+        if ((u64)r < n) break;
+    }
+    return (i64)done;
 }
 
 static int do_truncate(struct efs3 *fs, struct vnode *v, u64 size) {
@@ -572,7 +799,7 @@ static int do_truncate(struct efs3 *fs, struct vnode *v, u64 size) {
 static int efs3_truncate(struct vnode *v, u64 size) {
     struct efs3 *fs = v->fs;
     if (v->type == VN_DIR) return -EISDIR;
-    return LOCKED(fs, do_truncate(fs, v, size));
+    return TX(fs, do_truncate(fs, v, size));
 }
 
 static int do_lookup(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, struct vnode **out) {
@@ -611,7 +838,7 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
         in.mode = (u16)(S_IFDIR | (attr->mode & 07777));
         in.links = 2;
         u32 b = bmap(fs, &in, 0, true);
-        u8 *data = b ? block_read(fs->dev, b) : NULL;
+        u8 *data = b ? bread(fs, b) : NULL;
         if (!data) {
             free_inode(fs, ino);
             return -ENOSPC;
@@ -622,7 +849,7 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
         struct dirent_raw *dotdot = (struct dirent_raw *)(data + 12);
         *dotdot = (struct dirent_raw){(u32)dir->ino, BLOCK_SIZE - 12, 2, FT_DIR};
         dotdot->name[0] = dotdot->name[1] = '.';
-        block_write(fs->dev, b, data);
+        bwrite(fs, b, data);
         in.size = BLOCK_SIZE;
     } else {
         in.mode = (u16)(S_IFREG | (attr->mode & 07777));
@@ -646,7 +873,7 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
 static int efs3_create(struct vnode *dir, const char *name, u32 len, int type, const struct vnode_attr *attr,
                        struct vnode **out) {
     struct efs3 *fs = dir->fs;
-    return LOCKED(fs, do_create(fs, dir, name, len, type, attr, out));
+    return TX(fs, do_create(fs, dir, name, len, type, attr, out));
 }
 
 /* Drops one link of `ino`; frees it once unused (now, or when the last open file closes). */
@@ -683,7 +910,7 @@ static int do_remove(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
 
 static int efs3_remove(struct vnode *dir, const char *name, u32 len, bool is_dir) {
     struct efs3 *fs = dir->fs;
-    return LOCKED(fs, do_remove(fs, dir, name, len, is_dir));
+    return TX(fs, do_remove(fs, dir, name, len, is_dir));
 }
 
 /* True if directory `ino` is `ancestor` or lies inside it (follows ".." up to the root). */
@@ -722,7 +949,7 @@ static int do_rename(struct efs3 *fs, struct vnode *od, const char *on, u32 ol, 
         unlink_inode(fs, t.ino, &target, false);
         if (!inode_get(fs, (u32)nd->ino, &ndir)) return -EIO;
     }
-    r = dir_add(fs, (u32)nd->ino, &ndir, nn, nl, s.ino, src_dir ? FT_DIR : FT_FILE);
+    r = dir_add(fs, (u32)nd->ino, &ndir, nn, nl, s.ino, file_type(src.mode));
     if (r < 0) return r;
     if (!inode_get(fs, (u32)od->ino, &odir)) return -EIO;
     r = dir_remove(fs, &odir, on, ol);
@@ -753,7 +980,7 @@ static int do_rename(struct efs3 *fs, struct vnode *od, const char *on, u32 ol, 
 static int efs3_rename(struct vnode *od, const char *on, u32 ol, struct vnode *nd, const char *nn, u32 nl) {
     struct efs3 *fs = od->fs;
     if (nd->fs != fs) return -EXDEV;
-    return LOCKED(fs, do_rename(fs, od, on, ol, nd, nn, nl));
+    return TX(fs, do_rename(fs, od, on, ol, nd, nn, nl));
 }
 
 struct readdir_ctx {
@@ -771,14 +998,14 @@ static int do_readdir(struct efs3 *fs, struct vnode *dir, u64 *cookie, struct di
         u64 fb = pos / BLOCK_SIZE;
         u32 off = (u32)(pos % BLOCK_SIZE);
         u32 b = bmap(fs, &d, fb, false);
-        u8 *data = b ? block_read(fs->dev, b) : NULL;
+        u8 *data = b ? bread(fs, b) : NULL;
         if (!data) return -EIO;
         struct dirent_raw *r = (struct dirent_raw *)(data + off);
         if (r->rec_len < 8 || r->rec_len % 4 || off + r->rec_len > BLOCK_SIZE) return -EIO;
         pos += r->rec_len;
         if (!r->ino) continue;
         out->ino = r->ino;
-        out->type = r->type == FT_DIR ? VN_DIR : VN_FILE;
+        out->type = r->type == FT_DIR ? VN_DIR : r->type == FT_SYMLINK ? VN_SYMLINK : VN_FILE;
         out->name_len = r->name_len;
         memcpy(out->name, r->name, r->name_len);
         out->name[r->name_len] = 0;
@@ -787,6 +1014,98 @@ static int do_readdir(struct efs3 *fs, struct vnode *dir, u64 *cookie, struct di
     }
     *cookie = pos;
     return 0;
+}
+
+/* A symbolic link: an inode of type S_IFLNK whose one data block holds the target path. */
+static int do_symlink(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, const char *target,
+                      const struct vnode_attr *attr) {
+    u64 tlen = strlen(target);
+    if (!tlen || tlen >= BLOCK_SIZE) return -ENAMETOOLONG;
+    struct efs3_inode d;
+    if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
+    if (d.links == 0) return -ENOENT;
+    struct find_ctx c;
+    int r = dir_find(fs, &d, name, len, &c);
+    if (r < 0) return r;
+    if (r > 0) return -EEXIST;
+    u32 ino = alloc_inode(fs);
+    if (!ino) return -ENOSPC;
+    struct efs3_inode in;
+    memset(&in, 0, sizeof in);
+    in.mode = (u16)(S_IFLNK | 0777);
+    in.links = 1;
+    in.uid = attr->uid;
+    in.gid = attr->gid;
+    in.atime = in.mtime = in.ctime = time_realtime_ns();
+    in.size = tlen;
+    u32 b = alloc_block(fs);
+    if (!b) {
+        free_inode(fs, ino);
+        return -ENOSPC;
+    }
+    in.direct[0] = b;
+    u8 *page = kcalloc(1, BLOCK_SIZE);
+    if (!page) return -ENOMEM;
+    memcpy(page, target, tlen);
+    bwrite(fs, b, page);   /* with the transaction: the link and its target appear together */
+    kfree(page);
+    if (!inode_put(fs, ino, &in)) return -EIO;
+    if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
+    r = dir_add(fs, (u32)dir->ino, &d, name, len, ino, FT_SYMLINK);
+    if (r < 0) {
+        destroy_inode(fs, ino, &in);
+        return r;
+    }
+    touch_dir(fs, (u32)dir->ino);
+    return 0;
+}
+
+static int efs3_symlink(struct vnode *dir, const char *name, u32 len, const char *target, const struct vnode_attr *attr) {
+    struct efs3 *fs = dir->fs;
+    return TX(fs, do_symlink(fs, dir, name, len, target, attr));
+}
+
+static int do_readlink(struct efs3 *fs, struct vnode *v, char *buf, u32 size) {
+    struct efs3_inode in;
+    if (!inode_get(fs, (u32)v->ino, &in)) return -EIO;
+    if ((in.mode & S_IFMT) != S_IFLNK) return -EINVAL;
+    u8 *data = in.direct[0] ? bread(fs, in.direct[0]) : NULL;
+    if (!data) return -EIO;
+    u32 n = (u32)MIN(in.size, (u64)size);
+    memcpy(buf, data, n);
+    return (int)n;
+}
+
+static int efs3_readlink(struct vnode *v, char *buf, u32 size) {
+    struct efs3 *fs = v->fs;
+    return LOCKED(fs, do_readlink(fs, v, buf, size));
+}
+
+/* A hard link: one more directory entry for an existing inode. */
+static int do_link(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, struct vnode *target) {
+    struct efs3_inode d, t;
+    if (!inode_get(fs, (u32)dir->ino, &d) || !inode_get(fs, (u32)target->ino, &t)) return -EIO;
+    if (d.links == 0 || t.links == 0) return -ENOENT;
+    if ((t.mode & S_IFMT) == S_IFDIR) return -EPERM;
+    if (t.links == 0xFFFF) return -EMLINK;
+    struct find_ctx c;
+    int r = dir_find(fs, &d, name, len, &c);
+    if (r < 0) return r;
+    if (r > 0) return -EEXIST;
+    r = dir_add(fs, (u32)dir->ino, &d, name, len, (u32)target->ino, file_type(t.mode));
+    if (r < 0) return r;
+    if (!inode_get(fs, (u32)target->ino, &t)) return -EIO;
+    t.links++;
+    stamp(&t, false);
+    inode_put(fs, (u32)target->ino, &t);
+    touch_dir(fs, (u32)dir->ino);
+    return 0;
+}
+
+static int efs3_link(struct vnode *dir, const char *name, u32 len, struct vnode *target) {
+    struct efs3 *fs = dir->fs;
+    if (target->fs != fs) return -EXDEV;
+    return TX(fs, do_link(fs, dir, name, len, target));
 }
 
 static int efs3_readdir(struct vnode *dir, u64 *cookie, struct dir_entry *out) {
@@ -826,7 +1145,7 @@ static int do_setattr(struct efs3 *fs, struct vnode *v, const struct vnode_attr 
 
 static int efs3_setattr(struct vnode *v, const struct vnode_attr *a) {
     struct efs3 *fs = v->fs;
-    return LOCKED(fs, do_setattr(fs, v, a));
+    return TX(fs, do_setattr(fs, v, a));
 }
 
 static int efs3_stat(struct vnode *v, struct vnode_stat *st) {
@@ -836,7 +1155,7 @@ static int efs3_stat(struct vnode *v, struct vnode_stat *st) {
 
 static int efs3_sync(struct vnode *v) {
     struct efs3 *fs = v->fs;
-    return LOCKED(fs, block_flush(fs->dev) ? 0 : -EIO);
+    return LOCKED(fs, block_flush(fs->dev) ? 0 : -EIO);   /* every transaction is already on the disk */
 }
 
 static const struct vnode_ops efs3_ops = {
@@ -850,6 +1169,9 @@ static const struct vnode_ops efs3_ops = {
     .readdir = efs3_readdir,
     .stat = efs3_stat,
     .setattr = efs3_setattr,
+    .symlink = efs3_symlink,
+    .readlink = efs3_readlink,
+    .link = efs3_link,
     .sync = efs3_sync,
     .release = efs3_release,
 };
@@ -860,15 +1182,45 @@ int efs3_mount(struct block_device *dev, struct vnode **root) {
     struct efs3 *fs = kcalloc(1, sizeof *fs);
     if (!fs) return -ENOMEM;
     memcpy(&fs->sb, b, sizeof fs->sb);
-    if (memcmp(fs->sb.magic, "EFS3", 4) || fs->sb.version != 1 || fs->sb.block_size != BLOCK_SIZE ||
-        (u64)fs->sb.block_count * SECTORS_PER_BLOCK > dev->sector_count) {
+    if (memcmp(fs->sb.magic, "EFS3", 4) || (fs->sb.version != 1 && fs->sb.version != 2) ||
+        fs->sb.block_size != BLOCK_SIZE || (u64)fs->sb.block_count * SECTORS_PER_BLOCK > dev->sector_count) {
         kfree(fs);
         return -EINVAL;
     }
     fs->dev = dev;
+    if (fs->sb.version == 2) {
+        if (fs->sb.journal_blocks < 8 || fs->sb.journal_start + fs->sb.journal_blocks > fs->sb.first_data ||
+            !(fs->jpage = pmm_alloc_page())) {
+            kfree(fs);
+            return -EINVAL;
+        }
+        fs->jstart = fs->sb.journal_start;
+        fs->jblocks = fs->sb.journal_blocks;
+        u64 replayed = journal_replay(dev, fs->jstart, fs->jblocks, &fs->jseq);
+        if (replayed) {
+            kprintf("EFS3: journal replayed (transaction %lu): the file system was not unmounted cleanly\n", replayed);
+            b = block_read(dev, 0);   /* the superblock may have changed */
+            if (b) memcpy(&fs->sb, b, sizeof fs->sb);
+        }
+    } else {
+        kprintf("EFS3: version 1 file system: no journal\n");
+    }
     fs->block_hint = fs->sb.first_data;
     fs->inode_hint = 1;
     mutex_lock(&fs->lock);
+    /* inodes deleted while open when the power went off: free them now */
+    u32 orphans = 0;
+    for (u32 ino = 1; ino < fs->sb.inode_count; ino++) {
+        u8 *bm = bread(fs, fs->sb.inode_bitmap + ino / (BLOCK_SIZE * 8));
+        if (!bm || !(bm[(ino % (BLOCK_SIZE * 8)) / 8] & (1 << (ino % 8)))) continue;
+        struct efs3_inode in;
+        if (ino != fs->sb.root_inode && inode_get(fs, ino, &in) && in.links == 0) {
+            destroy_inode(fs, ino, &in);
+            tx_commit(fs);
+            orphans++;
+        }
+    }
+    if (orphans) kprintf("EFS3: %u orphaned inode(s) freed\n", orphans);
     *root = get_vnode(fs, fs->sb.root_inode);
     mutex_unlock(&fs->lock);
     if (!*root) {

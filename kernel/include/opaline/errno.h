@@ -28,6 +28,7 @@
 #define EMFILE       24
 #define ENOTTY       25
 #define ENOSPC       28
+#define EMLINK       31
 #define ESPIPE       29
 #define EPIPE        32
 #define ERANGE       34

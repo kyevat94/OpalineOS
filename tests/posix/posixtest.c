@@ -11,7 +11,8 @@
  * since stage SE1, copy-on-write fork, shared memory (anonymous and file),
  * mremap, execve from a process with threads, the real clock and file times,
  * users and permissions (as an ordinary user, set-user-id programs) and job
- * control (stop/continue, process groups, restarted system calls).
+ * control (stop/continue, process groups, restarted system calls); and, since
+ * stage SE2, symbolic and hard links.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
 #define _GNU_SOURCE
@@ -759,6 +760,73 @@ static void test_jobs(void) {
     signal(SIGUSR1, SIG_DFL);
 }
 
+/* ---- stage SE2: symbolic and hard links ------------------------------------------------------ */
+
+static void test_links(void) {
+    printf("links:\n");
+    mkdir("/tmp/lk", 0755);
+    mkdir("/tmp/lk/real", 0755);
+    int fd = open("/tmp/lk/real/target.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    write(fd, "hello links", 11);
+    close(fd);
+    CHECK(symlink("real/target.txt", "/tmp/lk/sym") == 0, "symlink");
+    char buf[64] = {0};
+    CHECK(readlink("/tmp/lk/sym", buf, sizeof buf) == 15 && !memcmp(buf, "real/target.txt", 15), "readlink gives the target");
+    struct stat st, lst;
+    CHECK(lstat("/tmp/lk/sym", &lst) == 0 && S_ISLNK(lst.st_mode) && lst.st_size == 15, "lstat sees the link itself");
+    CHECK(stat("/tmp/lk/sym", &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 11, "stat follows the link");
+    fd = open("/tmp/lk/sym", O_RDONLY);
+    memset(buf, 0, sizeof buf);
+    CHECK(fd >= 0 && read(fd, buf, sizeof buf) == 11 && !strcmp(buf, "hello links"), "open follows a relative link");
+    close(fd);
+    CHECK(open("/tmp/lk/sym", O_RDONLY | O_NOFOLLOW) < 0 && errno == ELOOP, "O_NOFOLLOW refuses a link");
+    symlink("/tmp/lk/nowhere", "/tmp/lk/dangling");
+    CHECK(stat("/tmp/lk/dangling", &st) < 0 && errno == ENOENT && lstat("/tmp/lk/dangling", &lst) == 0,
+          "a dangling link: stat fails, lstat works");
+    symlink("loop2", "/tmp/lk/loop1");
+    symlink("loop1", "/tmp/lk/loop2");
+    CHECK(open("/tmp/lk/loop1", O_RDONLY) < 0 && errno == ELOOP, "a loop of links gives ELOOP");
+    CHECK(symlink("/tmp/lk/real", "/tmp/lk/dir") == 0 && access("/tmp/lk/dir/target.txt", R_OK) == 0,
+          "an absolute link to a directory works in the middle of a path");
+    char cwd[128];
+    CHECK(chdir("/tmp/lk/dir") == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, "/tmp/lk/real"),
+          "chdir through a link: getcwd shows the real path");
+    chdir("/");
+    char *real = realpath("/tmp/lk/dir/../sym", NULL);
+    CHECK(real && !strcmp(real, "/tmp/lk/real/target.txt"), "realpath resolves every link");
+    free(real);
+    DIR *d = opendir("/tmp/lk");
+    int lnk = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (!strcmp(e->d_name, "sym") && e->d_type == DT_LNK) lnk = 1;
+    if (d) closedir(d);
+    CHECK(lnk, "readdir reports DT_LNK");
+    CHECK(rename("/tmp/lk/sym", "/tmp/lk/sym2") == 0 && lstat("/tmp/lk/sym2", &lst) == 0 && S_ISLNK(lst.st_mode),
+          "a renamed link is still a link");
+    CHECK(unlink("/tmp/lk/sym2") == 0 && access("/tmp/lk/real/target.txt", F_OK) == 0, "unlink removes the link, not the target");
+    CHECK(chmod("/tmp/lk/dir", 0700) == 0 && stat("/tmp/lk/real", &st) == 0 && (st.st_mode & 0777) == 0700,
+          "chmod through a link changes the target");
+    chmod("/tmp/lk/real", 0755);
+
+    /* hard links */
+    CHECK(link("/tmp/lk/real/target.txt", "/tmp/lk/hard") == 0, "link");
+    struct stat a, b;
+    CHECK(stat("/tmp/lk/real/target.txt", &a) == 0 && stat("/tmp/lk/hard", &b) == 0 && a.st_ino == b.st_ino &&
+              a.st_nlink == 2, "both names are the same file (2 links)");
+    fd = open("/tmp/lk/hard", O_WRONLY | O_APPEND);
+    write(fd, "!", 1);
+    close(fd);
+    CHECK(stat("/tmp/lk/real/target.txt", &a) == 0 && a.st_size == 12, "writing through one name changes the other");
+    CHECK(unlink("/tmp/lk/real/target.txt") == 0 && stat("/tmp/lk/hard", &b) == 0 && b.st_nlink == 1 && b.st_size == 12,
+          "the file lives on under its other name");
+    CHECK(link("/tmp/lk/real", "/tmp/lk/dirhard") < 0 && errno == EPERM, "no hard links to directories");
+    CHECK(link("/tmp/lk/hard", "/tmp/lk/dir") < 0 && errno == EEXIST, "link onto an existing name gives EEXIST");
+    const char *gone[] = {"/tmp/lk/hard", "/tmp/lk/dangling", "/tmp/lk/loop1", "/tmp/lk/loop2", "/tmp/lk/dir"};
+    for (unsigned i = 0; i < sizeof gone / sizeof gone[0]; i++) unlink(gone[i]);
+    CHECK(rmdir("/tmp/lk/real") == 0 && rmdir("/tmp/lk") == 0, "everything cleaned up");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "exec-child")) {
@@ -785,6 +853,7 @@ int main(int argc, char **argv) {
     test_exec_threads_and_time();
     test_permissions();
     test_jobs();
+    test_links();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

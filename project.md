@@ -444,7 +444,7 @@ isso funcionando.
 | **E5** ✅ | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E6** ✅ | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam. **Concluída em 2026-11-20** (QEMU e VirtualBox) |
 | **SE1** ✅ | Sub-etapa: o que a E6 simplificou — copy-on-write, `MAP_SHARED` real, `mremap`, `execve` com threads, relógio real e tempos de arquivo, usuários e permissões, controle de tarefas (Ctrl+C/Ctrl+Z) | `posixtest` (104 verificações) passa, inclusive como usuário comum. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
-| **SE2** | Sub-etapa: sistema de arquivos — journal no EFS3, links simbólicos e físicos | queda de energia simulada no meio de uma escrita não corrompe o disco (fsck limpo) |
+| **SE2** ✅ | Sub-etapa: sistema de arquivos — journal no EFS3, links simbólicos e físicos | queda de energia simulada no meio de uma escrita não corrompe o disco (fsck limpo). **Concluída em 2026-11-21** (QEMU e VirtualBox) |
 | **SE3** | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente |
 | **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
@@ -643,8 +643,8 @@ OpalineOS/
   128 bytes com 12 ponteiros diretos + indireto + duplamente indireto (até ~4 GiB por arquivo),
   bitmaps de blocos e inodes, diretórios com registros de tamanho variável. Criar, ler, gravar,
   truncar, renomear (substituindo arquivos), apagar, `mkdir`/`rmdir`. Um arquivo apagado enquanto
-  aberto só some quando é fechado. Um *mutex* por sistema de arquivos; **sem journal** ainda (uma queda
-  de energia no meio de uma operação pode deixar inconsistências).
+  aberto só some quando é fechado. Um *mutex* por sistema de arquivos. (Na E5 não havia journal; a
+  SE2 o acrescentou, seção 10.1.9.)
 - **Nomes UTF-8 em NFC**: o VFS valida o UTF-8 e compõe acentos (tabela gerada por
   `tools/gen_nfc.py` com os dados Unicode do Python: latim, grego, cirílico). `ação` digitado com
   acentos combinantes é o mesmo arquivo. O `efs3.py` também grava em NFC.
@@ -869,6 +869,73 @@ OpalineOS/
   o mapeamento compartilhado fica velho. (Este último exigiu corrigir o teste: a página precisava já
   estar carregada.)
 
+### 10.1.9 Como a SE2 funciona (journal e links)
+
+- **EFS3 versão 2**: o superbloco ganhou `journal_start` e `journal_blocks`, e uma área de **journal**
+  de 256 blocos (1 MiB) fica entre a tabela de inodes e os dados. O formato é o mesmo de antes nos
+  demais pontos; o kernel ainda monta imagens da versão 1, mas sem journal.
+- **Cada operação é uma transação** (`kernel/fs/efs3.c`). Os blocos de metadados que ela muda
+  (superbloco, bitmaps, inodes, diretórios, blocos indiretos, o alvo de um link simbólico) ficam em
+  memória enquanto ela roda. No fim:
+  1. as cópias vão para o journal com um descritor (a lista de blocos);
+  2. *flush*;
+  3. bloco de **commit** com checksum (FNV-1a de tudo), *flush*;
+  4. cada bloco é gravado no seu lugar, *flush*;
+  5. o cabeçalho do journal avança o número da transação ("feita"), *flush*.
+- **Modo ordenado** (como o ext4): o **conteúdo** dos arquivos vai direto para o disco antes do
+  commit, então um arquivo nunca aponta para lixo. Depois de uma queda, o sistema de arquivos está
+  sempre consistente; o conteúdo de uma escrita interrompida pode ficar pela metade.
+- **Blocos liberados só voltam ao bitmap no commit**, para a mesma transação não reaproveitar um bloco
+  que os metadados já gravados ainda usam. Escritas grandes viram transações de 256 KiB cada, e tabelas
+  indiretas liberadas inteiras não são zeradas, para uma transação sempre caber no journal.
+- **Ao montar**: se há uma transação com commit válido (checksum certo) e número ainda não marcado como
+  feito, ela é **regravada** ("EFS3: journal replayed"). Depois, inodes **órfãos** (apagados enquanto
+  abertos quando a energia caiu) são liberados.
+- **Custo**: cada operação grava os metadados duas vezes e faz 4 *flushes*. Os testes no QEMU usam
+  `cache=unsafe`, o que deixa o *flush* barato; o VirtualBox já ignora *flushes* por padrão. Agrupar
+  várias operações numa transação fica para quando o desempenho pedir.
+- **Links simbólicos**: inode do tipo `S_IFLNK` (0777) cujo primeiro bloco guarda o caminho alvo; tipo
+  3 nas entradas de diretório e `DT_LNK` no `getdents64`.
+  - O VFS **segue links** ao resolver caminhos: alvos relativos partem do diretório do link, absolutos
+    da raiz, e há no máximo 40 por busca (depois, `ELOOP`).
+  - O último componente não é seguido por `lstat`, `readlink`, `unlink`, `rename`, `O_NOFOLLOW`
+    (`ELOOP`), `AT_SYMLINK_NOFOLLOW` e `lchown`. `chmod` num link muda o alvo; `fchmodat` com
+    `AT_SYMLINK_NOFOLLOW` dá `EOPNOTSUPP`, como no Linux.
+- **Links físicos**: `link`/`linkat` (com `AT_SYMLINK_FOLLOW`) acrescentam um nome ao mesmo inode e
+  aumentam a contagem de links; diretórios não podem (`EPERM`), nem entre sistemas de arquivos
+  (`EXDEV`).
+- **`getcwd` mostra o caminho real**: calculado na hora, subindo por `..` e procurando o nome de cada
+  diretório no pai (`vfs_path_of`), então funciona depois de `cd` por um link e acompanha um diretório
+  renomeado. `chdir` passou a exigir permissão de busca; `fchdir` novo.
+- **`tools/efs3.py`**:
+  - cria imagens da versão 2 com o journal vazio;
+  - `check` acusa transação pendente e entende links físicos (o mesmo inode com vários nomes) e
+    simbólicos, conferindo também se o tipo de cada entrada de diretório bate com o do inode;
+  - `tree`, `ls` e `cat` reaplicam um journal pendente em memória, para ler imagens de uma máquina que
+    "perdeu energia"; `tree` mostra `link -> alvo`.
+- **Teste de queda de energia** (`kernel/fs/powercut.c` e `vm.py`, teste `powercut`).
+  - Com `test=powercut:N`, o kernel roda uma carga fixa em `/home/pc`:
+    - cria arquivos, inclusive um de 300 KiB (com blocos indiretos), e grava neles;
+    - links simbólicos e físicos, renomear e substituir, truncar;
+    - 20 arquivos criados e 10 apagados, remover diretório;
+    - um arquivo apagado enquanto aberto.
+  - Depois de N escritas no disco, as próximas são descartadas em silêncio ("o disco perdeu energia")
+    e a máquina para sem *flush*. O `vm.py` então apaga o parâmetro da imagem, dá um boot normal e roda
+    o fsck do host.
+  - A primeira rodada mede o total de escritas da carga (1178); depois corta em 10 pontos espalhados
+    por ela.
+  - Resultado: fsck limpo em todos os pontos, o journal foi reaplicado em 5 deles e o órfão foi
+    liberado.
+  - **Teste negativo**: com o kernel gravando os metadados direto no lugar (sem journal), o mesmo
+    teste acusa 4 pontos com bitmap e contadores do superbloco errados.
+- **`posixtest`**: 127 verificações (22 novas de links), entre elas:
+  - `readlink`, `lstat` × `stat`, link relativo e absoluto, link pendente;
+  - laço de links (`ELOOP`), `O_NOFOLLOW`;
+  - `chdir` por link e `getcwd`, `realpath` da musl, `DT_LNK`;
+  - renomear e apagar links, `chmod` pelo link;
+  - links físicos: mesmo inode, 2 links, o arquivo continua vivo pelo outro nome;
+  - `EPERM` para diretório, `EEXIST`.
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -926,6 +993,7 @@ OpalineOS/
 | 2026-11-21 | **SE1 concluída**: refcount de páginas, copy-on-write, `MAP_SHARED` real com cache de páginas coerente com `read`/`write`, futex compartilhado, `mremap` completo, `execve` com threads, RTC e tempos de arquivo, uid/gid/modo no EFS3 e permissões POSIX no VFS, setuid/setgid, grupos e sessões, parar/continuar, `SIGCHLD`, Ctrl+C/Ctrl+Z/Ctrl+\\, syscalls que recomeçam, `poll`/`ppoll`. `reboot` só root |
 | 2026-11-21 | Visual passa de **vidro (glassmorphism) para relevo suave (neumorfismo)**: superfícies opacas, luz e sombra em cache, bege porcelana com destaque verde-petróleo (referência `docs/references/neumorfismo.webp`). Motivo: sem GPU, o desfoque do que está atrás das janelas é o efeito mais caro do compositor. Vidro fosco continua como efeito opcional. Toolkit renomeado: **`opaline-relief`** (`from opaline import relief as rl`; `opaline-relief` livre no PyPI e no GitHub, pesquisa de 2026-11-21). Design system "Relief". O nome do sistema continua **OpalineOS** (opalina é vidro leitoso e opaco, que combina com o relevo) |
 | 2026-11-21 | **Layout da área de trabalho**: sem docks nem barras laterais ou inferiores; uma barra fina no topo é a barra de tarefas (botão Apps, um botão por programa aberto, indicadores, notificações e relógio). Prévia interativa aprovada: `docs/mockup/opaline-desktop.html` (movimentos, funções e design). Elementos coloridos afundados usam uma sombra interna própria (escura, quase sem realce), para não parecerem brilhantes. No toolkit, `ctx.dock_icon` virou `ctx.task_button` e `to_dock` virou `to_bar` |
+| 2026-11-21 | **SE2 concluída**: EFS3 versão 2 com **journal** de metadados em modo ordenado (uma transação por operação, commit com checksum, reaplicado na montagem, órfãos liberados), links **simbólicos** (seguidos pelo VFS, até 40) e **físicos**, `getcwd` com o caminho real. Teste de queda de energia em 10 pontos de uma carga de 1178 escritas: fsck limpo em todos |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

@@ -37,6 +37,15 @@ u8 *block_read(struct block_device *dev, u64 block);
 /* Writes `data` (BLOCK_SIZE bytes) to the block, through the cache, to the disk. */
 bool block_write(struct block_device *dev, u64 block, const void *data);
 bool block_flush(struct block_device *dev);
+/* Writes one physical page to a block, bypassing the cache (whose copy of that block is dropped).
+   The file system journal uses it, so its blocks do not push useful ones out of the cache. */
+bool block_write_phys(struct block_device *dev, u64 block, u64 phys);
+
+/* Power-cut test: after `writes` more block writes, every write is silently dropped, as if the
+   power went off (the cache still believes them). block_writes() counts writes since arming. */
+void block_powercut_arm(u64 writes);
+u64 block_writes(void);
+bool block_powercut_hit(void);
 void block_cache_stats(u64 *hits, u64 *misses);
 u64 block_cache_pages(void);   /* pages the cache holds (they are not leaked memory) */
 

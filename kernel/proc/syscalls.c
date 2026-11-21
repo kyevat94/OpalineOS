@@ -49,10 +49,12 @@ enum {
     SYS_setregid = 114, SYS_setgroups = 116, SYS_setresuid = 117, SYS_getresuid = 118, SYS_setresgid = 119,
     SYS_getresgid = 120, SYS_setfsuid = 122, SYS_setfsgid = 123, SYS_settimeofday = 164, SYS_clock_settime = 227,
     SYS_fchownat = 260, SYS_utimensat = 280, SYS_sysinfo = 99, SYS_poll = 7, SYS_ppoll = 271,
+    SYS_link = 86, SYS_symlink = 88, SYS_linkat = 265, SYS_symlinkat = 266,
     SYS_opaline_spawn = 1000,   /* spawn(path, argv): starts a program, returns its pid */
 };
 
 #define AT_FDCWD (-100)
+#define AT_SYMLINK_FOLLOW 0x400
 #define AT_SYMLINK_NOFOLLOW 0x100
 #define AT_REMOVEDIR 0x200
 #define AT_EMPTY_PATH 0x1000
@@ -228,7 +230,7 @@ static i64 sys_fstatat(i64 dirfd, u64 path_addr, u64 buf, u64 flags) {
     struct vnode *dir = NULL;
     if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
     struct vnode_stat s;
-    r = vfs_stat(path, dir, &s);   /* no symbolic links yet: AT_SYMLINK_NOFOLLOW changes nothing */
+    r = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, dir, &s) : vfs_stat(path, dir, &s);
     if (r < 0) return r;
     to_linux_stat(&s, (struct linux_stat *)buf);
     return 0;
@@ -245,9 +247,48 @@ static i64 sys_faccessat(i64 dirfd, u64 path_addr, u64 mode, u64 flags) {
     return vfs_access(path, dir, (int)mode, !(flags & 0x200 /* AT_EACCESS */));
 }
 
-static i64 sys_readlinkat(i64 dirfd, u64 path_addr) {
-    i64 r = sys_faccessat(dirfd, path_addr, 0, 0);
-    return r < 0 ? r : -EINVAL;   /* there are no symbolic links */
+static i64 sys_readlinkat(i64 dirfd, u64 path_addr, u64 buf, i64 size) {
+    char path[PATH_MAX];
+    if (size <= 0) return -EINVAL;
+    int r = copy_string(path_addr, path, sizeof path);
+    if (r < 0) return r;
+    struct vnode *dir = NULL;
+    if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
+    if (!user_ok(buf, (u64)size, true)) return -EFAULT;
+    char *target = kmalloc(PATH_MAX);
+    if (!target) return -ENOMEM;
+    r = vfs_readlink(path, dir, target, PATH_MAX);
+    if (r > 0) {   /* no terminating zero, as POSIX says */
+        r = (int)MIN((i64)r, size);
+        memcpy((void *)buf, target, (u64)r);
+    }
+    kfree(target);
+    return r;
+}
+
+static i64 sys_symlinkat(u64 target_addr, i64 dirfd, u64 path_addr) {
+    char *target = kmalloc(PATH_MAX), path[PATH_MAX];
+    if (!target) return -ENOMEM;
+    int r = copy_string(target_addr, target, PATH_MAX);
+    if (r == 0) r = copy_string(path_addr, path, sizeof path);
+    struct vnode *dir = NULL;
+    if (r == 0 && path[0] != '/') r = at_dir(dirfd, &dir);
+    if (r == 0) r = vfs_symlink(target, path, dir);
+    kfree(target);
+    return r;
+}
+
+static i64 sys_linkat(i64 olddir, u64 old_addr, i64 newdir, u64 new_addr, u64 flags) {
+    if (flags & ~(u64)(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) return -EINVAL;
+    char a[PATH_MAX], b[PATH_MAX];
+    int r = copy_string(old_addr, a, sizeof a);
+    if (r < 0) return r;
+    r = copy_string(new_addr, b, sizeof b);
+    if (r < 0) return r;
+    struct vnode *da = NULL, *db = NULL;
+    if (a[0] != '/' && (r = at_dir(olddir, &da)) < 0) return r;
+    if (b[0] != '/' && (r = at_dir(newdir, &db)) < 0) return r;
+    return vfs_link(a, da, b, db, flags & AT_SYMLINK_FOLLOW);
 }
 
 static i64 sys_lseek(u64 fd, i64 offset, u64 whence) {
@@ -387,7 +428,8 @@ static i64 sys_getdents64(u64 fd, u64 buf, u64 len) {
         *(u64 *)rec = de->ino;
         *(i64 *)(rec + 8) = (i64)cookie;
         *(u16 *)(rec + 16) = (u16)reclen;
-        rec[18] = de->type == VN_DIR ? 4 : de->type == VN_CHARDEV ? 2 : de->type == VN_PIPE ? 1 : 8;   /* DT_* */
+        rec[18] = de->type == VN_DIR ? 4 : de->type == VN_CHARDEV ? 2 : de->type == VN_PIPE ? 1
+                : de->type == VN_SYMLINK ? 10 : 8;   /* DT_* */
         memcpy(rec + 19, de->name, de->name_len);
         memset(rec + 19 + de->name_len, 0, reclen - 19 - de->name_len);
         used += reclen;
@@ -397,70 +439,48 @@ static i64 sys_getdents64(u64 fd, u64 buf, u64 len) {
     return (i64)used;
 }
 
-/* Makes `path` absolute and removes ".", ".." and repeated slashes (no symbolic links exist). */
-static int join_path(const char *cwd, const char *path, char *out, u64 size) {
-    char tmp[512];
-    u64 n = 0;
-    if (path[0] != '/') {
-        for (const char *s = cwd; *s && n < sizeof tmp - 1; s++) tmp[n++] = *s;
-        if (n < sizeof tmp - 1) tmp[n++] = '/';
-    }
-    for (const char *s = path; *s && n < sizeof tmp - 1; s++) tmp[n++] = *s;
-    tmp[n] = 0;
-    u64 o = 0;
-    out[o++] = '/';
-    for (char *p = tmp; *p;) {
-        while (*p == '/') p++;
-        char *start = p;
-        while (*p && *p != '/') p++;
-        u64 len = (u64)(p - start);
-        if (len == 0 || (len == 1 && start[0] == '.')) continue;
-        if (len == 2 && start[0] == '.' && start[1] == '.') {
-            if (o > 1) {
-                o--;
-                while (o > 1 && out[o - 1] != '/') o--;
-                if (o > 1) o--;
-            }
-            continue;
-        }
-        if (o > 1) out[o++] = '/';
-        if (o + len + 1 > size) return -ENAMETOOLONG;
-        memcpy(out + o, start, len);
-        o += len;
-    }
-    out[o] = 0;
-    return 0;
-}
-
-static i64 sys_chdir(u64 path_addr) {
-    char path[PATH_MAX], abs[256];
-    int r = copy_string(path_addr, path, sizeof path);
-    if (r < 0) return r;
+/* The current directory becomes v (which is referenced); its path is the physical one (links resolved). */
+static i64 set_cwd(struct vnode *v) {
     struct process *p = self();
-    struct vnode *v;
-    r = vfs_lookup(path, p->cwd, &v);
-    if (r < 0) return r;
-    if (v->type != VN_DIR) {
-        vnode_put(v);
-        return -ENOTDIR;
-    }
-    r = join_path(p->cwd_path, path, abs, sizeof abs);
+    int r = v->type != VN_DIR ? -ENOTDIR : vfs_permission(v, MAY_EXEC);
+    char path[256];
+    if (r == 0) r = vfs_path_of(v, path, sizeof path);
     if (r < 0) {
         vnode_put(v);
         return r;
     }
     vnode_put(p->cwd);
     p->cwd = v;
-    memcpy(p->cwd_path, abs, sizeof abs);
+    memcpy(p->cwd_path, path, sizeof path);
     return 0;
 }
 
+static i64 sys_chdir(u64 path_addr) {
+    char path[PATH_MAX];
+    int r = copy_string(path_addr, path, sizeof path);
+    if (r < 0) return r;
+    struct vnode *v;
+    r = vfs_lookup(path, self()->cwd, &v);
+    return r < 0 ? r : set_cwd(v);
+}
+
+static i64 sys_fchdir(u64 fd) {
+    struct file *f = get_file(fd);
+    if (!f) return -EBADF;
+    vnode_ref(f->vn);
+    return set_cwd(f->vn);
+}
+
 static i64 sys_getcwd(u64 buf, u64 size) {
-    u64 n = strlen(self()->cwd_path) + 1;
-    if (size < n) return -ERANGE;
-    if (!user_ok(buf, n, true)) return -EFAULT;
-    memcpy((void *)buf, self()->cwd_path, n);
-    return (i64)n;
+    char *path = kmalloc(PATH_MAX);
+    if (!path) return -ENOMEM;
+    int r = vfs_path_of(self()->cwd, path, PATH_MAX);   /* where the directory is now (it may have moved) */
+    u64 n = r < 0 ? 0 : strlen(path) + 1;
+    if (r == 0 && size < n) r = -ERANGE;
+    if (r == 0 && !user_ok(buf, n, true)) r = -EFAULT;
+    if (r == 0) memcpy((void *)buf, path, n);
+    kfree(path);
+    return r < 0 ? r : (i64)n;
 }
 
 /* mkdir(at), rmdir, unlink(at): op 0 = mkdir, 1 = rmdir, 2 = unlink */
@@ -704,7 +724,7 @@ static i64 sys_clock_nanosleep(u64 clock, u64 flags, u64 req, u64 rem) {
 
 static i64 sys_uname(u64 buf) {
     if (!user_ok(buf, 6 * 65, true)) return -EFAULT;
-    static const char *const fields[6] = {"OpalineOS", "opaline", "0.6.1-se1", "#1 OpalineOS", "x86_64", "(none)"};
+    static const char *const fields[6] = {"OpalineOS", "opaline", "0.6.2-se2", "#1 OpalineOS", "x86_64", "(none)"};
     char *out = (char *)buf;
     memset(out, 0, 6 * 65);
     for (int i = 0; i < 6; i++) memcpy(out + i * 65, fields[i], strlen(fields[i]));
@@ -771,6 +791,7 @@ static i64 sys_getrandom(u64 buf, u64 len) {
  * dirfd itself with AT_EMPTY_PATH and no path.
  */
 static i64 sys_attr(i64 dirfd, u64 path_addr, u64 flags, int op, u64 a, u64 b, u64 c) {
+    bool nofollow = flags & AT_SYMLINK_NOFOLLOW;
     struct vnode *v;
     int r;
     if (!path_addr && (flags & AT_EMPTY_PATH)) {
@@ -784,8 +805,12 @@ static i64 sys_attr(i64 dirfd, u64 path_addr, u64 flags, int op, u64 a, u64 b, u
         if (r < 0) return r;
         struct vnode *dir = NULL;
         if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
-        r = vfs_lookup(path, dir, &v);
+        r = nofollow ? vfs_lookup_nofollow(path, dir, &v) : vfs_lookup(path, dir, &v);
         if (r < 0) return r;
+    }
+    if (op == 'm' && v->type == VN_SYMLINK) {   /* a link has no mode of its own (as Linux) */
+        vnode_put(v);
+        return -EOPNOTSUPP;
     }
     struct vnode_stat st;
     r = v->ops->stat ? v->ops->stat(v, &st) : -EPERM;
@@ -919,15 +944,20 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_openat:        r = sys_openat((i64)a, b, c, d); break;
     case SYS_creat:         r = sys_openat(AT_FDCWD, a, O_CREAT | O_WRONLY | O_TRUNC, b); break;
     case SYS_close:         r = sys_close(a); break;
-    case SYS_stat:
-    case SYS_lstat:         r = sys_fstatat(AT_FDCWD, a, b, 0); break;   /* no symbolic links yet */
+    case SYS_stat:          r = sys_fstatat(AT_FDCWD, a, b, 0); break;
+    case SYS_lstat:         r = sys_fstatat(AT_FDCWD, a, b, AT_SYMLINK_NOFOLLOW); break;
     case SYS_fstat:         r = sys_fstat(a, b); break;
     case SYS_newfstatat:    r = sys_fstatat((i64)a, b, c, d); break;
     case SYS_access:        r = sys_faccessat(AT_FDCWD, a, b, 0); break;
     case SYS_faccessat:     r = sys_faccessat((i64)a, b, c, 0); break;
     case SYS_faccessat2:    r = sys_faccessat((i64)a, b, c, d); break;
-    case SYS_readlink:      r = sys_readlinkat(AT_FDCWD, a); break;
-    case SYS_readlinkat:    r = sys_readlinkat((i64)a, b); break;
+    case SYS_readlink:      r = sys_readlinkat(AT_FDCWD, a, b, (i64)c); break;
+    case SYS_readlinkat:    r = sys_readlinkat((i64)a, b, c, (i64)d); break;
+    case SYS_symlink:       r = sys_symlinkat(a, AT_FDCWD, b); break;
+    case SYS_symlinkat:     r = sys_symlinkat(a, (i64)b, c); break;
+    case SYS_link:          r = sys_linkat(AT_FDCWD, a, AT_FDCWD, b, 0); break;
+    case SYS_linkat:        r = sys_linkat((i64)a, b, (i64)c, d, e); break;
+    case SYS_fchdir:        r = sys_fchdir(a); break;
     case SYS_lseek:         r = sys_lseek(a, (i64)b, c); break;
     case SYS_ioctl:         r = sys_ioctl(a, b, c); break;
     case SYS_readv:         r = sys_rwv(a, b, c, false); break;
@@ -956,8 +986,8 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_chmod:         r = sys_attr(AT_FDCWD, a, 0, 'm', b, 0, 0); break;
     case SYS_fchmod:        r = sys_attr((i64)a, 0, AT_EMPTY_PATH, 'm', b, 0, 0); break;
     case SYS_fchmodat:      r = sys_attr((i64)a, b, d, 'm', c, 0, 0); break;
-    case SYS_chown:
-    case SYS_lchown:        r = sys_attr(AT_FDCWD, a, 0, 'o', 0, b, c); break;
+    case SYS_chown:         r = sys_attr(AT_FDCWD, a, 0, 'o', 0, b, c); break;
+    case SYS_lchown:        r = sys_attr(AT_FDCWD, a, AT_SYMLINK_NOFOLLOW, 'o', 0, b, c); break;
     case SYS_fchown:        r = sys_attr((i64)a, 0, AT_EMPTY_PATH, 'o', 0, b, c); break;
     case SYS_fchownat:      r = sys_attr((i64)a, b, e, 'o', 0, c, d); break;
     case SYS_utimensat:     r = sys_attr((i64)a, b, d | (b ? 0 : AT_EMPTY_PATH), 't', c, 0, 0); break;

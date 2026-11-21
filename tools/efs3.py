@@ -5,7 +5,7 @@
     python tools/efs3.py ls   DISK.img [PATH]     # list a directory of the root partition
     python tools/efs3.py cat  DISK.img PATH       # print a file
     python tools/efs3.py tree DISK.img            # whole tree with sizes
-    python tools/efs3.py check DISK.img           # consistency check (bitmaps, link counts)
+    python tools/efs3.py check DISK.img           # consistency check (bitmaps, link counts, journal)
 
 Other tools import make_fs() (build) and Efs3 (read).
 
@@ -15,12 +15,13 @@ On-disk format (little endian, 4 KiB blocks; kernel/fs/efs3.c is the other imple
     block 1              inode bitmap (bit n = inode n in use; inode 0 is never used)
     block 2..            block bitmap (bit n = block n in use, metadata included)
     then                 inode table (128-byte inodes, inode n at byte n * 128)
+    then                 journal (version 2: JOURNAL_BLOCKS blocks)
     then                 data blocks
 
     superblock:  "EFS3", version, block_size, block_count, inode_count, inode_bitmap_block,
                  block_bitmap_block, block_bitmap_blocks, inode_table_block, inode_table_blocks,
                  first_data_block, root_inode (1), free_blocks, free_inodes, reserved,
-                 label[32] (UTF-8), uuid[16]
+                 label[32] (UTF-8), uuid[16], journal_start, journal_blocks (version 2)
     inode:       mode u16 (0x4000 dir / 0x8000 file | permissions, set-id and sticky bits),
                  links u16, flags u32, size u64, ctime u64, mtime u64, direct[12] u32,
                  indirect u32, double_indirect u32, uid u32, gid u32, atime u64,
@@ -28,7 +29,15 @@ On-disk format (little endian, 4 KiB blocks; kernel/fs/efs3.c is the other imple
                  1970 UTC; images from before stage SE1 have zero there: root, 1970)
     directory:   records that cover every byte of each data block:
                  inode u32 (0 = free), rec_len u16 (multiple of 4), name_len u8,
-                 type u8 (1 file, 2 directory), name (UTF-8, NFC, no '/' or NUL, 1..255 bytes)
+                 type u8 (1 file, 2 directory, 3 symbolic link), name (UTF-8, NFC, no '/' or NUL,
+                 1..255 bytes). Several entries may name the same file (hard links).
+    symbolic link: an inode with mode 0xA000 | 0777 whose first data block holds the target path
+                 (size = its length, at most 4095 bytes)
+    journal:     block 0 header ("EFJH", version u32, seq u64: the next transaction's number),
+                 block 1 descriptor ("EFJD", count u32, seq u64, block numbers u32[count]),
+                 blocks 2.. copies of those blocks, then a commit block ("EFJC", count u32, seq u64,
+                 checksum u32 = FNV-1a over count, seq, the block list and every copy). A committed
+                 transaction with seq >= the header's is written in place again at mount.
 
 Names are stored NFC-normalized, so "ação" typed with combining accents is the same file.
 """
@@ -45,9 +54,11 @@ PTRS = BLOCK // 4                    # block numbers per indirect block
 MAGIC = b"EFS3"
 ROOT_INODE = 1
 S_IFDIR, S_IFREG = 0x4000, 0x8000
-FT_FILE, FT_DIR = 1, 2
+FT_FILE, FT_DIR, FT_SYMLINK = 1, 2, 3
+S_IFLNK = 0xA000
+JOURNAL_BLOCKS = 256
 
-SUPER_FMT = "<4s14I32s16s"
+SUPER_FMT = "<4s14I32s16sII"
 INODE_FMT = "<HHIQQQ12IIIIIQ24s"
 assert struct.calcsize(INODE_FMT) == INODE_SIZE
 
@@ -69,7 +80,15 @@ def layout(block_count):
     bbmap_blocks = (block_count + BLOCK * 8 - 1) // (BLOCK * 8)
     itable_blocks = inode_count * INODE_SIZE // BLOCK
     itable = 2 + bbmap_blocks
-    return inode_count, bbmap_blocks, itable, itable_blocks, itable + itable_blocks
+    jstart = itable + itable_blocks
+    jblocks = min(JOURNAL_BLOCKS, max(16, block_count // 16))
+    return inode_count, bbmap_blocks, itable, itable_blocks, jstart, jblocks, jstart + jblocks
+
+
+def fnv1a(h, data):
+    for byte in data:
+        h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
+    return h
 
 
 def dir_records(entries):
@@ -111,7 +130,7 @@ def make_fs(source_dir, size_bytes, label="OpalineOS", when_ns=None):
     Every file gets the time `when_ns` (default: now)."""
     stamp = time.time_ns() if when_ns is None else when_ns
     block_count = size_bytes // BLOCK
-    inode_count, bbmap_blocks, itable, itable_blocks, first_data = layout(block_count)
+    inode_count, bbmap_blocks, itable, itable_blocks, jstart, jblocks, first_data = layout(block_count)
     img = bytearray(block_count * BLOCK)
     inodes = {}            # number -> dict
     next_inode = [ROOT_INODE]
@@ -204,26 +223,65 @@ def make_fs(source_dir, size_bytes, label="OpalineOS", when_ns=None):
         img[2 * BLOCK + b // 8] |= 1 << (b % 8)
 
     vol_uuid = uuid.uuid5(ROOT_TYPE_GUID, label).bytes
-    struct.pack_into(SUPER_FMT, img, 0, MAGIC, 1, BLOCK, block_count, inode_count, 1, 2, bbmap_blocks, itable,
+    struct.pack_into(SUPER_FMT, img, 0, MAGIC, 2, BLOCK, block_count, inode_count, 1, 2, bbmap_blocks, itable,
                      itable_blocks, first_data, ROOT_INODE, block_count - next_block[0],
-                     inode_count - used_inodes, 0, label.encode("utf-8")[:32].ljust(32, b"\0"), vol_uuid)
+                     inode_count - used_inodes, 0, label.encode("utf-8")[:32].ljust(32, b"\0"), vol_uuid,
+                     jstart, jblocks)
+    struct.pack_into("<4sIQ", img, jstart * BLOCK, b"EFJH", 1, 1)   # an empty journal
     return bytes(img)
 
 
 class Efs3:
     """Reads an EFS3 file system (bytes of the partition)."""
 
-    def __init__(self, data):
+    def __init__(self, data, replay=True):
         self.data = data
-        f = struct.unpack_from(SUPER_FMT, data, 0)
+        self._super()
+        self.pending = self.pending_transaction()
+        self.replayed = None
+        if self.pending and replay:   # what the kernel does at mount, done in memory
+            seq, blocks, copies = self.pending
+            buf = bytearray(self.data)
+            for b, copy in zip(blocks, copies):
+                buf[b * BLOCK:(b + 1) * BLOCK] = copy
+            self.data = bytes(buf)
+            self._super()
+            self.replayed, self.pending = seq, None
+
+    def _super(self):
+        f = struct.unpack_from(SUPER_FMT, self.data, 0)
         if f[0] != MAGIC:
             raise ValueError("not an EFS3 file system")
-        (_, self.version, bs, self.block_count, self.inode_count, _, _, _, self.itable, _, _, self.root,
-         self.free_blocks, self.free_inodes, _, label, _) = f
+        (_, self.version, bs, self.block_count, self.inode_count, _, _, _, self.itable, _, self.first_data, self.root,
+         self.free_blocks, self.free_inodes, _, label, _, self.jstart, self.jblocks) = f
+        if self.version < 2:
+            self.jstart = self.jblocks = 0
         self.label = label.rstrip(b"\0").decode("utf-8")
 
+    def pending_transaction(self):
+        """A committed journal transaction not yet marked done: (seq, blocks, copies) or None."""
+        if not self.jblocks:
+            return None
+        blk = lambda n: self.data[(self.jstart + n) * BLOCK:(self.jstart + n + 1) * BLOCK]
+        magic, _, next_seq = struct.unpack_from("<4sIQ", blk(0))
+        if magic != b"EFJH":
+            next_seq = 1
+        magic, count, seq = struct.unpack_from("<4sIQ", blk(1))
+        if magic != b"EFJD" or not 0 < count <= self.jblocks - 3 or seq < next_seq:
+            return None
+        blocks = list(struct.unpack_from(f"<{count}I", blk(1), 16))
+        cmagic, ccount, cseq, csum = struct.unpack_from("<4sIQI", blk(2 + count))
+        copies = [blk(2 + i) for i in range(count)]
+        h = fnv1a(fnv1a(fnv1a(2166136261, struct.pack("<I", count)), struct.pack("<Q", seq)),
+                  struct.pack(f"<{count}I", *blocks))
+        for c in copies:
+            h = fnv1a(h, c)
+        if cmagic != b"EFJC" or ccount != count or cseq != seq or csum != h:
+            return None
+        return seq, blocks, copies
+
     @classmethod
-    def from_disk(cls, path):
+    def from_disk(cls, path, replay=True):
         """Opens the root partition of a GPT disk image."""
         with open(path, "rb") as f:
             disk = f.read()
@@ -233,7 +291,7 @@ class Efs3:
             e = disk[entries_lba * 512 + i * size:entries_lba * 512 + (i + 1) * size]
             if uuid.UUID(bytes_le=e[:16]) == ROOT_TYPE_GUID:
                 first, last = struct.unpack_from("<QQ", e, 32)
-                return cls(disk[first * 512:(last + 1) * 512])
+                return cls(disk[first * 512:(last + 1) * 512], replay)
         raise ValueError("no OpalineOS root partition in this disk image")
 
     def inode(self, n):
@@ -287,26 +345,24 @@ class Efs3:
         return n
 
     def check(self):
-        """fsck: compares the bitmaps and free counts with what the directory tree really uses."""
+        """fsck: compares the bitmaps, link counts and free counts with what the directory tree really
+        uses. A committed journal transaction that was not written in place is a problem too (the
+        kernel replays it at mount; open the image with replay=False to see it)."""
         errors = []
-        _, bbmap_blocks, itable, itable_blocks, first_data = layout(self.block_count)
-        used_blocks = set(range(first_data))
+        if self.pending:
+            errors.append(f"journal: transaction {self.pending[0]} is committed but not written in place")
+        used_blocks = set(range(self.first_data))
         used_inodes = {0}
         links = {}
 
         def mark_block(b, owner):
             if b in used_blocks:
                 errors.append(f"block {b} used twice ({owner})")
-            if not first_data <= b < self.block_count:
+            if not self.first_data <= b < self.block_count:
                 errors.append(f"block {b} out of range ({owner})")
             used_blocks.add(b)
 
-        def visit(n, path, parent):
-            if n in used_inodes:
-                errors.append(f"inode {n} reached twice ({path})")
-                return
-            used_inodes.add(n)
-            ino = self.inode(n)
+        def mark_blocks(n, ino, path):
             nb = (ino["size"] + BLOCK - 1) // BLOCK
             for b in self.blocks(ino):
                 if b:
@@ -319,27 +375,45 @@ class Efs3:
                 for ib in outer:
                     if ib:
                         mark_block(ib, path + " (indirect)")
-            if ino["mode"] & 0xF000 == S_IFDIR:
-                entries = self.listdir(n)
-                names = [e[0] for e in entries]
-                if names[:2] != [".", ".."]:
-                    errors.append(f"{path}: '.' and '..' missing")
-                elif entries[1][1] != parent:
-                    errors.append(f"{path}: '..' points to inode {entries[1][1]}, expected {parent}")
-                subdirs = 0
-                for name, child, ftype in entries[2:]:
-                    links[child] = links.get(child, 0) + 1
-                    if ftype == FT_DIR:
-                        subdirs += 1
-                        visit(child, path.rstrip("/") + "/" + name, n)
-                    else:
-                        visit(child, path.rstrip("/") + "/" + name, n)
-                if ino["links"] != 2 + subdirs:
-                    errors.append(f"{path}: link count {ino['links']}, expected {2 + subdirs}")
-            elif ino["links"] != links.get(n, 0):
-                errors.append(f"{path}: link count {ino['links']}, expected {links.get(n, 0)}")
 
-        visit(self.root, "/", self.root)
+        def visit_dir(n, path, parent):
+            if n in used_inodes:
+                errors.append(f"directory inode {n} reached twice ({path})")
+                return
+            used_inodes.add(n)
+            ino = self.inode(n)
+            mark_blocks(n, ino, path)
+            entries = self.listdir(n)
+            names = [e[0] for e in entries]
+            if names[:2] != [".", ".."]:
+                errors.append(f"{path}: '.' and '..' missing")
+            elif entries[1][1] != parent:
+                errors.append(f"{path}: '..' points to inode {entries[1][1]}, expected {parent}")
+            subdirs = 0
+            for name, child, ftype in entries[2:]:
+                child_path = path.rstrip("/") + "/" + name
+                kind = self.inode(child)["mode"] & 0xF000
+                expected = FT_DIR if kind == S_IFDIR else FT_SYMLINK if kind == S_IFLNK else FT_FILE
+                if ftype != expected:
+                    errors.append(f"{child_path}: entry type {ftype}, inode type {expected}")
+                if ftype == FT_DIR:
+                    subdirs += 1
+                    visit_dir(child, child_path, n)
+                    continue
+                links[child] = links.get(child, 0) + 1
+                if child not in used_inodes:   # a file with several names is counted once
+                    used_inodes.add(child)
+                    cino = self.inode(child)
+                    mark_blocks(child, cino, child_path)
+                    if kind == S_IFLNK and not 0 < cino["size"] < BLOCK:
+                        errors.append(f"{child_path}: symbolic link of {cino['size']} bytes")
+            if ino["links"] != 2 + subdirs:
+                errors.append(f"{path}: link count {ino['links']}, expected {2 + subdirs}")
+
+        visit_dir(self.root, "/", self.root)
+        for child, count in links.items():
+            if self.inode(child)["links"] != count:
+                errors.append(f"inode {child}: link count {self.inode(child)['links']}, {count} name(s) found")
         for b in range(self.block_count):
             in_bitmap = bool(self.data[2 * BLOCK + b // 8] & (1 << (b % 8)))
             if in_bitmap != (b in used_blocks):
@@ -355,6 +429,9 @@ class Efs3:
             errors.append(f"superblock: {self.free_inodes} free inodes, counted {self.inode_count - len(used_inodes)}")
         return errors
 
+    def readlink(self, n):
+        return self.read(n).decode("utf-8", errors="replace")
+
     def walk(self, n=None, prefix=""):
         n = self.root if n is None else n
         for name, ino, ftype in self.listdir(n):
@@ -369,7 +446,7 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     cmd, image = sys.argv[1], sys.argv[2]
-    fs = Efs3.from_disk(image)
+    fs = Efs3.from_disk(image, replay=cmd != "check")
     sys.stdout.reconfigure(encoding="utf-8")
     if cmd == "ls":
         for name, ino, ftype in fs.listdir(fs.lookup(sys.argv[3] if len(sys.argv) > 3 else "/")):
@@ -384,7 +461,12 @@ def main():
         sys.exit(1 if errors else 0)
     elif cmd == "tree":
         print(f"EFS3 \"{fs.label}\": {fs.block_count} blocks, {fs.free_blocks} free, {fs.free_inodes} inodes free")
+        if fs.replayed:
+            print(f"(journal transaction {fs.replayed} replayed in memory)")
         for path, ino, ftype in fs.walk():
+            if ftype == FT_SYMLINK:
+                print(f"{path} -> {fs.readlink(ino)}")
+                continue
             size = "" if ftype == FT_DIR else f"  {fs.inode(ino)['size']} bytes"
             print(path + ("/" if ftype == FT_DIR else "") + size)
     else:
