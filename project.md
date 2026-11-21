@@ -11,14 +11,15 @@
 
 Um sistema operacional **próprio, open source, leve, rápido e moderno**, em que **Python é o centro
 do sistema**: a área de trabalho e os apps são escritos em **Python de verdade (CPython oficial)**,
-usando **`opaline.vitrum`**, a biblioteca própria do sistema para criar janelas e interfaces. Os apps podem
+usando **`opaline.relief`**, a biblioteca própria do sistema para criar janelas e interfaces. Os apps podem
 usar bibliotecas reais baixadas com `pip`.
 
 - **Kernel próprio em C**, escrito do zero, sem código de Linux nem de Windows.
 - **Motor em C, lógica em Python**: o kernel, o compositor e o desenho dos componentes são nativos
   (a parte que define se o sistema "parece rápido"). A lógica dos apps é Python.
-- Visual moderno: vidro fosco (glassmorphism), cantos arredondados, sombras suaves, destaque
-  coral/rosa com brilho (glow) e tema escuro. Veja a seção 6 e `docs/references/`.
+- Visual moderno em **relevo suave (neumorfismo)**: superfícies opacas que saltam ou afundam com luz
+  e sombra, cantos arredondados, bege porcelana com destaque verde-petróleo. Mais leve de desenhar
+  que vidro fosco (seção 5). Veja a seção 6 e `docs/references/`.
 - Meta realista: chegar ao nível de projetos como SerenityOS, ToaruOS, Haiku e Redox (que também
   rodam o Python oficial), ou seja, um sistema completo e utilizável. **Não** é meta replicar o
   tamanho do Windows ou do Linux.
@@ -56,8 +57,8 @@ aposentada**: no v3, o Python é o CPython oficial.
 |---|---|
 | `kernel/net.c` (TCP/IP), `e1000.c` | pilha de rede do kernel (com interrupções em vez de polling), exposta como sockets BSD |
 | `kernel/fs.c` (EFS2) | ponto de partida do sistema de arquivos (EFS3) |
-| `kernel/wm.c`, `gfx.c` | ideias do compositor. O renderizador será reescrito (alfa, blur, AA) |
-| `root/*.pyos` (apps) | lógica dos apps reescrita em Python + `vitrum` (a sintaxe do PyOS já era parecida com Python) |
+| `kernel/wm.c`, `gfx.c` | ideias do compositor. O renderizador será reescrito (alfa, sombras, AA) |
+| `root/*.pyos` (apps) | lógica dos apps reescrita em Python + `relief` (a sintaxe do PyOS já era parecida com Python) |
 | `tools/vmctl.py` | controle e testes automáticos da VM pela serial |
 | `kernel/pyos/*` (compilador e VM) | **não é reaproveitado** (o CPython oficial substitui) |
 | `tools/proxy.py` (HTTPS) | **não é reaproveitado** (o OpenSSL portado faz o TLS) |
@@ -78,7 +79,7 @@ aposentada**: no v3, o Python é o CPython oficial.
 | Interface com programas | **POSIX** (≈100–150 syscalls no estilo Unix) | necessário para portar o CPython e outros softwares |
 | libc | **musl** (MIT), portada para o OpalineOS | pequena, limpa e com licença permissiva |
 | Python | **CPython oficial** (versão estável mais recente na época do porte: 3.14/3.15) | ecossistema real: pip, PyPI |
-| Toolkit gráfico | **`opaline.vitrum`**: núcleo em C + API em Python | apps em Python com o visual do sistema |
+| Toolkit gráfico | **`opaline.relief`**: núcleo em C + API em Python | apps em Python com o visual do sistema |
 | Apps rápidos | **mypyc / Cython** (Python tipado → extensão C) | ganho de ~3–10× sem criar um compilador próprio |
 | TLS | **OpenSSL** portado (Apache-2.0) | HTTPS real, e o `pip` funciona |
 | Linguagem do kernel | C (clang) + Assembly (NASM) | mesma toolchain do v2 |
@@ -86,11 +87,11 @@ aposentada**: no v3, o Python é o CPython oficial.
 | Onde roda | **VM no início**. Rodar em **PC real** e em **dual boot com Windows** é meta obrigatória (ver 3.3) | uso diário de verdade |
 | Fonte da interface | **Inter** (licença OFL) | moderna, legível e pode ser distribuída |
 | Nome do sistema | **OpalineOS** | escolhido pelo usuário após a pesquisa do Apêndice A.2 |
-| Nomes dos módulos | pacote de distribuição **`opaline-vitrum`**; em Python: **`from opaline import vitrum`** (toolkit) e **`opaline.system`** (APIs do sistema). Documentação: [`opaline-vitrum.md`](opaline-vitrum.md) | nomes com hífen não podem ser importados em Python, e `vitrum` sozinho já existe no PyPI. Ficar dentro do pacote `opaline` evita qualquer conflito |
+| Nomes dos módulos | pacote de distribuição **`opaline-relief`**; em Python: **`from opaline import relief`** (toolkit) e **`opaline.system`** (APIs do sistema). Documentação: [`opaline-relief.md`](opaline-relief.md) | nomes com hífen não podem ser importados em Python, e `relief` sozinho já existe no PyPI. Ficar dentro do pacote `opaline` evita qualquer conflito |
 | Tipo de kernel | **monolítico modular** | drivers dentro do kernel, mas cada um isolado atrás de uma interface bem definida (podem ir para o espaço de usuário no futuro). Compositor e shell já rodam em espaço de usuário. É o modelo mais prático para os muitos drivers de PC real |
 | ABI das syscalls | **mista** | as syscalls POSIX seguem o Linux x86-64: mesma numeração, mesmos registradores (`rax` = número; `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` = argumentos), mesmas estruturas, constantes e `errno`. As syscalls exclusivas do sistema (compositor, IPC, notificações) ficam numa faixa própria, **a partir de 1000**. Syscall não implementada → `-ENOSYS`. Permite usar a musl quase sem mudanças e testar pacotes musllinux do PyPI. Nenhum código do Linux é usado, só o mesmo contrato |
 | Licença do sistema | **GPL-3.0-or-later** (kernel, bootloader, compositor, shell, apps do sistema, ferramentas) | quem distribuir versões modificadas precisa publicar o código; "or later" permite usar versões futuras da GPL. Texto em `COPYING` |
-| Licença das bibliotecas | **LGPL-3.0-or-later** para o que os apps importam: pacote `opaline` (`opaline.vitrum`, `opaline.system`, `opaline.i18n`) e o núcleo C `_vitrum` | apps para o OpalineOS podem ter qualquer licença. Texto em `COPYING.LESSER`; resumo em `LICENSING.md`. Componentes de terceiros mantêm as próprias licenças (seção 10) |
+| Licença das bibliotecas | **LGPL-3.0-or-later** para o que os apps importam: pacote `opaline` (`opaline.relief`, `opaline.system`, `opaline.i18n`) e o núcleo C `_relief` | apps para o OpalineOS podem ter qualquer licença. Texto em `COPYING.LESSER`; resumo em `LICENSING.md`. Componentes de terceiros mantêm as próprias licenças (seção 10) |
 | Idioma do código | **inglês**: APIs, nomes de módulos/classes/funções, identificadores, comentários, mensagens de log, commits e documentação das bibliotecas | padrão de projetos open source; facilita contribuições |
 | Idioma da interface | **inglês (en-US)** como padrão + **português (pt-BR)**. Troca a qualquer momento nas Configurações, **sem reiniciar** os apps | seção 7 |
 | Texto | **Unicode / UTF-8 em todo o sistema** (kernel, nomes de arquivos, terminal, Python, interface) | aceitar acentos e qualquer idioma |
@@ -137,15 +138,15 @@ Requisitos, para que tudo seja projetado desde o início sem atrapalhar o Window
 │ Shell gráfico (Python): barra superior, dock, lançador,      │
 │ central de notificações                                      │
 ├─────────────────────────────────────────────────────────────┤
-│ opaline.vitrum · opaline.system · opaline.i18n (Python)      │
-│ _vitrum (núcleo C): componentes, layout, texto, animação     │
+│ opaline.relief · opaline.system · opaline.i18n (Python)      │
+│ _relief (núcleo C): componentes, layout, texto, animação     │
 ├─────────────────────────────────────────────────────────────┤
 │ CPython oficial  ·  zlib, OpenSSL, libffi, sqlite...         │
 ├─────────────────────────────────────────────────────────────┤
 │ musl libc  ·  carregador dinâmico (ld.so)                    │
 ├─────────────────────────────────────────────────────────────┤
 │ Compositor (C, espaço de usuário): buffers compartilhados,   │
-│ alfa, blur, sombras, animações                               │
+│ alfa, relevo (sombras em cache), animações                   │
 ├──────────────────── syscalls POSIX ─────────────────────────┤
 │ Kernel (C): memória virtual, processos/threads, escalonador  │
 │ SMP, VFS + EFS3, pipes, sockets, IPC, drivers (disco, rede,  │
@@ -157,13 +158,13 @@ Requisitos, para que tudo seja projetado desde o início sem atrapalhar o Window
 
 ---
 
-## 4. Python como centro: CPython oficial + `opaline.vitrum`
+## 4. Python como centro: CPython oficial + `opaline.relief`
 
 ### 4.1 Por que o Python oficial e não uma linguagem própria
 
 - **Ecossistema real**: bibliotecas do PyPI, documentação, tutoriais e ferramentas existentes.
 - **Menos trabalho reinventando**: o esforço vai para o que torna o OpalineOS único (kernel,
-  compositor, visual e a API `opaline.vitrum`), e não para recriar uma linguagem e seu compilador.
+  compositor, visual e a API `opaline.relief`), e não para recriar uma linguagem e seu compilador.
 - **Velocidade onde importa**: um app de interface passa quase todo o tempo esperando eventos, e o
   desenho é feito em C. Para cálculo pesado existem mypyc/Cython e o JIT experimental do CPython.
 - **Custo aceitável**: cada app em CPython ocupa cerca de 15–25 MB e leva dezenas de
@@ -190,33 +191,34 @@ Requisitos, para que tudo seja projetado desde o início sem atrapalhar o Window
 | **Binários "musllinux" do PyPI** | **Podem funcionar sem recompilar** se a musl do OpalineOS mantiver as mesmas estruturas, constantes e (idealmente) a numeração de syscalls do Linux. A ser validado na etapa E12 |
 | **Dependentes de GPU ou de outro sistema gráfico** (PyTorch, PyQt, Tkinter) | Fora de escopo |
 
-### 4.4 A biblioteca `opaline.vitrum`
+### 4.4 A biblioteca `opaline.relief`
 
-- **`_vitrum` (C)**: fala com o compositor por memória compartilhada e IPC, desenha os componentes
-  do design system (seção 6) com blur, sombras, texto TrueType e animações, e trata a entrada.
-- **`opaline.vitrum` (Python)**: uma API simples e "pythônica" por cima, **em inglês**.
+- **`_relief` (C)**: fala com o compositor por memória compartilhada e IPC, desenha os componentes
+  do design system (seção 6) com relevo (luz e sombra), texto TrueType e animações, e trata a
+  entrada.
+- **`opaline.relief` (Python)**: uma API simples e "pythônica" por cima, **em inglês**.
 - **`opaline.system` (Python)**: APIs do sistema (notificações, energia, rede, configurações, tema,
   arquivos recentes).
 - **`opaline.i18n` (Python)**: traduções, idioma atual e formatação de datas/números (seção 7).
-- Documentação completa: [`opaline-vitrum.md`](opaline-vitrum.md).
+- Documentação completa: [`opaline-relief.md`](opaline-relief.md).
 
 Exemplo do estilo de API desejado:
 
 ```python
-from opaline import vitrum as vt
+from opaline import relief as rl
 
 from opaline.i18n import _
 
-app = vt.App(_("Counter"))
-window = vt.Window(_("Counter"), width=360, height=200)
+app = rl.App(_("Counter"))
+window = rl.Window(_("Counter"), width=360, height=200)
 
-total = vt.Label("0", style="h1")
+total = rl.Label("0", style="h1")
 def increment():
     total.text = str(int(total.text) + 1)
 
-window.add(vt.Column([
+window.add(rl.Column([
     total,
-    vt.Button(_("Add"), primary=True, on_click=increment),
+    rl.Button(_("Add"), primary=True, on_click=increment),
 ]))
 window.show()
 app.run()
@@ -236,10 +238,11 @@ SIMD (SSE/AVX)**. O visual das referências é viável com estas técnicas:
 
 | Efeito | Técnica | Custo / otimização |
 |---|---|---|
-| Vidro fosco (blur do fundo) | blur gaussiano aproximado (3 passes de box blur) em resolução reduzida (1/4) e depois ampliado | o blur do papel de parede é **cacheado**. Só é refeito quando o fundo muda |
+| Relevo (neumorfismo) | duas sombras por elemento: realce claro do lado da luz e sombra escura do outro (internas, para afundado), pré-desfocadas e guardadas em cache por tamanho, raio e elevação (9 fatias: cantos e bordas) | quase grátis depois do cache; mudar a elevação (passar o mouse, pressionar) é só uma mistura entre sombras já prontas |
+| Superfícies opacas | janelas e componentes têm cor sólida | o compositor pula o que uma janela opaca cobre, e mover uma janela redesenha só a área descoberta. Nada atrás precisa ser lido e desfocado |
 | Cantos arredondados | máscaras de SDF (campo de distância) com antialiasing | barato |
-| Sombras suaves | sombra pré-desfocada por raio, guardada em cache (9 fatias: cantos e bordas) | quase grátis depois do cache |
-| Brilho (glow) coral | é uma sombra colorida com blur, igual à anterior | idem |
+| Brilho (glow) de foco | sombra colorida desfocada, como as do relevo | idem |
+| Vidro fosco (**opcional**) | blur aproximado (3 passes de box blur) em resolução reduzida (1/4) e ampliado | caro: refeito sempre que o que está atrás muda. Fica fora do tema do sistema; os apps podem usar em elementos pequenos e passageiros |
 | Texto nítido | rasterizador TrueType (próprio ou FreeType portado) com antialiasing e cache de glifos | cache por tamanho |
 | Ícones | ícones vetoriais próprios rasterizados com AA e cacheados | — |
 | Animações | interpolação com *easing* a 60 fps, só na região que mudou (*damage tracking*) | redesenhar só o necessário |
@@ -249,50 +252,86 @@ SIMD (SSE/AVX)**. O visual das referências é viável com estas técnicas:
   compartilhada) e o compositor só monta a cena. Assim, uma janela travada não congela a tela.
 - Metas de desempenho: 60 fps arrastando janelas em 1920×1080 na VM e menos de 16 ms por quadro.
 - Mais adiante: driver *virtio-gpu* (QEMU) e, só muito depois, aceleração de GPU real.
+- **Por que relevo e não vidro** (decisão de 2026-11-21): sem GPU, o desfoque do que está atrás de
+  cada janela transparente é o efeito mais caro do compositor, e precisa ser refeito toda vez que o
+  fundo muda. No relevo as superfícies são opacas e as sombras vêm prontas do cache.
 
 ---
 
-## 6. Design system "Vitrum"
+## 6. Design system "Relief"
+
+Relevo suave (**neumorfismo**): superfícies opacas da cor do fundo, que saltam ou afundam por causa de
+uma luz (de cima à esquerda) — um realce claro de um lado e uma sombra do outro, ou os dois por dentro
+para o que está afundado. Um único destaque forte (verde-petróleo) marca as ações principais.
 
 Referências em `docs/references/`:
+- `neumorfismo.webp` (**referência do estilo atual**, de 2026-11-21): kit completo — camadas (base,
+  elevada, embutida, pressionada), níveis de elevação, espessuras de borda, escala de raios, regras de
+  ícones, controles, navegação, exibição de dados e feedback.
 - `desktop.webp`: área de trabalho completa (barra superior, dock lateral e inferior, menu de apps,
-  gerenciador de arquivos, monitor do sistema, player e central de notificações).
-- `componentes.webp`: kit de componentes (botões, inputs, toggle, abas, chips, dropdown, date picker,
-  stepper, toast, tooltip, badges, paginação, breadcrumbs, card, tabela, estado vazio).
+  gerenciador de arquivos, monitor do sistema, player e central de notificações). Vale pela
+  **disposição** dos elementos; o estilo de vidro escuro foi substituído pelo relevo.
+- `componentes.webp`: kit de componentes no estilo antigo (vidro), também só como referência de
+  conteúdo.
 
 > Os ícones das referências incluem marcas de terceiros (Firefox, Spotify, Discord, Steam, VS Code,
 > Chrome). O OpalineOS usa **somente ícones próprios**, nunca logotipos de outras marcas.
 
-### 6.1 Tokens (valores iniciais, estimados das referências e ajustáveis)
+**Cuidados do estilo** (o ponto fraco conhecido do neumorfismo é o contraste):
+- toda ação principal usa o destaque, e texto e ícones ficam com contraste de pelo menos 4,5:1;
+- estados (pressionado, desabilitado, foco) nunca dependem só da sombra: mudam também cor, opacidade
+  ou ganham o anel de foco;
+- o modo de **alto contraste** acrescenta borda de 1 px em todo elemento elevado ou afundado.
+
+### 6.1 Tokens (valores iniciais, estimados da referência e ajustáveis)
 
 Os nomes dos tokens são em inglês, como toda a API.
 
-**Cores (tema escuro)**
+**Cores (tema claro, o padrão)**
 
 | Token | Valor | Uso |
 |---|---|---|
-| `background.base` | `#0E1424` | atrás de tudo (quando não há papel de parede) |
-| `surface.glass` | `#1C2433` com 72% de opacidade + blur 24 px | janelas, painéis, dock |
-| `surface.raised` | `#26303F` com 85% | menus, dropdowns, tooltips |
-| `surface.field` | `#2A3B40` | inputs, botões secundários (tom petróleo da ref. 2) |
-| `border.subtle` | `#FFFFFF` com 10% | contorno de janelas e cards |
-| `accent` | `#F28B82` (coral) | botão primário, item ativo, sliders, toggle ligado |
-| `accent.strong` | `#FF6F7D` (rosa) | hover/pressionado, botão play, badge "novo" |
-| `accent.glow` | `#F28B82` com 45%, blur 16 px | brilho no hover/foco |
-| `text.primary` | `#F2F4F8` | títulos e texto principal |
-| `text.secondary` | `#A9B3C4` | legendas, metadados |
-| `text.disabled` | `#6B7586` | estados desabilitados |
-| `success` / `warning` / `error` / `info` | `#5BD69A` / `#F5C451` / `#F0606A` / `#5AA9F7` | badges, toasts, gráficos |
-| `chart.cpu` / `chart.memory` / `chart.disk` | `#F27A8A` / `#4FC3D9` / `#F2A65A` | séries do monitor do sistema |
+| `background.base` | `#EEE6DA` (bege porcelana) | fundo da área de trabalho e das janelas |
+| `surface.base` | `#EEE6DA` | superfícies em relevo (a mesma cor do fundo: só a luz as separa) |
+| `surface.inset` | `#E8DFD2` | campos de texto, trilhos de slider, poços |
+| `relief.light` | `#FFFBF5` com 90% | realce do lado da luz |
+| `relief.dark` | `#C9BBA6` com 70% | sombra do lado oposto |
+| `border.subtle` | `#000000` com 8% | bordas finas (e do alto contraste) |
+| `accent` | `#1E5D59` (verde-petróleo) | botão primário, item ativo, switch ligado, passo atual |
+| `accent.strong` | `#164744` | hover/pressionado do destaque |
+| `accent.on` | `#FFFFFF` | texto sobre o destaque |
+| `focus` | `#2E8C86` com 50% | anel de foco (glow) |
+| `text.primary` | `#2D2A26` | títulos e texto principal |
+| `text.secondary` | `#6F665C` | legendas, metadados |
+| `text.disabled` | `#A79E92` | estados desabilitados |
+| `success` / `warning` / `error` / `info` | `#2E7D5B` / `#B7832F` / `#B3423A` / `#2E6F9E` | badges, toasts, alertas, gráficos |
+| `chart.cpu` / `chart.memory` / `chart.disk` | `#1E5D59` / `#C9A26B` / `#8C6E9E` | séries do monitor do sistema |
+
+O **tema escuro** segue a mesma regra de relevo com uma superfície escura e realces discretos; os
+valores ficam para a E9 (questão aberta no `opaline-relief.md`).
+
+**Elevação** (`elevation`, deslocamento/desfoque das duas sombras em px; o realce vai para o lado da
+luz e a sombra para o outro)
+
+| Nível | Nome | Sombras | Uso |
+|---|---|---|---|
+| −2 | `pressed` | internas 4/8 | botão pressionado, switch ligado |
+| −1 | `inset` | internas 3/6 | campos, trilhos, poços |
+| 0 | `base` | nenhuma | fundo, separadores |
+| 1 | `flat` | 2/4 | itens de lista, cabeçalho de tabela |
+| 2 | `hover` | 4/10 | o que está sob o ponteiro |
+| 3 | `raised` | 6/16 | cards, botões, dock |
+| 4 | `modal` | 10/28 | janelas, diálogos |
+| 5 | `popover` | 14/36 | menus, tooltips, dropdowns, toasts |
 
 **Forma e espaço**
 
 | Token | Valor |
 |---|---|
-| Raio (`radius.*`) | `small 6` · `medium 10` · `large 14` · `window 16` · `pill 999` (px) |
+| Raio (`radius.*`) | `xs 4` · `sm 8` · `md 12` · `lg 16` · `xl 24` · `window 16` · `pill 999` (px) |
 | Espaçamento (grade de 4 px) | 4 · 8 · 12 · 16 · 24 · 32 · 48 |
-| Borda | 1 px (padrão) · 2 px (foco) |
-| Sombra | `s1` 0/2/6 · `s2` 0/8/24 · `s3` 0/16/48 (preto 35–50%) |
+| Borda | 1 px (fina) · 2 px (normal, foco) · 4 px (grossa) |
+| Ícones | 16 · 20 · 24 px, traço de 2 px, cantos arredondados |
 | Tipografia (`font.*`) | Inter. `h1` 28/600 · `h2` 20/600 · `body` 14/400 · `caption` 12/400 |
 | Movimento (`motion.*`) | `fast` 120 ms (hover) · `open` 200 ms · `close` 160 ms · `window` 320 ms (minimizar/maximizar). Easing `cubic-bezier(.2,.8,.2,1)` |
 
@@ -300,16 +339,18 @@ Os nomes dos tokens são em inglês, como toda a API.
 
 1. Janela (barra de título com minimizar, maximizar e fechar), botão (primário, secundário,
    desabilitado, carregando), input (texto, senha, busca), rótulo, ícone
-2. Toggle, abas, chips, dropdown, slider, barra de progresso/stepper, tooltip, badge
-3. Lista, grade de ícones, tabela, card, breadcrumbs, paginação, estado vazio, toast/notificação
+2. Toggle, checkbox, radio, abas, chips, dropdown, slider, barra de progresso, passos (stepper),
+   tooltip, badge, spinner
+3. Lista, grade de ícones, tabela, card, avatar, breadcrumbs, paginação, estado vazio,
+   toast/notificação, banner de alerta, diálogo de confirmação, linhas de carregamento (skeleton)
 4. Date picker, gráficos (linha, anel), menu de contexto
 
 ### 6.3 Shell (área de trabalho)
 
 Barra superior (menus Applications, Places e System — "Aplicativos", "Locais" e "Sistema" em pt-BR — mais indicadores de rede, som, bateria e
 relógio), dock lateral, dock inferior, lançador de apps com busca e categorias, central de
-notificações com atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno e brilho) e papel de
-parede espacial próprio.
+notificações com atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno e brilho). O fundo é a
+cor base ou um papel de parede próprio, suave e de pouco contraste, para o relevo continuar legível.
 
 ---
 
@@ -334,8 +375,8 @@ parede espacial próprio.
 - Baseado no **`gettext`**, o padrão de tradução do mundo open source. O próprio Python já tem o
   módulo `gettext`, então ferramentas e editores de tradução (Poedit, Weblate) funcionam.
 - Catálogos: `locale/pt_BR.po` (fonte, editável) → `.mo` (compilado no build).
-- API para apps: `from opaline.i18n import _` (detalhes em `opaline-vitrum.md`, seção "Internationalization"):
-  - `_("Save")` devolve um **texto traduzível "vivo"**: os componentes do `opaline.vitrum` guardam a
+- API para apps: `from opaline.i18n import _` (detalhes em `opaline-relief.md`, seção "Internationalization"):
+  - `_("Save")` devolve um **texto traduzível "vivo"**: os componentes do `opaline.relief` guardam a
     referência e se redesenham sozinhos quando o idioma muda;
   - plurais (`_n("{n} file", "{n} files", n)`) e parâmetros (`_("Hello, {name}!", name=...)`);
   - formatação regional de datas, horas, números e tamanhos: en-US `Mon, Oct 27 · 9:42 PM` ·
@@ -391,8 +432,8 @@ parede espacial próprio.
 | **SE3** | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente |
 | **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
-| **E8** | Compositor + renderizador (alfa, blur, sombras, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela de vidro arrastável a 60 fps; digitar "ação, über, ñ" funciona |
-| **E9** | **`opaline.vitrum`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra, dock, lançador) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
+| **E8** | Compositor + renderizador (alfa, relevo com sombras em cache, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela em relevo arrastável a 60 fps; digitar "ação, über, ñ" funciona |
+| **E9** | **`opaline.relief`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra, dock, lançador) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
 | **E10** | Apps em Python: Terminal, Files, Editor, System Monitor, Settings (com a página **Language & Region**) | uso diário básico, nos dois idiomas |
 | **E11** | Rede: driver (e1000/virtio-net, portado do v2), TCP/IP com sockets BSD + OpenSSL | `pip install requests` e um GET `https://` funcionando |
 | **E12** | Sistema de ports (numpy, pillow...), teste de binários musllinux, apps com mypyc; HarfBuzz + bidi (escritas complexas e da direita para a esquerda), emoji | `import numpy` funciona; benchmark mypyc × CPython registrado; árabe, hebraico, hindi e CJK aparecem corretamente |
@@ -407,7 +448,7 @@ parede espacial próprio.
 ```
 OpalineOS/
 ├── project.md            # este documento
-├── opaline-vitrum.md     # documentação do toolkit
+├── opaline-relief.md     # documentação do toolkit
 ├── docs/references/      # imagens de referência visual
 ├── boot/                 # bootloader UEFI
 ├── kernel/               # kernel (C + ASM)
@@ -415,8 +456,8 @@ OpalineOS/
 │   ├── mm/  sched/  fs/  net/  posix/  drivers/
 ├── system/
 │   ├── compositor/       # compositor (C)
-│   ├── vitrum/           # _vitrum (C) + vitrum (Python)
-│   ├── opaline/          # pacote Python `opaline` (system/, i18n/; vitrum/ é instalado aqui)
+│   ├── relief/           # _relief (C) + relief (Python)
+│   ├── opaline/          # pacote Python `opaline` (system/, i18n/; relief/ é instalado aqui)
 │   └── shell/            # área de trabalho (Python)
 ├── apps/                 # apps em Python (pasta + app.toml + locale/)
 ├── locale/               # catálogos de tradução do sistema (en-US = textos do código, pt_BR.po)
@@ -867,6 +908,7 @@ OpalineOS/
 | 2026-11-20 | **E6 concluída**: musl 1.2.6 sem modificações (build próprio em Python, SHA-256 conferido, patch da CVE-2026-107891), `libc.so` como `/lib/ld-musl-x86_64.so.1`, runtime do compilador próprio em `ports/rt` (LGPL). Kernel: memória por áreas com paginação sob demanda, `mmap`/`mprotect`/`brk`, `fork`/`vfork`/`clone`/`execve` com ELF dinâmico e vetor auxiliar, threads com TLS e futex, sinais no formato do Linux, esperas interrompíveis. STAR com RPL 3 (correção para CPUs AMD). Simplificações registradas: `MAP_SHARED` privado, `fork` sem copy-on-write, `execve` só em processo de uma thread |
 | 2026-11-21 | Antes da E7, quatro **sub-etapas** (SE1–SE4) para o que ficou simplificado ou pendente até a E6. Usuários: permissões reais no kernel já na SE1, mas o sistema continua iniciando como root (login e `sudo` na E15). Controle de tarefas com Ctrl+C/Ctrl+Z junto na SE1 |
 | 2026-11-21 | **SE1 concluída**: refcount de páginas, copy-on-write, `MAP_SHARED` real com cache de páginas coerente com `read`/`write`, futex compartilhado, `mremap` completo, `execve` com threads, RTC e tempos de arquivo, uid/gid/modo no EFS3 e permissões POSIX no VFS, setuid/setgid, grupos e sessões, parar/continuar, `SIGCHLD`, Ctrl+C/Ctrl+Z/Ctrl+\\, syscalls que recomeçam, `poll`/`ppoll`. `reboot` só root |
+| 2026-11-21 | Visual passa de **vidro (glassmorphism) para relevo suave (neumorfismo)**: superfícies opacas, luz e sombra em cache, bege porcelana com destaque verde-petróleo (referência `docs/references/neumorfismo.webp`). Motivo: sem GPU, o desfoque do que está atrás das janelas é o efeito mais caro do compositor. Vidro fosco continua como efeito opcional. Toolkit renomeado: **`opaline-relief`** (`from opaline import relief as rl`; `opaline-relief` livre no PyPI e no GitHub, pesquisa de 2026-11-21). Design system "Relief". O nome do sistema continua **OpalineOS** (opalina é vidro leitoso e opaco, que combina com o relevo) |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema
@@ -929,6 +971,13 @@ direto) e só cobrem EUA/Canadá; o INPI (Brasil) não foi consultado.
 
 > Observação: o nome **`vitrum` está ocupado no PyPI** (pacote científico de simulação de vidro).
 > **Resolvido:** o toolkit é distribuído como `opaline-vitrum` e importado como `opaline.vitrum`.
+>
+> **Atualização de 2026-11-21:** com a troca do vidro pelo relevo, o toolkit passou a se chamar
+> **`opaline-relief`** (importado como `opaline.relief`). Pesquisa: `opaline-relief` não existe no
+> PyPI (a API JSON responde 404) nem no GitHub (nenhum repositório, conta `opaline-relief` livre), e a
+> busca na web não achou projeto ou produto com esse nome. O nome curto `relief` está ocupado no PyPI
+> (biblioteca de validação de dados de 2013, sem relação) — a mesma situação do `vitrum`, resolvida do
+> mesmo jeito.
 > Atenção: o nome `opaline` também está reservado no PyPI por terceiros. Por isso o sistema guarda o
 > pacote `opaline` num diretório protegido do sistema, que vem antes do `site-packages`, e o `pip`
 > do OpalineOS recusa instalar pacotes que sobrescrevam `opaline`.

@@ -1,7 +1,7 @@
 # OpalineOS
 
 A light, fast and modern operating system with its own kernel, where **Python is at the center**:
-the desktop and the apps are written in Python (official CPython) using `opaline-vitrum`, the
+the desktop and the apps are written in Python (official CPython) using `opaline-relief`, the
 system's GUI toolkit.
 
 > **Status:** stage **E6** — 64-bit kernel with memory management, a preemptive scheduler,
@@ -14,7 +14,7 @@ system's GUI toolkit.
 
 ![Shell](docs/screenshots/e5-shell.png)
 > The full plan is in [`project.md`](project.md) (in Portuguese) and the toolkit API in
-> [`opaline-vitrum.md`](opaline-vitrum.md).
+> [`opaline-relief.md`](opaline-relief.md).
 
 ## Requirements (Windows)
 
@@ -41,5 +41,5 @@ The test prints `TEST_OK` / `TEST_FAILED` per emulator and exits with a non-zero
 ## License
 
 **GPL-3.0-or-later** for the system and **LGPL-3.0-or-later** for the libraries that apps import
-(`opaline.vitrum`, `opaline.system`, `opaline.i18n`), so apps for OpalineOS can use any license.
+(`opaline.relief`, `opaline.system`, `opaline.i18n`), so apps for OpalineOS can use any license.
 See [`LICENSING.md`](LICENSING.md), [`COPYING`](COPYING) and [`COPYING.LESSER`](COPYING.LESSER).
