@@ -38,7 +38,7 @@
 #include <opaline/string.h>
 #include <opaline/vfs.h>
 
-#define OPALINE_VERSION "0.6.2-se2"
+#define OPALINE_VERSION "0.6.3-se3"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",

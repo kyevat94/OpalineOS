@@ -441,7 +441,11 @@ i64 vnode_write_at(struct vnode *v, u64 offset, const void *buf, u64 len) {
 i64 file_read(struct file *f, void *buf, u64 len) {
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (!f->vn->ops->read) return -EINVAL;
+    struct thread *t = thread_current();
+    bool nb = t->io_nonblock;
+    t->io_nonblock = f->flags & O_NONBLOCK;   /* pipes and the terminal look at it instead of waiting */
     i64 r = vnode_read_at(f->vn, f->offset, buf, len);
+    t->io_nonblock = nb;
     if (r > 0 && f->vn->type == VN_FILE) f->offset += (u64)r;
     return r;
 }
@@ -453,7 +457,11 @@ i64 file_write(struct file *f, const void *buf, u64 len) {
         struct vnode_stat st;
         if (f->vn->ops->stat(f->vn, &st) == 0) f->offset = st.size;
     }
+    struct thread *t = thread_current();
+    bool nb = t->io_nonblock;
+    t->io_nonblock = f->flags & O_NONBLOCK;
     i64 r = vnode_write_at(f->vn, f->offset, buf, len);
+    t->io_nonblock = nb;
     if (r > 0 && f->vn->type == VN_FILE) f->offset += (u64)r;
     return r;
 }

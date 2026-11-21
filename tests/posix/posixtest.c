@@ -11,8 +11,10 @@
  * since stage SE1, copy-on-write fork, shared memory (anonymous and file),
  * mremap, execve from a process with threads, the real clock and file times,
  * users and permissions (as an ordinary user, set-user-id programs) and job
- * control (stop/continue, process groups, restarted system calls); and, since
- * stage SE2, symbolic and hard links.
+ * control (stop/continue, process groups, restarted system calls); since
+ * stage SE2, symbolic and hard links; and, since stage SE3, the terminal
+ * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK.
+ * "posixtest rawkeys" and "posixtest env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
 #define _GNU_SOURCE
@@ -30,7 +32,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/auxv.h>
+#include <sys/ioctl.h>
 #include <sys/random.h>
+#include <sys/select.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -40,6 +44,7 @@
 #include <grp.h>
 #define FUTEX_WAIT 0   /* linux/futex.h; musl has no kernel headers */
 #define FUTEX_WAKE 1
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -827,8 +832,179 @@ static void test_links(void) {
     CHECK(rmdir("/tmp/lk/real") == 0 && rmdir("/tmp/lk") == 0, "everything cleaned up");
 }
 
+/* ---- terminal, select, O_NONBLOCK (SE3) --------------------------------------------------- */
+
+static long ms_since(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+static void test_terminal(void) {
+    printf("terminal (termios):\n");
+    struct termios orig, t;
+    CHECK(isatty(0) && tcgetattr(0, &orig) == 0, "tcgetattr on the terminal");
+    CHECK((orig.c_lflag & (ICANON | ECHO | ISIG)) == (ICANON | ECHO | ISIG) && (orig.c_iflag & ICRNL) &&
+              orig.c_cc[VMIN] == 1 && orig.c_cc[VINTR] == 3 && orig.c_cc[VERASE] == 0x7F,
+          "it starts canonical, with echo, signal keys and CR -> NL");
+    t = orig;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 0;
+    struct termios back;
+    CHECK(tcsetattr(0, TCSANOW, &t) == 0 && tcgetattr(0, &back) == 0 && !(back.c_lflag & ICANON) &&
+              back.c_cc[VMIN] == 0,
+          "tcsetattr: raw mode, read back the same");
+    char c;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(read(0, &c, 1) == 0 && ms_since(&t0) < 100, "raw, VMIN=0 VTIME=0: read returns 0 at once");
+    t.c_cc[VTIME] = 3;   /* tenths of a second */
+    tcsetattr(0, TCSANOW, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long r = read(0, &c, 1);
+    long took = ms_since(&t0);
+    CHECK(r == 0 && took >= 250 && took < 2000, "raw, VMIN=0 VTIME=3: read gives up after 0.3 s");
+    int n = -1;
+    CHECK(ioctl(0, FIONREAD, &n) == 0 && n == 0, "FIONREAD: nothing waiting");
+    CHECK(tcsetattr(0, TCSAFLUSH, &orig) == 0 && tcgetattr(0, &back) == 0 && (back.c_lflag & ICANON) &&
+              (back.c_lflag & ECHO),
+          "back to canonical mode");
+    int fl = fcntl(0, F_GETFL);
+    fcntl(0, F_SETFL, fl | O_NONBLOCK);
+    errno = 0;
+    CHECK(read(0, &c, 1) == -1 && errno == EAGAIN, "O_NONBLOCK terminal: read gives EAGAIN, no wait");
+    fcntl(0, F_SETFL, fl);
+    struct winsize ws;
+    CHECK(ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0, "TIOCGWINSZ: the size in cells");
+    errno = 0;
+    CHECK(ioctl(0, TCGETS, (void *)8) == -1 && errno == EFAULT, "TCGETS to a bad pointer: EFAULT");
+}
+
+static volatile sig_atomic_t usr1_seen;
+static void on_usr1_seen(int s) {
+    (void)s;
+    usr1_seen = 1;
+}
+
+static void test_select(void) {
+    printf("select, pselect, O_NONBLOCK:\n");
+    int p[2];
+    pipe(p);
+    fd_set rd, wr;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    CHECK(select(p[0] + 1, &rd, NULL, NULL, &tv) == 0 && !FD_ISSET(p[0], &rd), "select: empty pipe not readable");
+    write(p[1], "x", 1);
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    FD_ZERO(&wr);
+    FD_SET(p[1], &wr);
+    int maxfd = p[0] > p[1] ? p[0] : p[1];
+    CHECK(select(maxfd + 1, &rd, &wr, NULL, NULL) == 2 && FD_ISSET(p[0], &rd) && FD_ISSET(p[1], &wr),
+          "select: readable and writable (2 bits set)");
+    char c;
+    read(p[0], &c, 1);
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    tv.tv_sec = 0;
+    tv.tv_usec = 150000;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* the system call itself: musl passes the kernel a copy of the timeval */
+    int r = (int)syscall(SYS_select, p[0] + 1, &rd, NULL, NULL, &tv);
+    long took = ms_since(&t0);
+    CHECK(r == 0 && took >= 140 && took < 2000 && tv.tv_sec == 0 && tv.tv_usec == 0,
+          "select: 0.15 s timeout, and the time left goes back (0)");
+    FD_ZERO(&rd);
+    FD_SET(40, &rd);
+    errno = 0;
+    CHECK(select(41, &rd, NULL, NULL, &tv) == -1 && errno == EBADF, "select on a closed fd: EBADF");
+
+    /* pselect: SIGUSR1 is blocked; the mask given only while waiting lets it in */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_usr1_seen;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigset_t block, old, during, now;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &block, &old);
+    raise(SIGUSR1);
+    CHECK(!usr1_seen, "SIGUSR1 blocked and pending");
+    sigemptyset(&during);
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    errno = 0;
+    struct timespec limit = {1, 0};
+    r = pselect(p[0] + 1, &rd, NULL, NULL, &limit, &during);
+    sigprocmask(SIG_BLOCK, NULL, &now);
+    CHECK(r == -1 && errno == EINTR && usr1_seen && sigismember(&now, SIGUSR1),
+          "pselect: its mask lets the signal in (EINTR), the old mask comes back");
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    struct timespec ts = {0, 50000000};
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    CHECK(pselect(p[0] + 1, &rd, NULL, NULL, &ts, NULL) == 0, "pselect: 0.05 s timeout");
+    close(p[1]);
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    CHECK(select(p[0] + 1, &rd, NULL, NULL, NULL) == 1 && FD_ISSET(p[0], &rd) && read(p[0], &c, 1) == 0,
+          "select: a pipe with no writers is readable (end of file)");
+    close(p[0]);
+
+    pipe(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    errno = 0;
+    CHECK(read(p[0], &c, 1) == -1 && errno == EAGAIN, "O_NONBLOCK pipe: empty read gives EAGAIN");
+    static char big[8192];
+    CHECK(write(p[1], big, 4096) == 4096, "O_NONBLOCK pipe: 4 KiB fills it");
+    errno = 0;
+    CHECK(write(p[1], big, 1) == -1 && errno == EAGAIN, "full pipe: write gives EAGAIN");
+    while (read(p[0], big, sizeof big) > 0) {}
+    write(p[1], big, 100);
+    CHECK(write(p[1], big, sizeof big) == 4096 - 100, "a big write takes only what fits");
+    close(p[0]);
+    close(p[1]);
+}
+
+/* "posixtest rawkeys": raw mode, one line per key until q (x: exit without restoring the terminal). */
+static int raw_keys(void) {
+    struct termios orig, t;
+    if (tcgetattr(0, &orig) < 0) return 2;
+    t = orig;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &t);
+    printf("rawkeys: press keys, q quits\n");
+    char c;
+    while (read(0, &c, 1) == 1) {
+        printf("key %d\n", (unsigned char)c);
+        if (c == 'x') {
+            printf("rawkeys: leaving raw\n");
+            return 3;
+        }
+        if (c == 'q') break;
+    }
+    tcsetattr(0, TCSANOW, &orig);
+    printf("rawkeys done\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
+    if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        return raw_keys();
+    }
+    if (argc >= 3 && !strcmp(argv[1], "env")) {   /* for the shell test: the environment it passed */
+        const char *v = getenv(argv[2]);
+        if (v) printf("env %s=%s\n", argv[2], v);
+        else printf("env %s unset\n", argv[2]);
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "exec-child")) {
         const char *t = getenv("OPALINE_TEST");
         return argc == 3 && !strcmp(argv[2], "arg with spaces") && t && !strcmp(t, "yes") && !getenv("PATH") ? 7 : 1;
@@ -854,6 +1030,8 @@ int main(int argc, char **argv) {
     test_permissions();
     test_jobs();
     test_links();
+    test_terminal();
+    test_select();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

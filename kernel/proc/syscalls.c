@@ -49,6 +49,7 @@ enum {
     SYS_setregid = 114, SYS_setgroups = 116, SYS_setresuid = 117, SYS_getresuid = 118, SYS_setresgid = 119,
     SYS_getresgid = 120, SYS_setfsuid = 122, SYS_setfsgid = 123, SYS_settimeofday = 164, SYS_clock_settime = 227,
     SYS_fchownat = 260, SYS_utimensat = 280, SYS_sysinfo = 99, SYS_poll = 7, SYS_ppoll = 271,
+    SYS_select = 23, SYS_pselect6 = 270,
     SYS_link = 86, SYS_symlink = 88, SYS_linkat = 265, SYS_symlinkat = 266,
     SYS_opaline_spawn = 1000,   /* spawn(path, argv): starts a program, returns its pid */
 };
@@ -314,6 +315,9 @@ static i64 sys_ioctl(u64 fd, u64 request, u64 arg) {
     if (!f) return -EBADF;
     if (!f->vn->ops->ioctl) return -ENOTTY;
     if (request == TIOCGWINSZ && !user_ok(arg, 8, true)) return -EFAULT;
+    if (request == 0x5401 && !user_ok(arg, 36, true)) return -EFAULT;                        /* TCGETS */
+    if (request >= 0x5402 && request <= 0x5404 && !user_ok(arg, 36, false)) return -EFAULT;  /* TCSETS* */
+    if ((request == 0x541B || request == 0x5411) && !user_ok(arg, 4, true)) return -EFAULT;  /* FIONREAD, TIOCOUTQ */
     if ((request == 0x540F || request == 0x5429) && !user_ok(arg, 4, true)) return -EFAULT;   /* TIOCGPGRP, TIOCGSID */
     if (request == 0x5410 && !user_ok(arg, 4, false)) return -EFAULT;                        /* TIOCSPGRP */
     return f->vn->ops->ioctl(f->vn, request, arg);
@@ -514,11 +518,9 @@ struct pollfd_k {
     i16 events, revents;
 };
 
-/* Waits until one of the files is ready, the time (ms; ~0 = for ever) passes or a signal comes. */
-static i64 do_poll(u64 fds_addr, u64 nfds, u64 timeout_ms) {
-    if (nfds > PROCESS_MAX_FDS * 4) return -EINVAL;
-    if (nfds && !user_ok(fds_addr, nfds * sizeof(struct pollfd_k), true)) return -EFAULT;
-    struct pollfd_k *fds = (struct pollfd_k *)fds_addr;
+/* Waits until one of the files is ready, the time (ms; ~0 = for ever) passes or a signal comes.
+ * fds is user memory already checked (poll) or a kernel array (select). */
+static i64 poll_wait(struct pollfd_k *fds, u64 nfds, u64 timeout_ms) {
     u64 deadline = timeout_ms == ~0ULL ? 0 : time_ms() + timeout_ms;
     for (;;) {
         u64 gen = vfs_poll_generation();
@@ -543,28 +545,141 @@ static i64 do_poll(u64 fds_addr, u64 nfds, u64 timeout_ms) {
     }
 }
 
-static i64 sys_ppoll(u64 fds, u64 nfds, u64 tsp, u64 sigmask, u64 size) {
-    u64 ms = ~0ULL;
-    if (tsp) {
-        if (!user_ok(tsp, sizeof(struct timespec), false)) return -EFAULT;
-        struct timespec t = *(const struct timespec *)tsp;
-        if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000) return -EINVAL;
-        ms = (u64)t.tv_sec * 1000 + ((u64)t.tv_nsec + 999999) / 1000000;
-    }
+static i64 do_poll(u64 fds_addr, u64 nfds, u64 timeout_ms) {
+    if (nfds > PROCESS_MAX_FDS * 4) return -EINVAL;
+    if (nfds && !user_ok(fds_addr, nfds * sizeof(struct pollfd_k), true)) return -EFAULT;
+    return poll_wait((struct pollfd_k *)fds_addr, nfds, timeout_ms);
+}
+
+/* A timespec timeout in ms, rounded up (~0 = none). */
+static i64 timespec_ms(u64 tsp, u64 *ms) {
+    *ms = ~0ULL;
+    if (!tsp) return 0;
+    if (!user_ok(tsp, sizeof(struct timespec), false)) return -EFAULT;
+    struct timespec t = *(const struct timespec *)tsp;
+    if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000) return -EINVAL;
+    *ms = (u64)t.tv_sec * 1000 + ((u64)t.tv_nsec + 999999) / 1000000;
+    return 0;
+}
+
+/* ppoll/pselect6: the signal mask given applies only while waiting. */
+static i64 mask_begin(u64 sigmask, u64 size, u64 *old) {
     struct thread *t = thread_current();
-    u64 old = t->sigmask;
-    if (sigmask) {   /* the mask applies only while waiting */
-        if (size != 8 || !user_ok(sigmask, 8, false)) return -EINVAL;
-        t->sigmask = *(const u64 *)sigmask & ~((1ULL << 8) | (1ULL << 18));   /* never SIGKILL/SIGSTOP */
+    *old = t->sigmask;
+    if (!sigmask) return 0;
+    if (size != 8 || !user_ok(sigmask, 8, false)) return -EINVAL;
+    t->sigmask = *(const u64 *)sigmask & ~((1ULL << 8) | (1ULL << 18));   /* never SIGKILL/SIGSTOP */
+    /* a signal already pending that the new mask lets in must end the wait at once */
+    if ((t->sigpending | t->process->sigpending) & ~t->sigmask) t->intr = true;
+    return 0;
+}
+
+static void mask_end(u64 sigmask, u64 old, i64 r) {
+    if (!sigmask) return;
+    struct thread *t = thread_current();
+    if (r == -EINTR) {   /* a handler must run with the temporary mask: restore at sigreturn */
+        t->saved_sigmask = old;
+        t->restore_sigmask = true;
+    } else {
+        t->sigmask = old;
     }
-    i64 r = do_poll(fds, nfds, ms);
-    if (sigmask) {
-        if (r == -EINTR) {   /* a handler must run with the temporary mask: restore at sigreturn */
-            t->saved_sigmask = old;
-            t->restore_sigmask = true;
-        } else {
-            t->sigmask = old;
-        }
+}
+
+static i64 sys_ppoll(u64 fds, u64 nfds, u64 tsp, u64 sigmask, u64 size) {
+    u64 ms, old;
+    i64 r = timespec_ms(tsp, &ms);
+    if (r < 0 || (r = mask_begin(sigmask, size, &old)) < 0) return r;
+    r = do_poll(fds, nfds, ms);
+    mask_end(sigmask, old, r);
+    return r;
+}
+
+/* select: the three fd_sets become pollfds, and the answer goes back into them. */
+static i64 do_select(u64 nfds, u64 rd, u64 wr, u64 ex, u64 timeout_ms) {
+    if ((i64)nfds < 0) return -EINVAL;
+    if (nfds > PROCESS_MAX_FDS) nfds = PROCESS_MAX_FDS;   /* no fd can be higher (Linux trims too) */
+    u64 bytes = (nfds + 63) / 64 * 8;
+    u64 *set[3] = {(u64 *)rd, (u64 *)wr, (u64 *)ex};
+    for (int k = 0; k < 3; k++)
+        if (set[k] && bytes && !user_ok((u64)set[k], bytes, true)) return -EFAULT;
+    static const u16 want[3] = {POLLIN, POLLOUT, POLLPRI};
+    struct pollfd_k fds[PROCESS_MAX_FDS];
+    u64 n = 0;
+    for (u64 fd = 0; fd < nfds; fd++) {
+        u16 ev = 0;
+        for (int k = 0; k < 3; k++)
+            if (set[k] && (set[k][fd / 64] >> (fd % 64) & 1)) ev |= want[k];
+        if (!ev) continue;
+        fds[n].fd = (i32)fd;
+        fds[n].events = (i16)ev;
+        fds[n++].revents = 0;
+    }
+    i64 r = poll_wait(fds, n, timeout_ms);
+    if (r < 0) return r;
+    for (u64 i = 0; i < n; i++)
+        if (fds[i].revents & POLLNVAL) return -EBADF;
+    for (int k = 0; k < 3; k++)
+        if (set[k]) memset(set[k], 0, bytes);
+    i64 count = 0;
+    for (u64 i = 0; i < n; i++) {
+        u16 ev = (u16)fds[i].revents, asked = (u16)fds[i].events;
+        bool hit[3] = {(asked & POLLIN) && (ev & (POLLIN | POLLHUP | POLLERR)),
+                       (asked & POLLOUT) && (ev & (POLLOUT | POLLERR)),
+                       (asked & POLLPRI) && (ev & POLLPRI)};
+        for (int k = 0; k < 3; k++)
+            if (hit[k]) {
+                set[k][fds[i].fd / 64] |= 1ULL << (fds[i].fd % 64);
+                count++;
+            }
+    }
+    return count;
+}
+
+/* The time left goes back into the timeout, as Linux does. */
+static void time_left(u64 start, u64 ms, u64 *sec, u64 *frac, u64 frac_per_ms) {
+    u64 used = time_ms() - start, left = used >= ms ? 0 : ms - used;
+    *sec = left / 1000;
+    *frac = left % 1000 * frac_per_ms;
+}
+
+struct timeval_k {
+    i64 tv_sec, tv_usec;
+};
+
+static i64 sys_select(u64 nfds, u64 rd, u64 wr, u64 ex, u64 tvp) {
+    u64 ms = ~0ULL;
+    if (tvp) {
+        if (!user_ok(tvp, sizeof(struct timeval_k), true)) return -EFAULT;
+        struct timeval_k tv = *(const struct timeval_k *)tvp;
+        if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000) return -EINVAL;
+        ms = (u64)tv.tv_sec * 1000 + ((u64)tv.tv_usec + 999) / 1000;
+    }
+    u64 start = time_ms();
+    i64 r = do_select(nfds, rd, wr, ex, ms);
+    if (tvp) {
+        struct timeval_k *tv = (struct timeval_k *)tvp;
+        time_left(start, ms, (u64 *)&tv->tv_sec, (u64 *)&tv->tv_usec, 1000);
+    }
+    return r;
+}
+
+/* pselect6: the sixth argument points to {const sigset_t *mask; size_t size}. */
+static i64 sys_pselect6(u64 nfds, u64 rd, u64 wr, u64 ex, u64 tsp, u64 sig) {
+    u64 ms, old, mask = 0, size = 0;
+    i64 r = timespec_ms(tsp, &ms);
+    if (r < 0) return r;
+    if (sig) {
+        if (!user_ok(sig, 16, false)) return -EFAULT;
+        mask = ((const u64 *)sig)[0];
+        size = ((const u64 *)sig)[1];
+    }
+    if ((r = mask_begin(mask, size, &old)) < 0) return r;
+    u64 start = time_ms();
+    r = do_select(nfds, rd, wr, ex, ms);
+    mask_end(mask, old, r);
+    if (tsp && user_ok(tsp, sizeof(struct timespec), true)) {
+        struct timespec *ts = (struct timespec *)tsp;
+        time_left(start, ms, (u64 *)&ts->tv_sec, (u64 *)&ts->tv_nsec, 1000000);
     }
     return r;
 }
@@ -1054,6 +1169,8 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_sysinfo:       r = sys_sysinfo(a); break;
     case SYS_poll:          r = do_poll(a, b, (i64)c < 0 ? ~0ULL : c); break;
     case SYS_ppoll:         r = sys_ppoll(a, b, c, d, e); break;
+    case SYS_select:        r = sys_select(a, b, c, d, e); break;
+    case SYS_pselect6:      r = sys_pselect6(a, b, c, d, e, g); break;
     case SYS_getrandom:     r = sys_getrandom(a, b); break;
     case SYS_reboot:        r = sys_reboot(a, b, c); break;
     /* signals */

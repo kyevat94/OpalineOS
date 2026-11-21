@@ -9,6 +9,8 @@ Outputs (in build/):
     BOOTX64.EFI     the UEFI bootloader
     user/*.elf      user programs (the minimal user/lib library)
     sysroot/        musl, the C library (tools/ports/musl.py; downloaded once)
+    programs/*      system programs on musl: programs/<name>/*.c becomes <name> (static; the
+                    shell is programs/sh)
     posix/*         C programs built against musl: tests/posix/<name>.c becomes <name> (dynamic,
                     through /lib/ld-musl-x86_64.so.1) and <name>-static
     root/           the tree copied into the EFS3 root partition: rootfs/ plus the programs
@@ -37,6 +39,8 @@ USER_BUILD = os.path.join(BUILD, "user")
 ROOT_TREE = os.path.join(BUILD, "root")
 ROOTFS_SRC = os.path.join(ROOT, "rootfs")
 SYSTEM_PROGRAMS = {"sh": "system/bin/sh"}   # everything else goes to /apps/<name>
+PROGRAMS_SRC = os.path.join(ROOT, "programs")
+PROGRAMS_BUILD = os.path.join(BUILD, "programs")
 POSIX_SRC = os.path.join(ROOT, "tests", "posix")
 POSIX_BUILD = os.path.join(BUILD, "posix")
 SYSROOT = os.path.join(BUILD, "sysroot")
@@ -159,12 +163,22 @@ POSIX_CFLAGS = [
 ] + WARNINGS
 
 
-def build_posix():
-    """Builds tests/posix/<name>.c against musl: build/posix/<name> (dynamic) and <name>-static."""
-    clang = tool("clang", LLVM_DIRS)
+def link_musl(objs, out, static):
+    """Links objects with musl: statically, or dynamically through /lib/ld-musl-x86_64.so.1."""
     ld = tool("ld.lld", LLVM_DIRS)
     lib = os.path.join(SYSROOT, "lib")
     crt = [os.path.join(lib, n) for n in ("crt1.o", "crti.o")]
+    common = [ld, "-nostdlib", "-no-pie", "-z", "max-page-size=4096", "-z", "noexecstack", "--gc-sections"]
+    if static:
+        run(common + ["-static", "-o", out] + crt + objs +
+            [os.path.join(lib, "libc.a"), os.path.join(lib, "libopaline_rt.a"), os.path.join(lib, "crtn.o")])
+    else:
+        run(common + ["--dynamic-linker", LDSO, "-o", out] + crt + objs + ["-L", lib, "-lc", os.path.join(lib, "crtn.o")])
+
+
+def build_posix():
+    """Builds tests/posix/<name>.c against musl: build/posix/<name> (dynamic) and <name>-static."""
+    clang = tool("clang", LLVM_DIRS)
     os.makedirs(POSIX_BUILD, exist_ok=True)
     programs = []
     for src in sources(POSIX_SRC, ".c"):
@@ -172,16 +186,34 @@ def build_posix():
         obj = obj_path(src, "posix")
         os.makedirs(os.path.dirname(obj), exist_ok=True)
         run([clang] + POSIX_CFLAGS + ["-c", src, "-o", obj])
-        common = [ld, "-nostdlib", "-no-pie", "-z", "max-page-size=4096", "-z", "noexecstack", "--gc-sections"]
-        run(common + ["-static", "-o", os.path.join(POSIX_BUILD, name + "-static")] + crt +
-            [obj, os.path.join(lib, "libc.a"), os.path.join(lib, "libopaline_rt.a"), os.path.join(lib, "crtn.o")])
-        run(common + ["--dynamic-linker", LDSO, "-o", os.path.join(POSIX_BUILD, name)] + crt +
-            [obj, "-L", lib, "-lc", os.path.join(lib, "crtn.o")])
+        link_musl([obj], os.path.join(POSIX_BUILD, name + "-static"), static=True)
+        link_musl([obj], os.path.join(POSIX_BUILD, name), static=False)
         programs += [name, name + "-static"]
     return programs
 
 
-def make_root_tree(programs, posix_programs=()):
+def build_programs():
+    """Builds each programs/<name>/ against musl into build/programs/<name> (static: the shell must
+    start even if the dynamic linker is broken)."""
+    clang = tool("clang", LLVM_DIRS)
+    os.makedirs(PROGRAMS_BUILD, exist_ok=True)
+    programs = []
+    for name in sorted(os.listdir(PROGRAMS_SRC)):
+        folder = os.path.join(PROGRAMS_SRC, name)
+        if not os.path.isdir(folder):
+            continue
+        objs = []
+        for src in sources(folder, ".c"):
+            obj = obj_path(src, "programs")
+            os.makedirs(os.path.dirname(obj), exist_ok=True)
+            run([clang] + POSIX_CFLAGS + ["-c", src, "-o", obj])
+            objs.append(obj)
+        link_musl(objs, os.path.join(PROGRAMS_BUILD, name), static=True)
+        programs.append(name)
+    return programs
+
+
+def make_root_tree(programs, posix_programs=(), musl_programs=()):
     """build/root = rootfs/ + the user programs + the C library and the programs built with it."""
     if os.path.isdir(ROOT_TREE):
         shutil.rmtree(ROOT_TREE)
@@ -197,6 +229,10 @@ def make_root_tree(programs, posix_programs=()):
     shutil.copyfile(os.path.join(SYSROOT, "lib", "libc.so"), ldso)   # libc.so is also the dynamic linker
     for name in posix_programs:
         shutil.copyfile(os.path.join(POSIX_BUILD, name), os.path.join(ROOT_TREE, "apps", name))
+    for name in musl_programs:
+        dest = os.path.join(ROOT_TREE, *SYSTEM_PROGRAMS.get(name, "apps/" + name).split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(os.path.join(PROGRAMS_BUILD, name), dest)
 
 
 def build_kernel():
@@ -282,7 +318,7 @@ def main():
     musl.build()
     print("[3/5] user programs", flush=True)
     programs = build_user()
-    make_root_tree(programs, build_posix())
+    make_root_tree(programs, build_posix(), build_programs())
     print("[4/5] kernel", flush=True)
     build_kernel()
     print("[5/5] disk image", flush=True)

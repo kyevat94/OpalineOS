@@ -28,11 +28,16 @@ static i64 pipe_read(struct vnode *v, u64 off, void *out, u64 n) {
     struct pipe *p = v->priv;
     if (n == 0) return 0;
     u64 f = irq_save();
-    while (p->len == 0 && p->writers > 0)
+    while (p->len == 0 && p->writers > 0) {
+        if (thread_current()->io_nonblock) {
+            irq_restore(f);
+            return -EAGAIN;
+        }
         if (waitqueue_wait_intr(&p->wait) < 0) {   /* a signal arrived */
             irq_restore(f);
             return -EINTR;
         }
+    }
     u64 got = MIN(n, (u64)p->len);
     for (u64 i = 0; i < got; i++) ((u8 *)out)[i] = p->buf[(p->head + i) % PIPE_SIZE];
     p->head = (u32)((p->head + got) % PIPE_SIZE);
@@ -52,6 +57,15 @@ static i64 pipe_write(struct vnode *v, u64 off, const void *in, u64 n) {
     while (done < n) {
         u64 f = irq_save();
         u64 want = MIN(n - done, (u64)PIPE_SIZE);   /* small writes go in one piece */
+        if (thread_current()->io_nonblock && p->readers > 0 && PIPE_SIZE - p->len < want) {
+            /* O_NONBLOCK: a small write goes whole or not at all; a big one takes what fits */
+            u64 room = PIPE_SIZE - p->len;
+            if (n - done <= PIPE_SIZE || room == 0) {
+                irq_restore(f);
+                return done ? (i64)done : -EAGAIN;
+            }
+            want = room;
+        }
         while (p->readers > 0 && PIPE_SIZE - p->len < want)
             if (waitqueue_wait_intr(&p->wait) < 0) {
                 irq_restore(f);

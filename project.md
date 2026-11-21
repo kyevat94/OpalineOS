@@ -445,7 +445,7 @@ isso funcionando.
 | **E6** ✅ | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam. **Concluída em 2026-11-20** (QEMU e VirtualBox) |
 | **SE1** ✅ | Sub-etapa: o que a E6 simplificou — copy-on-write, `MAP_SHARED` real, `mremap`, `execve` com threads, relógio real e tempos de arquivo, usuários e permissões, controle de tarefas (Ctrl+C/Ctrl+Z) | `posixtest` (104 verificações) passa, inclusive como usuário comum. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
 | **SE2** ✅ | Sub-etapa: sistema de arquivos — journal no EFS3, links simbólicos e físicos | queda de energia simulada no meio de uma escrita não corrompe o disco (fsck limpo). **Concluída em 2026-11-21** (QEMU e VirtualBox) |
-| **SE3** | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente |
+| **SE3** ✅ | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
 | **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, relevo com sombras em cache, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela em relevo arrastável a 60 fps; digitar "ação, über, ñ" funciona |
@@ -840,7 +840,7 @@ OpalineOS/
   depois do `fg`.
 - **`poll`/`ppoll`** (adiantado da SE3, porque a musl usa `poll` ao iniciar programas setuid): pipes e
   terminal dizem quando estão prontos e avisam a cada mudança; arquivos estão sempre prontos. Espera
-  por eventos com tempo limite e máscara de sinais (`ppoll`). `select` fica para a SE3.
+  por eventos com tempo limite e máscara de sinais (`ppoll`). `select` veio na SE3 (seção 10.1.10).
 - **`sysinfo`**: memória total e livre (usada pelo teste do copy-on-write).
 - **Shell**: cada comando roda como um job em primeiro plano (`spawn` ganhou a opção
   `SPAWN_FOREGROUND`); o próprio shell ignora os sinais do teclado; Ctrl+Z mostra
@@ -936,6 +936,59 @@ OpalineOS/
   - links físicos: mesmo inode, 2 links, o arquivo continua vivo pelo outro nome;
   - `EPERM` para diretório, `EEXIST`.
 
+### 10.1.10 Como a SE3 funciona (terminal e shell)
+
+- **termios** (`kernel/dev/tty.c`): o terminal guarda um `struct termios` no formato do Linux, lido e
+  gravado com os ioctls `TCGETS` e `TCSETS`/`TCSETSW`/`TCSETSF` (o último descarta a entrada
+  pendente). O padrão é o de um terminal Linux: modo canônico, eco, teclas de sinal, `ICRNL`.
+  - A tecla Enter agora manda `\r`, como num terminal de PC; com `ICRNL` (o padrão) ela vira `\n`.
+  - **Modo canônico com eco**: o editor de linha da E5 (setas, Home/End, Delete, histórico).
+  - **Canônico sem eco** (uma senha): linha simples, só Backspace, Enter e Ctrl+D.
+  - **Modo cru** (sem `ICANON`): cada byte vai direto para o leitor, com eco se `ECHO` estiver
+    ligado. `VMIN` e `VTIME` decidem quando o `read` volta, como no Linux (inclusive `VMIN=0`,
+    `VTIME=0`: devolve o que houver, sem esperar).
+  - As teclas de sinal (Ctrl+C, Ctrl+\\, Ctrl+Z) vêm de `c_cc` e só valem com `ISIG`.
+  - Ao passar do modo canônico para o cru, a linha digitada pela metade vai para o leitor.
+  - Também: `TCFLSH`, `FIONREAD`, `TIOCOUTQ`, `TIOCSWINSZ` (aceito, mas o tamanho é fixo). Um
+    processo em segundo plano que muda o termios recebe `SIGTTOU`.
+- **`select` e `pselect6`**: montados sobre o mesmo laço do `poll`. Os três conjuntos de fds viram
+  uma lista de `pollfd` (até 64 fds, o máximo de um processo); a resposta volta para os conjuntos.
+  Um fd fechado dá `EBADF`. O tempo que sobrou volta no `timeval`/`timespec`, como no Linux. O
+  `pselect6` aplica a máscara de sinais só durante a espera.
+  - **Correção**: um sinal que já estava pendente e que a máscara temporária libera (de `ppoll` ou
+    `pselect6`) não interrompia a espera; agora interrompe na hora.
+- **`O_NONBLOCK`** de verdade: em pipes e no terminal, uma leitura sem dados e uma escrita sem espaço
+  dão `EAGAIN` em vez de esperar. Num pipe, uma escrita de até 4 KiB vai inteira ou não vai; uma
+  maior grava o que couber.
+- **Shell novo** (`programs/sh/sh.c` → `/system/bin/sh`): um programa C comum sobre a **musl**,
+  ligado estaticamente (para iniciar mesmo se o ligador dinâmico quebrar). Substitui o shell da E5,
+  que usava a mini biblioteca `user/lib`. O `build.py` compila cada pasta de `programs/` com a musl.
+  - Programas rodam com **`fork` + `execve`**: o filho ganha um grupo de processos próprio
+    (`setpgid`) e o terminal (`tcsetpgrp`), volta às ações padrão dos sinais e recebe o **ambiente**.
+  - O kernel inicia o shell com `HOME=/home`, `PATH=/apps:/system/bin` e `LANG=C.UTF-8`; o shell
+    procura os programas no `$PATH`.
+  - Variáveis: `export NOME=VALOR`, `unset`, `env`, `NOME=VALOR` sozinho, e `NOME=VALOR programa`
+    (só para aquele programa). `$NOME`, `${NOME}` e `$?` (código de saída do último comando) são
+    expandidos, menos dentro de aspas simples; `\` protege o próximo caractere.
+  - **termios salvo e restaurado**: depois de cada programa o shell devolve o terminal como estava;
+    um programa que saiu (ou foi morto) em modo cru não quebra o prompt. Um programa parado com
+    Ctrl+Z guarda o seu termios, que o `fg` devolve.
+  - Novos: `ln [-s]`, `ls -l` mostra `link -> alvo` (e `ls`, `nome@`), `sh -c LINHA`.
+  - Simplificações: sem pipes (`|`) e sem scripts por enquanto; um job parado por vez.
+- **Testes**:
+  - `posixtest`: 149 verificações (22 novas): termios padrão, modo cru e volta, `VMIN`/`VTIME`
+    (0,3 s), `FIONREAD`, `TIOCGWINSZ`, `O_NONBLOCK` no terminal e em pipes (vazio, cheio, escrita
+    parcial), `select` (pronto para ler/escrever, tempo limite e tempo restante, `EBADF`, fim de
+    arquivo), `pselect` com máscara (o sinal entra, a máscara antiga volta), `TCGETS` com ponteiro
+    ruim (`EFAULT`).
+  - Teste do **shell**: `export` e `posixtest env` (o ambiente chega ao programa), `$GREETING` e
+    `$?`, variável só para um programa, `posixtest rawkeys` (o QEMU digita `a`, `b`, `q` sem Enter e
+    cada tecla aparece na hora), um programa que sai deixando o terminal cru (o shell o restaura),
+    `ln -s` e `cat` pelo link.
+  - **Testes negativos**: sem a restauração do termios, o teste do shell falha; sem `O_NONBLOCK` no
+    `file_read`, o `posixtest` trava na leitura do terminal; sem a correção da máscara, o teste do
+    `pselect` falha.
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -994,6 +1047,7 @@ OpalineOS/
 | 2026-11-21 | Visual passa de **vidro (glassmorphism) para relevo suave (neumorfismo)**: superfícies opacas, luz e sombra em cache, bege porcelana com destaque verde-petróleo (referência `docs/references/neumorfismo.webp`). Motivo: sem GPU, o desfoque do que está atrás das janelas é o efeito mais caro do compositor. Vidro fosco continua como efeito opcional. Toolkit renomeado: **`opaline-relief`** (`from opaline import relief as rl`; `opaline-relief` livre no PyPI e no GitHub, pesquisa de 2026-11-21). Design system "Relief". O nome do sistema continua **OpalineOS** (opalina é vidro leitoso e opaco, que combina com o relevo) |
 | 2026-11-21 | **Layout da área de trabalho**: sem docks nem barras laterais ou inferiores; uma barra fina no topo é a barra de tarefas (botão Apps, um botão por programa aberto, indicadores, notificações e relógio). Prévia interativa aprovada: `docs/mockup/opaline-desktop.html` (movimentos, funções e design). Elementos coloridos afundados usam uma sombra interna própria (escura, quase sem realce), para não parecerem brilhantes. No toolkit, `ctx.dock_icon` virou `ctx.task_button` e `to_dock` virou `to_bar` |
 | 2026-11-21 | **SE2 concluída**: EFS3 versão 2 com **journal** de metadados em modo ordenado (uma transação por operação, commit com checksum, reaplicado na montagem, órfãos liberados), links **simbólicos** (seguidos pelo VFS, até 40) e **físicos**, `getcwd` com o caminho real. Teste de queda de energia em 10 pontos de uma carga de 1178 escritas: fsck limpo em todos |
+| 2026-11-21 | **SE3 concluída**: termios no terminal (canônico e cru, `VMIN`/`VTIME`, Enter manda `\r` + `ICRNL`), `select`/`pselect6` sobre o laço do `poll`, `O_NONBLOCK` real em pipes e no terminal; **shell novo em C sobre a musl** (`programs/sh`, estático) com `fork`/`execve`, ambiente herdado, `$VAR`/`$?`, `export`/`unset`/`env`, `ln`, termios restaurado após cada programa. O shell da E5 (`user/sh`) saiu |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

@@ -124,6 +124,7 @@ struct thread {
     bool iret_return;         /* the user registers were rewritten: return through IRETQ */
     bool exit_pending;        /* another thread's execve: end at the next return to user mode */
     bool restart_syscall;     /* a stop interrupted it: an EINTR system call starts again */
+    bool io_nonblock;         /* the file being read or written has O_NONBLOCK: -EAGAIN, never wait */
     void *start_frame;        /* new user thread: the registers it starts with (kmalloc'd) */
 };
 

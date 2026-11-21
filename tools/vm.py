@@ -213,7 +213,7 @@ class QemuSession:
     # characters the tests type -> QEMU key names (US layout)
     KEYS = {" ": "spc", "\n": "ret", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
             '"': "shift-apostrophe", "_": "shift-minus", ":": "shift-semicolon", "=": "equal",
-            "\t": "tab", "\b": "backspace"}
+            "$": "shift-4", "?": "shift-slash", "\t": "tab", "\b": "backspace"}
 
     def __init__(self, image, log_name="serial-session.log", port=45455):
         self.log = os.path.join(BUILD, log_name)
@@ -349,6 +349,9 @@ def shell_test():
 
         steps = [
             ("mkdir pasta\n", "opaline:/home$ "),
+            ("ln -s nota.txt link.txt\n", "opaline:/home$ "),
+            ("ls -l\n", "link.txt -> nota.txt"),
+            ("cat link.txt\n", "ola mundo"),
             ("ls -l\n", "pasta/"),
             ("hello\n", "Hello from user space (3/3)"),
             ("crashnull\n", "[crashnull was stopped by signal 11]"),
@@ -363,6 +366,21 @@ def shell_test():
             ("<ctrl-z>", "[posixtest stopped; type fg to continue it]"),
             ("fg\n", "posixtest"),
             ("<ctrl-c>", "opaline:/apps$ "),
+            # SE3: the environment reaches programs through fork + execve
+            ("export GREETING=ola\n", "opaline:/apps$ "),
+            ("posixtest env GREETING\n", "env GREETING=ola"),
+            ("echo $GREETING $?\n", "ola 0"),
+            ("FOO=bar posixtest env FOO\n", "env FOO=bar"),
+            ("posixtest env FOO\n", "env FOO unset"),
+            # raw mode: each key reaches the program at once, with no Enter
+            ("posixtest rawkeys\n", "press keys, q quits"),
+            ("a", "key 97"),
+            ("b", "key 98"),
+            ("q", "rawkeys done"),
+            # a program that leaves the terminal raw: the shell puts it back
+            ("posixtest rawkeys\n", "press keys, q quits"),
+            ("x", "rawkeys: leaving raw"),
+            ("echo $GREETING-back\n", "ola-back"),
         ]
         for keys, expect in steps:
             mark = len(s.text())

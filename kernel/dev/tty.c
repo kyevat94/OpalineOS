@@ -24,12 +24,42 @@
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
 #include <opaline/string.h>
+#include <opaline/time.h>
 #include <opaline/vfs.h>
 
 #define LINE_MAX  1024
 #define READY_MAX 4096
 #define HISTORY   16
 #define TIOCGWINSZ 0x5413
+
+/* termios (Linux values): struct termios as the TCGETS/TCSETS ioctls pass it */
+struct ktermios {
+    u32 iflag, oflag, cflag, lflag;
+    u8 line;
+    u8 cc[19];
+} PACKED;
+#define ICRNL  0x100
+#define IXON   0x400
+#define OPOST  0x1
+#define ONLCR  0x4
+#define ISIG   0x1
+#define ICANON 0x2
+#define ECHO   0x8
+#define ECHOE  0x10
+#define ECHOK  0x20
+#define ECHONL 0x40
+#define ECHOCTL 0x200
+#define ECHOKE 0x800
+#define IEXTEN 0x8000
+enum { VINTR = 0, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, VSWTC, VSTART, VSTOP, VSUSP, VEOL, VREPRINT,
+       VDISCARD, VWERASE, VLNEXT, VEOL2 };
+static const struct ktermios termios_default = {
+    .iflag = ICRNL | IXON,
+    .oflag = OPOST | ONLCR,
+    .cflag = 0xF | 0x30 | 0x80,   /* B38400 | CS8 | CREAD */
+    .lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
+    .cc = {3, 0x1C, 0x7F, 0x15, 4, 0, 1, 0, 0x11, 0x13, 0x1A, 0, 0x12, 0x0F, 0x17, 0x16, 0},
+};
 
 static struct {
     char line[LINE_MAX];          /* line being edited */
@@ -47,6 +77,7 @@ static struct {
     int esc;                      /* escape sequence state: 0 none, 1 after ESC, 2 after ESC [ */
     u32 esc_param;
     u64 sid, fg;                  /* the session that owns the terminal and its foreground group */
+    struct ktermios tio;          /* canonical (line editing) or raw input, echo, signal keys */
     int pending_signal;           /* from Ctrl+C / Ctrl+Z / Ctrl+\, sent after the console lock */
 } tty;
 
@@ -243,8 +274,59 @@ static void escape(char final, u32 param) {
     }
 }
 
+/* Canonical mode without echo (a password prompt): a plain line, Backspace, Enter, Ctrl+D. */
+static bool input_quiet(char c) {
+    if (c == '\n') {
+        push_ready(tty.line, tty.len);
+        push_ready("\n", 1);
+        reset_line();
+        if (tty.tio.lflag & ECHONL) console_write("\n", 1);
+        return true;
+    }
+    if (c == (char)tty.tio.cc[VERASE] || c == 0x08) {
+        while (tty.len && ((u8)tty.line[tty.len - 1] & 0xC0) == 0x80) tty.len--;   /* a whole UTF-8 character */
+        if (tty.len) tty.len--;
+        tty.pos = tty.len;
+        return false;
+    }
+    if (c == (char)tty.tio.cc[VEOF]) {
+        if (tty.len == 0) {
+            u64 f = irq_save();
+            tty.eof_pending++;
+            irq_restore(f);
+        } else {
+            push_ready(tty.line, tty.len);
+            reset_line();
+        }
+        return true;
+    }
+    if (((u8)c >= 0x20 || c == '\t') && tty.len < LINE_MAX - 1) {
+        tty.line[tty.len++] = c;
+        tty.pos = tty.len;
+    }
+    return false;
+}
+
 /* One byte from the keyboard (console lock held). Returns true if a reader must be woken. */
 static bool input_byte(char c) {
+    if (c == '\r' && (tty.tio.iflag & ICRNL)) c = '\n';
+    if (tty.tio.lflag & ISIG) {   /* the signal keys: SIGINT, SIGQUIT, SIGTSTP for the foreground job */
+        int sig = c == (char)tty.tio.cc[VINTR] ? SIGINT : c == (char)tty.tio.cc[VQUIT] ? SIGQUIT
+                : c == (char)tty.tio.cc[VSUSP] ? SIGTSTP : 0;
+        if (sig) {
+            if (tty.tio.lflag & ICANON) move_end();
+            if (tty.tio.lflag & ECHO) console_write(sig == SIGINT ? "^C\n" : sig == SIGTSTP ? "^Z\n" : "^\\\n", 3);
+            reset_line();
+            tty.pending_signal = sig;
+            return false;
+        }
+    }
+    if (!(tty.tio.lflag & ICANON)) {   /* raw: every byte goes to the reader at once */
+        push_ready(&c, 1);
+        if (tty.tio.lflag & ECHO) console_write(&c, 1);
+        return true;
+    }
+    if (!(tty.tio.lflag & ECHO)) return input_quiet(c);
     if (tty.esc == 1) {
         tty.esc = c == '[' ? 2 : 0;
         tty.esc_param = 0;
@@ -286,14 +368,6 @@ static bool input_byte(char c) {
             reset_line();
         }
         return true;
-    case 0x03:   /* Ctrl+C: SIGINT to the foreground job */
-    case 0x1A:   /* Ctrl+Z: SIGTSTP (stop it) */
-    case 0x1C:   /* Ctrl+\: SIGQUIT */
-        move_end();
-        console_write(c == 0x03 ? "^C\n" : c == 0x1A ? "^Z\n" : "^\\\n", 3);
-        reset_line();
-        tty.pending_signal = c == 0x03 ? SIGINT : c == 0x1A ? SIGTSTP : SIGQUIT;
-        return false;
     default:
         if ((u8)c >= 0x20 || c == '\t') insert_byte(c);
         return false;
@@ -325,17 +399,56 @@ static int background_check(int sig) {
     return -EINTR;   /* the call starts again once the job is continued in the foreground */
 }
 
+/* Raw mode: VMIN and VTIME (tenths of a second) decide when read() returns. */
+static i64 read_raw(char *buf, u64 len) {
+    u64 vmin = tty.tio.cc[VMIN], vtime = tty.tio.cc[VTIME] * 100ULL;
+    u64 want = MIN(len, vmin ? vmin : 1);
+    u64 f = irq_save();
+    u64 deadline = vtime ? time_ms() + vtime : 0;
+    bool nb = thread_current()->io_nonblock;
+    if (nb && tty.ready_len == 0) {
+        irq_restore(f);
+        return -EAGAIN;
+    }
+    while (tty.ready_len < want && !nb) {
+        if (!vmin && !vtime) break;                       /* poll: whatever is there */
+        if (vtime && tty.ready_len && vmin) break;        /* something arrived and the timer ran: enough */
+        u64 now = time_ms();
+        if (deadline && now >= deadline) break;
+        int r = waitqueue_wait_timeout(&tty.readers, deadline ? deadline - now : 0);
+        if (r == -EINTR) {
+            irq_restore(f);
+            return -EINTR;
+        }
+        if (vtime && vmin) deadline = time_ms() + vtime;  /* VTIME is the gap between bytes */
+    }
+    u64 n = 0;
+    while (n < len && tty.ready_len > 0) {
+        buf[n++] = tty.ready[tty.ready_head];
+        tty.ready_head = (tty.ready_head + 1) % READY_MAX;
+        tty.ready_len--;
+    }
+    irq_restore(f);
+    return (i64)n;
+}
+
 static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
     (void)v, (void)off;
     int bg = background_check(SIGTTIN);
     if (bg < 0) return bg;
     if (len == 0) return 0;
+    if (!(tty.tio.lflag & ICANON)) return read_raw(buf, len);
     u64 f = irq_save();
-    while (tty.ready_len == 0 && tty.eof_pending == 0)
+    while (tty.ready_len == 0 && tty.eof_pending == 0) {
+        if (thread_current()->io_nonblock) {
+            irq_restore(f);
+            return -EAGAIN;
+        }
         if (waitqueue_wait_intr(&tty.readers) < 0) {   /* a signal arrived */
             irq_restore(f);
             return -EINTR;
         }
+    }
     if (tty.ready_len == 0) {   /* Ctrl+D on an empty line */
         tty.eof_pending--;
         irq_restore(f);
@@ -392,6 +505,47 @@ static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
         if (!p->ctty) return -ENOTTY;
         p->ctty = false;
         return 0;
+    case 0x5401:   /* TCGETS */
+        memcpy((void *)arg, &tty.tio, sizeof tty.tio);
+        return 0;
+    case 0x5402:   /* TCSETS: now */
+    case 0x5403:   /* TCSETSW: after the output drained (it never waits here) */
+    case 0x5404: { /* TCSETSF: and throw away pending input */
+        int bg = background_check(SIGTTOU);
+        if (bg < 0) return bg;
+        u64 f = console_lock();
+        bool was_canonical = tty.tio.lflag & ICANON;
+        memcpy(&tty.tio, (const void *)arg, sizeof tty.tio);
+        if (request == 0x5404) {
+            tty.ready_len = 0;
+            tty.eof_pending = 0;
+        }
+        if (was_canonical && !(tty.tio.lflag & ICANON) && tty.len) {   /* a half-typed line goes to the reader */
+            push_ready(tty.line, tty.len);
+            reset_line();
+        }
+        console_unlock(f);
+        waitqueue_wake_all(&tty.readers);
+        vfs_poll_notify();
+        return 0;
+    }
+    case 0x540B: { /* TCFLSH: 0 input, 1 output, 2 both */
+        if (arg == 0 || arg == 2) {
+            u64 f = console_lock();
+            tty.ready_len = 0;
+            reset_line();
+            console_unlock(f);
+        }
+        return arg <= 2 ? 0 : -EINVAL;
+    }
+    case 0x541B:   /* FIONREAD: bytes ready to read */
+        *(i32 *)arg = (i32)tty.ready_len;
+        return 0;
+    case 0x5411:   /* TIOCOUTQ: output never waits */
+        *(i32 *)arg = 0;
+        return 0;
+    case 0x5414:   /* TIOCSWINSZ: the console's size is fixed */
+        return 0;
     default: break;
     }
     if (request != TIOCGWINSZ) return -ENOTTY;
@@ -428,4 +582,5 @@ struct vnode *tty_vnode(void) { return &tty_node; }
 void tty_init(void) {
     memset(&tty, 0, sizeof tty);
     tty.browse = 0;
+    tty.tio = termios_default;
 }
