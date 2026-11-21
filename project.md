@@ -135,7 +135,7 @@ Requisitos, para que tudo seja projetado desde o início sem atrapalhar o Window
 │ Apps em Python: Arquivos, Terminal, Editor, Navegador,       │
 │ Monitor, Música, Configurações, Calendário... (+ pip/PyPI)   │
 ├─────────────────────────────────────────────────────────────┤
-│ Shell gráfico (Python): barra superior, dock, lançador,      │
+│ Shell gráfico (Python): barra superior com tarefas, lançador,│
 │ central de notificações                                      │
 ├─────────────────────────────────────────────────────────────┤
 │ opaline.relief · opaline.system · opaline.i18n (Python)      │
@@ -268,9 +268,14 @@ Referências em `docs/references/`:
 - `neumorfismo.webp` (**referência do estilo atual**, de 2026-11-21): kit completo — camadas (base,
   elevada, embutida, pressionada), níveis de elevação, espessuras de borda, escala de raios, regras de
   ícones, controles, navegação, exibição de dados e feedback.
+- **`docs/mockup/opaline-desktop.html`** (**prévia interativa aprovada** em 2026-11-21): a área de
+  trabalho no estilo Relief, com o layout da seção 6.3, as animações de janela, o kit de componentes
+  clicável e as Configurações (relevo, destaque, luz, contraste, efeitos, idioma). Abrir no navegador.
+  É a referência de como o sistema deve ficar e se mover.
 - `desktop.webp`: área de trabalho completa (barra superior, dock lateral e inferior, menu de apps,
   gerenciador de arquivos, monitor do sistema, player e central de notificações). Vale pela
-  **disposição** dos elementos; o estilo de vidro escuro foi substituído pelo relevo.
+  **conteúdo** dos apps; o estilo de vidro escuro foi substituído pelo relevo e os docks foram
+  abandonados (seção 6.3).
 - `componentes.webp`: kit de componentes no estilo antigo (vidro), também só como referência de
   conteúdo.
 
@@ -320,7 +325,7 @@ luz e a sombra para o outro)
 | 0 | `base` | nenhuma | fundo, separadores |
 | 1 | `flat` | 2/4 | itens de lista, cabeçalho de tabela |
 | 2 | `hover` | 4/10 | o que está sob o ponteiro |
-| 3 | `raised` | 6/16 | cards, botões, dock |
+| 3 | `raised` | 6/16 | cards, botões, barra superior |
 | 4 | `modal` | 10/28 | janelas, diálogos |
 | 5 | `popover` | 14/36 | menus, tooltips, dropdowns, toasts |
 
@@ -347,10 +352,21 @@ luz e a sombra para o outro)
 
 ### 6.3 Shell (área de trabalho)
 
-Barra superior (menus Applications, Places e System — "Aplicativos", "Locais" e "Sistema" em pt-BR — mais indicadores de rede, som, bateria e
-relógio), dock lateral, dock inferior, lançador de apps com busca e categorias, central de
-notificações com atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno e brilho). O fundo é a
-cor base ou um papel de parede próprio, suave e de pouco contraste, para o relevo continuar legível.
+**Sem docks e sem barras laterais ou inferiores.** A única barra é uma **barra fina no topo**,
+flutuante e em relevo, que faz o papel da barra de tarefas:
+- à esquerda, o botão **Apps** (também Ctrl+Espaço), que abre o lançador: busca, grade de apps,
+  usuário e os botões de reiniciar e desligar;
+- no meio, **um botão para cada programa aberto**, que aparece com uma animação de mola quando o
+  programa abre e some quando ele fecha. O do programa ativo fica afundado, com um traço de destaque.
+  Clicar alterna entre focar, minimizar e restaurar; minimizar "entra" no botão e restaurar sai dele;
+- à direita, os indicadores (rede, som, bateria), as notificações e o relógio, que abrem a central de
+  notificações: atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno), brilho, volume e a lista
+  de avisos.
+
+Janelas maximizadas ocupam a tela abaixo da barra. Os avisos (toasts) aparecem no canto superior
+direito, logo abaixo dela. O fundo é a cor base ou um papel de parede próprio, suave e de pouco
+contraste, para o relevo continuar legível. A prévia em `docs/mockup/opaline-desktop.html` mostra tudo
+isso funcionando.
 
 ---
 
@@ -433,7 +449,7 @@ cor base ou um papel de parede próprio, suave e de pouco contraste, para o rele
 | **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, relevo com sombras em cache, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela em relevo arrastável a 60 fps; digitar "ação, über, ñ" funciona |
-| **E9** | **`opaline.relief`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra, dock, lançador) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
+| **E9** | **`opaline.relief`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra superior com as tarefas, lançador, central de notificações) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
 | **E10** | Apps em Python: Terminal, Files, Editor, System Monitor, Settings (com a página **Language & Region**) | uso diário básico, nos dois idiomas |
 | **E11** | Rede: driver (e1000/virtio-net, portado do v2), TCP/IP com sockets BSD + OpenSSL | `pip install requests` e um GET `https://` funcionando |
 | **E12** | Sistema de ports (numpy, pillow...), teste de binários musllinux, apps com mypyc; HarfBuzz + bidi (escritas complexas e da direita para a esquerda), emoji | `import numpy` funciona; benchmark mypyc × CPython registrado; árabe, hebraico, hindi e CJK aparecem corretamente |
@@ -909,6 +925,7 @@ OpalineOS/
 | 2026-11-21 | Antes da E7, quatro **sub-etapas** (SE1–SE4) para o que ficou simplificado ou pendente até a E6. Usuários: permissões reais no kernel já na SE1, mas o sistema continua iniciando como root (login e `sudo` na E15). Controle de tarefas com Ctrl+C/Ctrl+Z junto na SE1 |
 | 2026-11-21 | **SE1 concluída**: refcount de páginas, copy-on-write, `MAP_SHARED` real com cache de páginas coerente com `read`/`write`, futex compartilhado, `mremap` completo, `execve` com threads, RTC e tempos de arquivo, uid/gid/modo no EFS3 e permissões POSIX no VFS, setuid/setgid, grupos e sessões, parar/continuar, `SIGCHLD`, Ctrl+C/Ctrl+Z/Ctrl+\\, syscalls que recomeçam, `poll`/`ppoll`. `reboot` só root |
 | 2026-11-21 | Visual passa de **vidro (glassmorphism) para relevo suave (neumorfismo)**: superfícies opacas, luz e sombra em cache, bege porcelana com destaque verde-petróleo (referência `docs/references/neumorfismo.webp`). Motivo: sem GPU, o desfoque do que está atrás das janelas é o efeito mais caro do compositor. Vidro fosco continua como efeito opcional. Toolkit renomeado: **`opaline-relief`** (`from opaline import relief as rl`; `opaline-relief` livre no PyPI e no GitHub, pesquisa de 2026-11-21). Design system "Relief". O nome do sistema continua **OpalineOS** (opalina é vidro leitoso e opaco, que combina com o relevo) |
+| 2026-11-21 | **Layout da área de trabalho**: sem docks nem barras laterais ou inferiores; uma barra fina no topo é a barra de tarefas (botão Apps, um botão por programa aberto, indicadores, notificações e relógio). Prévia interativa aprovada: `docs/mockup/opaline-desktop.html` (movimentos, funções e design). Elementos coloridos afundados usam uma sombra interna própria (escura, quase sem realce), para não parecerem brilhantes. No toolkit, `ctx.dock_icon` virou `ctx.task_button` e `to_dock` virou `to_bar` |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

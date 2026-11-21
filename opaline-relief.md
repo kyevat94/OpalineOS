@@ -594,8 +594,8 @@ def my_effect(ctx: rl.EffectContext) -> rl.Anim | None:
 |---|---|---|
 | `open` | `show()` | the window stays in the animation's final state |
 | `close` | `close()` / `hide()` | the window is destroyed/hidden **after** the animation |
-| `minimize` | minimize button, `minimize()` | the window disappears (goes to the dock) |
-| `restore` | dock click, `restore()` | — |
+| `minimize` | minimize button, `minimize()` | the window disappears (into its button in the top bar) |
+| `restore` | a click on its button in the top bar, `restore()` | — |
 | `maximize` / `unmaximize` | button, title bar double-click, `maximize()` | content is laid out again at the final size |
 | `fullscreen` / `exit_fullscreen` | `fullscreen(...)` | same |
 | `focus_in` / `focus_out` | the active window changes | — |
@@ -610,7 +610,7 @@ def my_effect(ctx: rl.EffectContext) -> rl.Anim | None:
 | `ctx.moment` | `"open"`, `"close"`, `"minimize"`... |
 | `ctx.origin` | current `Rect` of the window |
 | `ctx.target` | final `Rect` (e.g. the screen's work area when maximizing) |
-| `ctx.dock_icon` | `Rect` of the app icon in the dock, or `None` |
+| `ctx.task_button` | `Rect` of the window's button in the top bar, or `None` |
 | `ctx.cursor` | mouse position |
 | `ctx.screen` | the monitor (`.rect`, `.work_area`) |
 | `ctx.reason` | `"user"`, `"app"` or `"system"` |
@@ -649,8 +649,8 @@ Each one returns an effect function. Use them directly or inside your own effect
 | `rl.effects.zoom(scale=0.94, duration=200)` | scale + opacity |
 | `rl.effects.slide(direction="down", duration=220, distance=24)` | slide + opacity |
 | `rl.effects.spring(stiffness=380, damping=26)` | opens with a spring |
-| `rl.effects.to_dock(duration=320)` | shrinks into the dock icon (minimize/restore) |
-| `rl.effects.genie(duration=420)` | "genie" deformation into the dock. **Phase 2** (uses `warp`) |
+| `rl.effects.to_bar(duration=340)` | shrinks into its button in the top bar (minimize/restore) |
+| `rl.effects.genie(duration=420)` | "genie" deformation into its button in the top bar. **Phase 2** (uses `warp`) |
 | `rl.effects.shake(intensity=8)` | for `alert` |
 | `rl.effects.default` | the system effect for that moment |
 
@@ -682,12 +682,12 @@ def close(ctx):
     return rl.Anim(ctx.window, 160, rl.curves.ease_in, scale=0.94, opacity=0, elevation=1)
 
 def minimize(ctx):
-    target = ctx.dock_icon or rl.Rect(ctx.origin.center_x, ctx.screen.rect.height, 1, 1)
+    target = ctx.task_button or rl.Rect(ctx.origin.center_x, 0, 1, 1)
     return rl.Anim(ctx.window, 320, rl.curves.ease_in, rect=target, opacity=0.2)
 
 def restore(ctx):
     return rl.Anim(ctx.window, curve=SPRING,
-                   from_=dict(rect=ctx.dock_icon or ctx.target, opacity=0.2),
+                   from_=dict(rect=ctx.task_button or ctx.target, opacity=0.2),
                    rect=ctx.target, opacity=1)
 
 def maximize(ctx):
@@ -746,7 +746,7 @@ section 6.1):
 | `0` | base | flat with what is under it | window backgrounds, separators |
 | `1` | flat | barely lifted | list items, table headers |
 | `2` | hover | lifted a little | whatever is under the pointer |
-| `3` | raised | clearly raised | cards, buttons, the dock |
+| `3` | raised | clearly raised | cards, buttons, the top bar |
 | `4` | modal | floating | dialogs, windows |
 | `5` | popover | highest | menus, tooltips, dropdowns, toasts |
 
@@ -1207,7 +1207,7 @@ window.add(rl.Column([
 window.show()
 ```
 
-### 19.5 Dock icon that bounces when an app opens
+### 19.5 Top-bar button that bounces when an app opens
 
 ```python
 def bounce(icon):
@@ -1229,9 +1229,9 @@ from opaline.i18n import _
 
 PRESETS = {
     "smooth": dict(open=rl.effects.spring(), close=rl.effects.zoom(0.94, 160),
-                   minimize=rl.effects.to_dock(320)),
+                   minimize=rl.effects.to_bar(340)),
     "fast":   dict(open=rl.effects.fade(100), close=rl.effects.fade(80),
-                   minimize=rl.effects.to_dock(180)),
+                   minimize=rl.effects.to_bar(180)),
     "none":   dict(open=rl.effects.none, close=rl.effects.none,
                    minimize=rl.effects.none),
 }
@@ -1282,7 +1282,7 @@ window.effects = rl.Effects(open=, close=, minimize=, restore=, maximize=, unmax
                             fullscreen=, exit_fullscreen=, focus_in=, focus_out=,
                             drag_start=, drag_end=, alert=)
 def effect(ctx): return rl.Anim(ctx.window, ...)
-rl.effects.none | fade() | zoom() | slide() | spring() | to_dock() | genie() | shake()
+rl.effects.none | fade() | zoom() | slide() | spring() | to_bar() | genie() | shake()
 
 # visuals
 elevation=-2…5  ·  rl.Surface.relief() | solid() | transparent() | frosted()

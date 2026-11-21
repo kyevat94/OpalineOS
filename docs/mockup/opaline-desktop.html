@@ -1,0 +1,1221 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     Copyright (C) 2026 The OpalineOS authors
+     OpalineOS desktop mockup: the "Relief" design system (project.md, section 6) as a standalone page.
+     Everything here is a preview of how the real compositor and opaline-relief will look and move. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpalineOS desktop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ---- tokens (project.md 6.1) ------------------------------------------------------------ */
+:root {
+  --bg: #EEE6DA; --surface: #EEE6DA; --inset: #E8DFD2;
+  --hl: 255, 251, 245; --sh: 190, 175, 154;
+  --hla: .92; --sha: .62;
+  --depth: 1; --lx: 1;                 /* light from the top left (-1: top right) */
+  --hcw: 0px;                          /* high contrast border width */
+  --accent: #1E5D59; --accent-strong: #164744; --accent-rgb: 30, 93, 89; --on-accent: #FFFFFF;
+  --text: #2D2A26; --text2: #6F665C; --text3: #A79E92;
+  --success: #2E7D5B; --warning: #B7832F; --error: #B3423A; --info: #2E6F9E;
+  --border: rgba(0, 0, 0, .08);
+  --hc: 0 0 0 var(--hcw) rgba(0, 0, 0, .28);
+  --e1: calc(var(--lx) * -2px * var(--depth)) calc(-2px * var(--depth)) calc(4px * var(--depth)) rgba(var(--hl), var(--hla)), calc(var(--lx) * 2px * var(--depth)) calc(2px * var(--depth)) calc(4px * var(--depth)) rgba(var(--sh), var(--sha)), var(--hc);
+  --e2: calc(var(--lx) * -4px * var(--depth)) calc(-4px * var(--depth)) calc(10px * var(--depth)) rgba(var(--hl), var(--hla)), calc(var(--lx) * 4px * var(--depth)) calc(4px * var(--depth)) calc(10px * var(--depth)) rgba(var(--sh), var(--sha)), var(--hc);
+  --e3: calc(var(--lx) * -6px * var(--depth)) calc(-6px * var(--depth)) calc(16px * var(--depth)) rgba(var(--hl), var(--hla)), calc(var(--lx) * 6px * var(--depth)) calc(6px * var(--depth)) calc(16px * var(--depth)) rgba(var(--sh), var(--sha)), var(--hc);
+  --e4: calc(var(--lx) * -10px * var(--depth)) calc(-10px * var(--depth)) calc(28px * var(--depth)) rgba(var(--hl), var(--hla)), calc(var(--lx) * 10px * var(--depth)) calc(10px * var(--depth)) calc(28px * var(--depth)) rgba(var(--sh), calc(var(--sha) + .08)), var(--hc);
+  --e5: calc(var(--lx) * -14px * var(--depth)) calc(-14px * var(--depth)) calc(36px * var(--depth)) rgba(var(--hl), var(--hla)), calc(var(--lx) * 14px * var(--depth)) calc(14px * var(--depth)) calc(36px * var(--depth)) rgba(var(--sh), calc(var(--sha) + .12)), var(--hc);
+  --in1: inset calc(var(--lx) * 3px * var(--depth)) calc(3px * var(--depth)) calc(6px * var(--depth)) rgba(var(--sh), var(--sha)), inset calc(var(--lx) * -3px * var(--depth)) calc(-3px * var(--depth)) calc(6px * var(--depth)) rgba(var(--hl), var(--hla)), var(--hc);
+  --in2: inset calc(var(--lx) * 4px * var(--depth)) calc(4px * var(--depth)) calc(8px * var(--depth)) rgba(var(--sh), calc(var(--sha) + .1)), inset calc(var(--lx) * -4px * var(--depth)) calc(-4px * var(--depth)) calc(8px * var(--depth)) rgba(var(--hl), var(--hla)), var(--hc);
+  --in-acc: inset calc(var(--lx) * 3px * var(--depth)) calc(3px * var(--depth)) calc(6px * var(--depth)) rgba(0, 0, 0, .42), inset calc(var(--lx) * -2px * var(--depth)) calc(-2px * var(--depth)) calc(4px * var(--depth)) rgba(255, 255, 255, .07), var(--hc);
+  --knob-on-acc: calc(var(--lx) * 2px) 2px 5px rgba(0, 0, 0, .38);
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --bounce: cubic-bezier(.34, 1.56, .64, 1);
+  --fast: 120ms;
+  --bar-h: 38px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  background-image: radial-gradient(120% 90% at 30% 20%, rgba(255, 251, 245, .55), transparent 60%),
+                    radial-gradient(90% 80% at 90% 100%, rgba(201, 162, 107, .10), transparent 60%);
+  color: var(--text); font: 14px/1.4 Inter, system-ui, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased; user-select: none;
+}
+body.reduce * { transition-duration: 1ms !important; }
+button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+input, textarea { font: inherit; color: inherit; }
+svg.i { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+svg.i.s16 { width: 16px; height: 16px; }
+svg.i.s24 { width: 24px; height: 24px; }
+
+/* ---- relief primitives -------------------------------------------------------------------- */
+.e1 { box-shadow: var(--e1); } .e2 { box-shadow: var(--e2); } .e3 { box-shadow: var(--e3); }
+.e4 { box-shadow: var(--e4); } .e5 { box-shadow: var(--e5); }
+.in1 { box-shadow: var(--in1); background: var(--inset); } .in2 { box-shadow: var(--in2); }
+.press { transition: box-shadow var(--fast) var(--ease), transform var(--fast) var(--ease), background var(--fast), color var(--fast); }
+.btn {
+  height: 38px; padding: 0 18px; border-radius: 12px; background: var(--surface); box-shadow: var(--e3);
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-weight: 600; color: var(--text);
+  transition: box-shadow var(--fast) var(--ease), transform var(--fast) var(--ease), background var(--fast), color var(--fast);
+}
+.btn:hover { box-shadow: var(--e2); }
+.btn:active, .btn.down { box-shadow: var(--in2); transform: scale(.99); }
+.btn.primary { background: var(--accent); color: var(--on-accent); }
+.btn.primary:hover { background: var(--accent-strong); }
+.btn.primary:active { box-shadow: var(--in-acc); background: var(--accent-strong); }
+.btn.ghost { box-shadow: none; } .btn.ghost:hover { box-shadow: var(--e1); }
+.btn.danger { color: var(--error); }
+.btn.danger.primary { background: var(--error); color: #fff; }
+.btn:disabled { box-shadow: var(--in1); color: var(--text3); cursor: not-allowed; background: var(--inset); }
+.btn.small { height: 30px; padding: 0 12px; border-radius: 10px; font-size: 13px; }
+.icon-btn { width: 34px; height: 34px; border-radius: 11px; display: inline-grid; place-items: center; background: var(--surface); box-shadow: var(--e2); color: var(--text2); transition: box-shadow var(--fast) var(--ease), color var(--fast), transform var(--fast) var(--ease); }
+.icon-btn:hover { color: var(--accent); }
+.icon-btn:active, .icon-btn.on { box-shadow: var(--in2); color: var(--accent); }
+.focus-ring:focus-visible, .btn:focus-visible, .icon-btn:focus-visible { outline: none; box-shadow: var(--e2), 0 0 0 3px rgba(46, 140, 134, .45); }
+.field {
+  height: 40px; padding: 0 14px; border-radius: 12px; border: 0; outline: none; width: 100%;
+  background: var(--inset); box-shadow: var(--in1); color: var(--text);
+  transition: box-shadow 160ms var(--ease);
+}
+.field::placeholder { color: var(--text3); }
+.field:focus { box-shadow: var(--in1), 0 0 0 2px rgba(46, 140, 134, .55), 0 0 14px rgba(46, 140, 134, .25); }
+.field.error { box-shadow: var(--in1), 0 0 0 2px rgba(179, 66, 58, .55); }
+.label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text2); }
+.caption { font-size: 12px; color: var(--text2); }
+.caption.err { color: var(--error); }
+h1, h2, h3 { margin: 0; font-weight: 600; }
+.row { display: flex; align-items: center; gap: 12px; }
+.col { display: flex; flex-direction: column; gap: 10px; }
+.grow { flex: 1; }
+.scroll { overflow: auto; }
+.scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.scroll::-webkit-scrollbar-thumb { background: rgba(var(--sh), .6); border-radius: 10px; border: 3px solid var(--bg); }
+
+/* switch, checkbox, radio, slider */
+.switch { width: 50px; height: 28px; border-radius: 99px; background: var(--inset); box-shadow: var(--in1); position: relative; cursor: pointer; transition: background 200ms var(--ease); flex: none; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--surface); box-shadow: var(--e1); transition: transform 280ms var(--bounce), background 200ms; }
+.switch.on { background: var(--accent); box-shadow: var(--in-acc); }
+.switch.on::after { transform: translateX(22px); background: #F7F2EA; box-shadow: var(--knob-on-acc); }
+.check { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+.check .box { width: 22px; height: 22px; border-radius: 7px; background: var(--surface); box-shadow: var(--e1); display: grid; place-items: center; transition: all 160ms var(--ease); color: transparent; }
+.check.on .box { background: var(--accent); box-shadow: var(--in-acc); color: #fff; }
+.check .box svg { transform: scale(.4); transition: transform 260ms var(--bounce); }
+.check.on .box svg { transform: scale(1); }
+.radio .box { border-radius: 50%; }
+.radio.on .box { background: var(--surface); box-shadow: var(--in1); }
+.radio .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform 260ms var(--bounce); }
+.radio.on .dot { transform: scale(1); }
+.slider { position: relative; height: 34px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
+.slider .track { position: absolute; left: 0; right: 0; height: 10px; border-radius: 99px; background: var(--inset); box-shadow: var(--in1); }
+.slider .fill { position: absolute; left: 0; height: 10px; border-radius: 99px; background: var(--accent); box-shadow: var(--in-acc); }
+.slider .knob { position: absolute; width: 24px; height: 24px; margin-left: -12px; border-radius: 50%; background: var(--surface); box-shadow: var(--e2); transition: transform 160ms var(--bounce); }
+.slider:active .knob { transform: scale(1.12); box-shadow: var(--e3); }
+.slider .tip { position: absolute; top: -24px; margin-left: -20px; width: 40px; text-align: center; font-size: 11px; font-weight: 600; background: var(--text); color: var(--bg); border-radius: 6px; padding: 2px 0; opacity: 0; transform: translateY(4px); transition: all 160ms var(--ease); pointer-events: none; }
+.slider:hover .tip, .slider:active .tip { opacity: 1; transform: none; }
+
+/* ---- the top bar ------------------------------------------------------------------------------- */
+#bar {
+  position: fixed; top: 6px; left: 8px; right: 8px; height: var(--bar-h); z-index: 9000;
+  border-radius: 14px; background: var(--surface); box-shadow: var(--e3);
+  display: flex; align-items: center; gap: 6px; padding: 0 6px;
+}
+#start { height: 28px; padding: 0 12px 0 8px; border-radius: 10px; display: flex; align-items: center; gap: 8px; font-weight: 700; box-shadow: var(--e1); transition: box-shadow var(--fast) var(--ease), color var(--fast); color: var(--text); }
+#start:hover { color: var(--accent); }
+#start.on, #start:active { box-shadow: var(--in2); color: var(--accent); }
+#start .logo { width: 20px; height: 20px; }
+#tasks { flex: 1; display: flex; gap: 6px; align-items: center; overflow: hidden; padding: 4px 6px; }
+.task {
+  height: 28px; padding: 0 12px 0 8px; border-radius: 10px; display: flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 500; color: var(--text2); box-shadow: var(--e1); white-space: nowrap; flex: none;
+  transition: box-shadow 160ms var(--ease), color 160ms, opacity 160ms; position: relative;
+}
+.task:hover { box-shadow: var(--e2); color: var(--text); }
+.task.active { box-shadow: var(--in2); color: var(--accent); }
+.task.min { opacity: .62; }
+.task::after { content: ""; position: absolute; bottom: 3px; left: 50%; width: 14px; height: 3px; margin-left: -7px; border-radius: 3px; background: var(--accent); transform: scaleX(0); transition: transform 220ms var(--bounce); }
+.task.active::after { transform: scaleX(1); }
+.task svg.i { width: 16px; height: 16px; }
+#tray { display: flex; align-items: center; gap: 4px; padding-right: 2px; }
+.tray-btn { height: 28px; min-width: 28px; padding: 0 7px; border-radius: 9px; display: flex; align-items: center; gap: 6px; color: var(--text2); transition: box-shadow var(--fast) var(--ease), color var(--fast); font-size: 13px; font-weight: 500; }
+.tray-btn:hover { box-shadow: var(--e1); color: var(--text); }
+.tray-btn.on, .tray-btn:active { box-shadow: var(--in2); color: var(--accent); }
+.tray-btn .badge-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--error); margin-left: -4px; margin-top: -10px; transform: scale(0); transition: transform 260ms var(--bounce); }
+.tray-btn .badge-dot.show { transform: scale(1); }
+#clock { font-variant-numeric: tabular-nums; }
+
+/* ---- popovers (elevation 5) ------------------------------------------------------------------------ */
+.pop { position: fixed; z-index: 9500; background: var(--surface); border-radius: 20px; box-shadow: var(--e5); display: none; transform-origin: top left; }
+.pop.right { transform-origin: top right; }
+#launcher { top: 54px; left: 8px; width: 460px; padding: 18px; }
+.app-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 16px 0; }
+.app-tile { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 4px; border-radius: 16px; transition: box-shadow 160ms var(--ease), transform 160ms var(--ease); }
+.app-tile:hover { box-shadow: var(--e2); }
+.app-tile:active { box-shadow: var(--in2); transform: scale(.98); }
+.app-tile .ico { width: 52px; height: 52px; border-radius: 16px; display: grid; place-items: center; background: var(--surface); box-shadow: var(--e3); color: var(--accent); }
+.app-tile .ico svg.i { width: 26px; height: 26px; }
+.app-tile span { font-size: 12px; font-weight: 500; text-align: center; color: var(--text); }
+.app-tile.hidden { display: none; }
+.power-row { display: flex; gap: 10px; justify-content: flex-end; border-top: 1px solid var(--border); padding-top: 14px; }
+#center { top: 54px; right: 8px; width: 360px; padding: 16px; }
+.qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.qs { height: 56px; border-radius: 16px; padding: 0 12px; display: flex; align-items: center; gap: 10px; box-shadow: var(--e2); text-align: left; transition: box-shadow 160ms var(--ease), color 160ms; }
+.qs .ic { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; box-shadow: var(--e1); color: var(--text2); transition: all 160ms var(--ease); }
+.qs.on { box-shadow: var(--in1); }
+.qs.on .ic { background: var(--accent); color: #fff; box-shadow: var(--in-acc); }
+.qs b { display: block; font-size: 13px; font-weight: 600; }
+.qs small { font-size: 11px; color: var(--text2); }
+.notif { display: flex; gap: 10px; padding: 12px; border-radius: 14px; box-shadow: var(--e1); margin-top: 10px; align-items: flex-start; }
+.notif .ic { width: 30px; height: 30px; border-radius: 10px; display: grid; place-items: center; background: var(--surface); box-shadow: var(--e1); color: var(--accent); flex: none; }
+.notif p { margin: 2px 0 0; font-size: 12px; color: var(--text2); }
+
+/* ---- windows (elevation 4) ------------------------------------------------------------------------------- */
+#desk { position: fixed; inset: 0; }
+.win {
+  position: absolute; display: flex; flex-direction: column; border-radius: 18px; background: var(--surface);
+  box-shadow: var(--e4); min-width: 320px; min-height: 200px; transition: box-shadow 220ms var(--ease), filter 220ms var(--ease);
+  will-change: transform;
+}
+.win.inactive { box-shadow: var(--e3); filter: saturate(.8); }
+.win.inactive .titlebar .ttl { color: var(--text3); }
+.win.max { border-radius: 14px; }
+.win.dragging { box-shadow: var(--e5); }
+.titlebar { height: 44px; flex: none; display: flex; align-items: center; padding: 0 10px 0 16px; cursor: default; }
+.titlebar .ttl { flex: 1; display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 13.5px; color: var(--text); transition: color 220ms; }
+.titlebar .ttl svg { color: var(--accent); }
+.wbtns { display: flex; gap: 8px; }
+.wb { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; box-shadow: var(--e1); color: var(--text3); transition: box-shadow var(--fast) var(--ease), color var(--fast), background var(--fast); }
+.wbtns:hover .wb { color: var(--text2); }
+.wb:hover { box-shadow: var(--e2); }
+.wb:active { box-shadow: var(--in2); }
+.wb.close:hover { background: var(--error); color: #fff; }
+.wb svg.i { width: 12px; height: 12px; stroke-width: 2.6; }
+.wbody { flex: 1; min-height: 0; padding: 0 16px 16px; display: flex; flex-direction: column; }
+.resize { position: absolute; right: 2px; bottom: 2px; width: 16px; height: 16px; cursor: nwse-resize; border-radius: 0 0 16px 0; }
+.win.max .resize { display: none; }
+
+/* ---- shared bits inside apps --------------------------------------------------------------------------------- */
+.panel { border-radius: 16px; background: var(--inset); box-shadow: var(--in1); }
+.card { border-radius: 16px; background: var(--surface); box-shadow: var(--e3); padding: 16px; transition: box-shadow 200ms var(--ease), transform 200ms var(--ease); }
+.card.hoverable:hover { box-shadow: var(--e4); transform: translateY(-2px); }
+.card.hoverable:active { box-shadow: var(--in1); transform: scale(.99); }
+.badge { display: inline-flex; align-items: center; height: 22px; padding: 0 9px; border-radius: 99px; font-size: 11.5px; font-weight: 600; background: var(--accent); color: #fff; }
+.badge.soft { background: var(--surface); color: var(--accent); box-shadow: var(--e1); }
+.badge.err { background: var(--error); }
+.avatar { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 14px; color: var(--accent); background: var(--surface); box-shadow: var(--e2); }
+.avatar.ringed { box-shadow: var(--e2), 0 0 0 3px var(--bg), 0 0 0 5px var(--accent); }
+.tabs { display: inline-flex; gap: 4px; padding: 4px; border-radius: 14px; background: var(--inset); box-shadow: var(--in1); position: relative; }
+.tab { position: relative; z-index: 1; height: 32px; padding: 0 16px; border-radius: 10px; font-weight: 600; font-size: 13px; color: var(--text2); transition: color 200ms; }
+.tab.on { color: var(--accent); }
+.tabs .ind { position: absolute; top: 4px; height: 32px; border-radius: 10px; background: var(--surface); box-shadow: var(--e1); transition: left 320ms var(--bounce), width 320ms var(--bounce); }
+.steps { display: flex; align-items: flex-start; }
+.step { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 84px; position: relative; font-size: 12px; color: var(--text2); }
+.step .n { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; background: var(--surface); box-shadow: var(--e2); transition: all 260ms var(--ease); position: relative; z-index: 1; }
+.step.done .n { box-shadow: var(--in1); color: var(--accent); }
+.step.cur .n { background: var(--accent); color: #fff; transform: scale(1.12); }
+.step.cur { color: var(--text); font-weight: 600; }
+.step + .step::before { content: ""; position: absolute; top: 16px; right: 50%; width: 100%; height: 3px; border-radius: 3px; background: var(--inset); box-shadow: var(--in1); }
+.step.done::before, .step.cur::before { background: var(--accent) !important; box-shadow: none !important; }
+.progress { height: 10px; border-radius: 99px; background: var(--inset); box-shadow: var(--in1); overflow: hidden; }
+.progress > div { height: 100%; width: 0; border-radius: 99px; background: var(--accent); box-shadow: var(--in-acc); transition: width 600ms var(--ease); }
+.progress.indet > div { width: 35%; animation: indet 1.3s var(--ease) infinite; }
+@keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+.spinner { width: 30px; height: 30px; position: relative; }
+.spinner i { position: absolute; left: 13px; top: 1px; width: 4px; height: 8px; border-radius: 2px; background: var(--accent); transform-origin: 2px 14px; animation: spin 1s linear infinite; opacity: .15; }
+@keyframes spin { 0% { opacity: 1; } 100% { opacity: .15; } }
+.skel { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--inset), #F6F0E7, var(--inset)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; box-shadow: var(--in1); }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.pager { display: flex; gap: 6px; align-items: center; }
+.pg { width: 32px; height: 32px; border-radius: 10px; font-weight: 600; font-size: 13px; color: var(--text2); transition: box-shadow var(--fast) var(--ease), color var(--fast), background var(--fast); }
+.pg:hover { box-shadow: var(--e1); }
+.pg.on { background: var(--accent); color: #fff; box-shadow: var(--in-acc); }
+.crumbs { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; border-radius: 12px; box-shadow: var(--e1); font-size: 13px; color: var(--text2); }
+.crumbs button { padding: 2px 6px; border-radius: 7px; color: var(--text2); }
+.crumbs button:hover { color: var(--accent); }
+.crumbs button.cur { color: var(--text); font-weight: 600; }
+.tooltip-host { position: relative; display: inline-block; }
+.tooltip { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translate(-50%, 6px) scale(.96); background: var(--text); color: var(--bg); font-size: 12px; padding: 6px 10px; border-radius: 8px; white-space: nowrap; opacity: 0; pointer-events: none; transition: all 180ms var(--ease); }
+.tooltip-host:hover .tooltip { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.section-title { font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text2); margin: 8px 0 12px; display: flex; align-items: center; gap: 10px; }
+.section-title::after { content: ""; flex: 1; height: 2px; border-radius: 2px; box-shadow: var(--in1); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 600; color: var(--text2); padding: 8px 10px; cursor: pointer; }
+th:hover { color: var(--accent); }
+td { padding: 8px 10px; border-top: 1px solid var(--border); }
+tr.sel td { color: var(--accent); }
+
+/* ---- toasts, dialogs, boot ----------------------------------------------------------------------------------------- */
+#toasts { position: fixed; top: 56px; right: 14px; z-index: 9800; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; pointer-events: none; }
+.toast { pointer-events: auto; min-width: 260px; max-width: 340px; display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 14px; background: var(--surface); box-shadow: var(--e5); font-size: 13px; }
+.toast .ic { width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; color: #fff; flex: none; }
+.toast b { font-weight: 600; }
+#scrim { position: fixed; inset: 0; background: rgba(238, 230, 218, .62); z-index: 9900; display: none; }
+.dialog { position: fixed; z-index: 9950; left: 50%; top: 50%; width: 340px; margin: -150px 0 0 -170px; padding: 24px; border-radius: 22px; background: var(--surface); box-shadow: var(--e5); text-align: center; display: none; }
+.dialog .big { width: 64px; height: 64px; margin: 4px auto 14px; border-radius: 20px; display: grid; place-items: center; box-shadow: var(--in1); color: var(--warning); }
+.dialog p { color: var(--text2); margin: 8px 0 20px; }
+.dialog .row { justify-content: center; }
+#boot { position: fixed; inset: 0; z-index: 10000; background: var(--bg); display: grid; place-items: center; cursor: pointer; }
+#boot .box { display: flex; flex-direction: column; align-items: center; gap: 22px; }
+#boot .logo-wrap { width: 112px; height: 112px; border-radius: 34px; display: grid; place-items: center; box-shadow: var(--e4); color: var(--accent); }
+#boot .logo-wrap svg { width: 62px; height: 62px; }
+#boot h1 { font-size: 22px; letter-spacing: .02em; }
+#boot .progress { width: 220px; }
+#boot .hint { font-size: 12px; color: var(--text3); }
+#dim { position: fixed; inset: 0; pointer-events: none; z-index: 9990; background: #000; opacity: 0; transition: opacity 200ms; }
+#night { position: fixed; inset: 0; pointer-events: none; z-index: 9991; background: #FF9A3C; mix-blend-mode: multiply; opacity: 0; transition: opacity 600ms var(--ease); }
+
+/* ---- apps --------------------------------------------------------------------------------------------------------- */
+.files { display: flex; gap: 14px; flex: 1; min-height: 0; }
+.files .side { width: 170px; flex: none; display: flex; flex-direction: column; gap: 6px; padding: 10px; }
+.side-item { height: 34px; display: flex; align-items: center; gap: 9px; padding: 0 10px; border-radius: 10px; color: var(--text2); font-weight: 500; font-size: 13px; transition: box-shadow 160ms var(--ease), color 160ms; }
+.side-item:hover { color: var(--text); box-shadow: var(--e1); }
+.side-item.on { color: var(--accent); box-shadow: var(--e2); background: var(--surface); }
+.files .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 14px; padding: 14px; align-content: start; }
+.fitem { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 6px; border-radius: 14px; transition: box-shadow 160ms var(--ease), transform 160ms var(--ease); text-align: center; font-size: 12.5px; }
+.fitem:hover { box-shadow: var(--e2); }
+.fitem.sel { box-shadow: var(--in1); color: var(--accent); }
+.fitem .fi { width: 48px; height: 48px; border-radius: 14px; display: grid; place-items: center; background: var(--surface); box-shadow: var(--e2); color: var(--accent); }
+.fitem .fi.doc { color: var(--text2); }
+.fitem .fi svg.i { width: 24px; height: 24px; }
+.flist .fitem { flex-direction: row; justify-content: flex-start; padding: 6px 10px; text-align: left; }
+.flist .fitem .fi { width: 34px; height: 34px; border-radius: 10px; }
+.flist { grid-template-columns: 1fr; gap: 4px; }
+.term { flex: 1; min-height: 0; padding: 14px 16px; font: 13px/1.55 "JetBrains Mono", Consolas, monospace; color: var(--accent-strong); overflow: auto; user-select: text; cursor: text; }
+.term .line { white-space: pre-wrap; word-break: break-word; }
+.term .prompt { color: var(--accent); font-weight: 500; }
+.term .dim { color: var(--text2); }
+.term input { background: none; border: 0; outline: none; font: inherit; color: var(--text); width: 60%; caret-color: var(--accent); }
+.mon-grid { display: grid; grid-template-columns: 180px 1fr; gap: 14px; }
+.ring { position: relative; width: 150px; height: 150px; margin: 6px auto; border-radius: 50%; box-shadow: var(--e3); display: grid; place-items: center; }
+.ring svg { position: absolute; inset: 0; transform: rotate(-90deg); }
+.ring .val { font-size: 28px; font-weight: 700; }
+.ring .inner { width: 104px; height: 104px; border-radius: 50%; box-shadow: var(--in1); background: var(--inset); display: grid; place-items: center; text-align: center; }
+.set { display: flex; gap: 14px; flex: 1; min-height: 0; }
+.set .pane { flex: 1; overflow: auto; padding: 2px 6px 2px 2px; }
+.set-row { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 16px; box-shadow: var(--e1); margin-bottom: 12px; }
+.set-row .t { flex: 1; }
+.set-row .t b { display: block; font-weight: 600; }
+.set-row .t small { color: var(--text2); font-size: 12px; }
+.swatch { width: 26px; height: 26px; border-radius: 50%; box-shadow: var(--e1); transition: transform 200ms var(--bounce), box-shadow 160ms; }
+.swatch.on { transform: scale(1.18); box-shadow: var(--e1), 0 0 0 3px var(--bg), 0 0 0 5px currentColor; }
+.seg { display: inline-flex; padding: 4px; gap: 4px; border-radius: 12px; background: var(--inset); box-shadow: var(--in1); }
+.seg button { height: 28px; padding: 0 12px; border-radius: 9px; font-size: 12.5px; font-weight: 600; color: var(--text2); transition: all 180ms var(--ease); }
+.seg button.on { background: var(--surface); box-shadow: var(--e1); color: var(--accent); }
+.editor { flex: 1; min-height: 0; resize: none; border: 0; outline: none; padding: 16px; border-radius: 16px; background: var(--inset); box-shadow: var(--in1); font: 14px/1.6 Inter, sans-serif; color: var(--text); user-select: text; }
+.status { display: flex; justify-content: space-between; font-size: 12px; color: var(--text2); padding: 10px 4px 0; }
+.kit { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.kit .card { display: flex; flex-direction: column; gap: 14px; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 20px; border-radius: 16px; border: 2px dashed rgba(var(--sh), .7); text-align: center; color: var(--text2); }
+.empty .big { width: 64px; height: 64px; border-radius: 20px; display: grid; place-items: center; box-shadow: var(--e2); color: var(--text3); }
+</style>
+</head>
+<body>
+
+<!-- icons: drawn for OpalineOS (24x24, 2 px stroke, round caps) -->
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 2.8c4.6 0 8.6 3.6 8.6 8.7S16.6 21.2 12 21.2 3.4 16.6 3.4 11.5 7.4 2.8 12 2.8z"/><path d="M8.2 9.4c.9-1.8 2.4-2.8 4.3-2.9"/><circle cx="14.6" cy="14.1" r="2.4"/></symbol>
+    <symbol id="i-files" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2.5h6.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M7 10l3 2.5L7 15M12.5 15.5H17"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12 2.5-6H21"/></symbol>
+    <symbol id="i-editor" viewBox="0 0 24 24"><path d="M7 3.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4M9 12.5h6M9 16h4"/></symbol>
+    <symbol id="i-kit" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="3.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="3.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></symbol>
+    <symbol id="i-about" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.5v.2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2.5 9a14 14 0 0 1 19 0M5.8 12.6a9 9 0 0 1 12.4 0M9.1 16.2a4.2 4.2 0 0 1 5.8 0"/><circle cx="12" cy="19.5" r=".6"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+    <symbol id="i-battery" viewBox="0 0 24 24"><rect x="2.5" y="7" width="17" height="10" rx="3"/><path d="M21.5 10.5v3M6 10.5v3M9.5 10.5v3M13 10.5v3"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15zM10 20.5a2.2 2.2 0 0 0 4 0"/></symbol>
+    <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7.5l10 9-5 4.5V3l5 4.5-10 9"/></symbol>
+    <symbol id="i-plane" viewBox="0 0 24 24"><path d="M12 3c.9 0 1.5.8 1.5 1.8v5l7 4v2l-7-2v4l2 1.5v1.7L12 20l-3.5 1v-1.7l2-1.5v-4l-7 2v-2l7-4v-5C10.5 3.8 11.1 3 12 3z"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8.5M6.6 6.6a8 8 0 1 0 10.8 0"/></symbol>
+    <symbol id="i-restart" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4.5v4h-4"/></symbol>
+    <symbol id="i-min" viewBox="0 0 24 24"><path d="M6 12h12"/></symbol>
+    <symbol id="i-max" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7.6v.2"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.4v.2"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><circle cx="9" cy="10" r="1.8"/><path d="M4 17l5-4.5 4 3.5 3-2.5 4 3.5"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 19.5h14"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5M13.5 5l-3 14"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-6.5 8 6.5v8.5a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8.5 6.5H20M8.5 12H20M8.5 17.5H20M4.5 6.5h.1M4.5 12h.1M4.5 17.5h.1"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5.5M14 11v5.5"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></symbol>
+    <symbol id="i-lang" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+    <symbol id="i-motion" viewBox="0 0 24 24"><path d="M3 12h3M4.5 7.5h4M4.5 16.5h4"/><circle cx="15" cy="12" r="5.5"/></symbol>
+    <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.2 0 1.8-.9 1.4-2-.5-1.4.4-2.5 1.8-2.5H18a2.5 2.5 0 0 0 2.5-2.5A8.5 8.5 0 0 0 12 3.5z"/><circle cx="7.8" cy="11.5" r=".6"/><circle cx="10.5" cy="7.6" r=".6"/><circle cx="15" cy="8" r=".6"/></symbol>
+  </defs>
+</svg>
+
+<div id="desk"></div>
+
+<div id="bar">
+  <button id="start" title="Ctrl+Space"><svg class="i logo"><use href="#i-logo"/></svg><span data-i18n="apps">Apps</span></button>
+  <div id="tasks"></div>
+  <div id="tray">
+    <button class="tray-btn" data-qs-open title="Wi-Fi"><svg class="i s16"><use href="#i-wifi"/></svg></button>
+    <button class="tray-btn" data-qs-open><svg class="i s16"><use href="#i-volume"/></svg></button>
+    <button class="tray-btn" data-qs-open><svg class="i s16"><use href="#i-battery"/></svg><span>86%</span></button>
+    <button class="tray-btn" id="bell"><svg class="i s16"><use href="#i-bell"/></svg><span class="badge-dot" id="bell-dot"></span></button>
+    <button class="tray-btn" id="clockbtn"><span id="clock">--:--</span></button>
+  </div>
+</div>
+
+<div class="pop" id="launcher">
+  <div class="row">
+    <div class="grow" style="position:relative">
+      <svg class="i" style="position:absolute;left:13px;top:11px;color:var(--text3)"><use href="#i-search"/></svg>
+      <input class="field" id="search" data-i18n-ph="search" placeholder="Search apps" style="padding-left:40px">
+    </div>
+  </div>
+  <div class="app-grid" id="appgrid"></div>
+  <div class="power-row">
+    <div class="row grow" style="gap:10px">
+      <div class="avatar" style="width:34px;height:34px;font-size:12px">R</div>
+      <div><b style="font-size:13px">root</b><div class="caption" data-i18n="localUser">Local user</div></div>
+    </div>
+    <button class="icon-btn" id="restart" data-i18n-title="restart" title="Restart"><svg class="i"><use href="#i-restart"/></svg></button>
+    <button class="icon-btn" id="shutdown" data-i18n-title="shutdown" title="Shut down"><svg class="i"><use href="#i-power"/></svg></button>
+  </div>
+</div>
+
+<div class="pop right" id="center">
+  <div class="qs-grid" id="qs"></div>
+  <div class="col" style="margin-top:16px;gap:4px">
+    <div class="row"><svg class="i" style="color:var(--text2)"><use href="#i-sun"/></svg><div class="grow" id="bright"></div></div>
+    <div class="row"><svg class="i" style="color:var(--text2)"><use href="#i-volume"/></svg><div class="grow" id="vol"></div></div>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <b class="grow" data-i18n="notifications">Notifications</b>
+    <button class="btn ghost small" id="clearall" data-i18n="clearAll">Clear all</button>
+  </div>
+  <div id="notifs"></div>
+</div>
+
+<div id="toasts"></div>
+<div id="scrim"></div>
+<div class="dialog" id="dialog">
+  <div class="big"><svg class="i s24"><use href="#i-alert"/></svg></div>
+  <h2 id="dlg-title"></h2>
+  <p id="dlg-text"></p>
+  <div class="row"><button class="btn" id="dlg-cancel" data-i18n="cancel">Cancel</button><button class="btn primary" id="dlg-ok"></button></div>
+</div>
+<div id="dim"></div>
+<div id="night"></div>
+<div id="boot"><div class="box">
+  <div class="logo-wrap"><svg class="i"><use href="#i-logo"/></svg></div>
+  <h1>OpalineOS</h1>
+  <div class="progress"><div id="bootbar"></div></div>
+  <div class="hint" id="boothint"></div>
+</div></div>
+
+<script>
+"use strict";
+/* ===================================================================================================
+   Translations (opaline.i18n): English is the source language; pt-BR switches live.
+   =================================================================================================== */
+const STR = {
+  en: {
+    apps: "Apps", search: "Search apps", localUser: "Local user", restart: "Restart", shutdown: "Shut down",
+    notifications: "Notifications", clearAll: "Clear all", noNotif: "No notifications",
+    files: "Files", terminal: "Terminal", settings: "Settings", monitor: "System Monitor", editor: "Editor",
+    components: "Components", about: "About OpalineOS",
+    wifi: "Wi-Fi", bluetooth: "Bluetooth", airplane: "Airplane mode", night: "Night mode", on: "On", off: "Off",
+    connected: "Connected", home: "Home", documents: "Documents", music: "Music", pictures: "Pictures",
+    downloads: "Downloads", projects: "Projects", emptyFolder: "This folder is empty", items: "{n} items",
+    appearance: "Appearance", depth: "Depth of the relief", depthSub: "0 is flat, 1 is the theme, 1.5 is deeper",
+    accent: "Accent color", light: "Light comes from", left: "Top left", rightSide: "Top right",
+    contrast: "High contrast", contrastSub: "Borders around raised and sunken elements",
+    motion: "Motion", effects: "Window effects", smooth: "Smooth", fast: "Fast", none: "None",
+    reduce: "Reduce motion", reduceSub: "Replaces animations with short fades",
+    language: "Language & Region", langLabel: "Language", applyNow: "Changes apply immediately to all open apps.",
+    cpu: "CPU", memory: "Memory", disk: "Disk", processes: "Processes", name: "Name", status: "Status",
+    running: "Running", sleeping: "Sleeping", usage: "Usage",
+    buttons: "Buttons", send: "Send now", sending: "Sending...", secondary: "Secondary", unavailable: "Not available",
+    selection: "Selection", option: "Option", fields: "Text fields", email: "Email address",
+    helper: "Enter a valid email", invalid: "Invalid email format", valid: "Looks good",
+    navigation: "Navigation", overview: "Overview", details: "Details", account: "Account", review: "Review",
+    payment: "Payment", next: "Next", back: "Back", feedback: "Feedback", deleteAcc: "Delete account?",
+    sure: "Are you sure? This cannot be undone.", cancel: "Cancel", del: "Delete", deleted: "Account deleted",
+    showToast: "Show toast", showDialog: "Open dialog", saved: "File uploaded", updates: "Updates available",
+    errorConn: "Could not connect", loading: "Loading", noResults: "No results found", clearFilters: "Clear filters",
+    data: "Data display", progress: "Progress", start: "Start", welcome: "Welcome to OpalineOS",
+    welcomeSub: "Open Apps (or press Ctrl+Space) to start.", shutting: "Shutting down...",
+    turnOn: "Click anywhere to turn on", starting: "Starting...", tooltip: "More info", tipText: "Tooltips rise above everything",
+    newBadge: "New", beta: "Beta", product: "Product name", productText: "A card lifts when you point at it and sinks when you press.",
+    viewMore: "View more", untitled: "Untitled", words: "{n} words", chars: "{n} characters",
+    noteText: "Welcome to the OpalineOS mockup.\n\nEverything here is a preview of the Relief design: surfaces rise and sink with light and shadow, and every window, button and menu animates the way the real compositor will.\n\nTry it: drag windows by their title bar, double-click it to maximize, minimize into the bar at the top, and change the depth, the light and the language in Settings.",
+    effectsPreview: "Try the effect", preview: "Preview", aboutText: "Version 0.6.1-se1 · Relief design preview",
+    kernel: "Kernel", python: "Python", toolkit: "Toolkit", restartNote: "Restarting...",
+  },
+  pt: {
+    apps: "Apps", search: "Buscar apps", localUser: "Usuário local", restart: "Reiniciar", shutdown: "Desligar",
+    notifications: "Notificações", clearAll: "Limpar tudo", noNotif: "Nenhuma notificação",
+    files: "Arquivos", terminal: "Terminal", settings: "Configurações", monitor: "Monitor do Sistema", editor: "Editor",
+    components: "Componentes", about: "Sobre o OpalineOS",
+    wifi: "Wi-Fi", bluetooth: "Bluetooth", airplane: "Modo avião", night: "Modo noturno", on: "Ligado", off: "Desligado",
+    connected: "Conectado", home: "Início", documents: "Documentos", music: "Música", pictures: "Imagens",
+    downloads: "Downloads", projects: "Projetos", emptyFolder: "Esta pasta está vazia", items: "{n} itens",
+    appearance: "Aparência", depth: "Profundidade do relevo", depthSub: "0 é plano, 1 é o tema, 1,5 é mais fundo",
+    accent: "Cor de destaque", light: "A luz vem da", left: "Esquerda", rightSide: "Direita",
+    contrast: "Alto contraste", contrastSub: "Bordas em volta do que sobe e do que afunda",
+    motion: "Movimento", effects: "Efeitos de janela", smooth: "Suave", fast: "Rápido", none: "Nenhum",
+    reduce: "Reduzir movimento", reduceSub: "Troca as animações por transições curtas",
+    language: "Idioma e região", langLabel: "Idioma", applyNow: "As mudanças valem na hora para todos os apps abertos.",
+    cpu: "CPU", memory: "Memória", disk: "Disco", processes: "Processos", name: "Nome", status: "Estado",
+    running: "Executando", sleeping: "Dormindo", usage: "Uso",
+    buttons: "Botões", send: "Enviar agora", sending: "Enviando...", secondary: "Secundário", unavailable: "Indisponível",
+    selection: "Seleção", option: "Opção", fields: "Campos de texto", email: "Endereço de e-mail",
+    helper: "Digite um e-mail válido", invalid: "Formato de e-mail inválido", valid: "Tudo certo",
+    navigation: "Navegação", overview: "Visão geral", details: "Detalhes", account: "Conta", review: "Revisão",
+    payment: "Pagamento", next: "Próximo", back: "Voltar", feedback: "Retorno", deleteAcc: "Excluir a conta?",
+    sure: "Tem certeza? Isso não pode ser desfeito.", cancel: "Cancelar", del: "Excluir", deleted: "Conta excluída",
+    showToast: "Mostrar aviso", showDialog: "Abrir diálogo", saved: "Arquivo enviado", updates: "Atualizações disponíveis",
+    errorConn: "Não foi possível conectar", loading: "Carregando", noResults: "Nenhum resultado", clearFilters: "Limpar filtros",
+    data: "Exibição de dados", progress: "Progresso", start: "Iniciar", welcome: "Bem-vindo ao OpalineOS",
+    welcomeSub: "Abra Apps (ou Ctrl+Espaço) para começar.", shutting: "Desligando...",
+    turnOn: "Clique em qualquer lugar para ligar", starting: "Iniciando...", tooltip: "Mais informações", tipText: "Dicas ficam acima de tudo",
+    newBadge: "Novo", beta: "Beta", product: "Nome do produto", productText: "Um card sobe quando você aponta para ele e afunda quando você pressiona.",
+    viewMore: "Ver mais", untitled: "Sem título", words: "{n} palavras", chars: "{n} caracteres",
+    noteText: "Bem-vindo à prévia do OpalineOS.\n\nTudo aqui mostra o design Relief: as superfícies sobem e afundam com luz e sombra, e cada janela, botão e menu se move do jeito que o compositor de verdade vai mover.\n\nExperimente: arraste as janelas pela barra de título, clique duas vezes nela para maximizar, minimize para a barra lá em cima e mude a profundidade, a luz e o idioma em Configurações.",
+    effectsPreview: "Testar o efeito", preview: "Prévia", aboutText: "Versão 0.6.1-se1 · prévia do design Relief",
+    kernel: "Kernel", python: "Python", toolkit: "Toolkit", restartNote: "Reiniciando...",
+  },
+};
+let lang = "en";
+const t = (k, vars) => {
+  let s = (STR[lang][k] ?? STR.en[k] ?? k);
+  if (vars) for (const [a, b] of Object.entries(vars)) s = s.replace("{" + a + "}", b);
+  return s;
+};
+const langListeners = [];
+function applyLang() {
+  document.documentElement.lang = lang === "pt" ? "pt-BR" : "en";
+  document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+  document.querySelectorAll("[data-i18n-ph]").forEach(el => el.placeholder = t(el.dataset.i18nPh));
+  document.querySelectorAll("[data-i18n-title]").forEach(el => el.title = t(el.dataset.i18nTitle));
+  langListeners.forEach(fn => fn());
+  tickClock();
+}
+
+/* ===================================================================================================
+   Helpers
+   =================================================================================================== */
+const $ = (sel, root = document) => root.querySelector(sel);
+const icon = (name, cls = "") => `<svg class="i ${cls}"><use href="#i-${name}"/></svg>`;
+function h(html) { const d = document.createElement("div"); d.innerHTML = html.trim(); return d.firstElementChild; }
+const prefs = { effects: "smooth", reduce: matchMedia("(prefers-reduced-motion: reduce)").matches };
+const mode = () => prefs.reduce ? "fade" : prefs.effects;
+
+/* A damped spring sampled into keyframe progress values (what rl.curves.spring describes). */
+function springSteps(stiffness = 380, damping = 26) {
+  let x = 0, v = 0; const out = [0]; const dt = 1 / 120;
+  for (let i = 0; i < 240; i++) {
+    const a = stiffness * (1 - x) - damping * v; v += a * dt; x += v * dt;
+    if (i % 2) out.push(x);
+    if (i > 40 && Math.abs(1 - x) < 0.001 && Math.abs(v) < 0.01) break;
+  }
+  out.push(1); return out;
+}
+const SPRING = springSteps();
+const springMs = () => Math.round(SPRING.length * 1000 / 60);
+function springFrames(fn) { return SPRING.map((p, i) => ({ ...fn(p), offset: i / (SPRING.length - 1) })); }
+
+/* Slider component */
+function makeSlider(host, { value = .5, min = 0, max = 1, step = 0, fmt = v => Math.round(v * 100) + "%", onChange }) {
+  host.classList.add("slider");
+  host.innerHTML = `<div class="track"></div><div class="fill"></div><div class="knob"></div><div class="tip"></div>`;
+  const fill = $(".fill", host), knob = $(".knob", host), tip = $(".tip", host);
+  const set = (v, fire) => {
+    v = Math.min(max, Math.max(min, v)); if (step) v = Math.round(v / step) * step;
+    const pct = (v - min) / (max - min) * 100;
+    fill.style.width = pct + "%"; knob.style.left = pct + "%"; tip.style.left = pct + "%"; tip.textContent = fmt(v);
+    host.value = v; if (fire && onChange) onChange(v);
+  };
+  const fromEvent = e => { const r = host.getBoundingClientRect(); set(min + (e.clientX - r.left) / r.width * (max - min), true); };
+  host.addEventListener("pointerdown", e => { host.setPointerCapture(e.pointerId); fromEvent(e); host.onpointermove = fromEvent; });
+  host.addEventListener("pointerup", () => host.onpointermove = null);
+  set(value, false); host.set = set; return host;
+}
+function makeSwitch(on, onChange) {
+  const s = h(`<div class="switch ${on ? "on" : ""}" role="switch" tabindex="0"></div>`);
+  s.addEventListener("click", () => { s.classList.toggle("on"); onChange?.(s.classList.contains("on")); });
+  return s;
+}
+
+/* ===================================================================================================
+   Popovers, toasts, dialogs
+   =================================================================================================== */
+let openPop = null;
+function showPop(pop, btn) {
+  if (openPop === pop) return hidePop();
+  hidePop(true);
+  openPop = pop; pop._btn = btn; btn?.classList.add("on");
+  pop.style.display = "block";
+  pop.animate(mode() === "none" ? [{}] : mode() === "fade" ? [{ opacity: 0 }, { opacity: 1 }] :
+    springFrames(p => ({ opacity: Math.min(1, p * 1.6), transform: `translateY(${(1 - p) * -8}px) scale(${.96 + .04 * p})` })),
+    { duration: mode() === "smooth" ? springMs() : 120, easing: "linear" });
+  if (pop.id === "launcher") setTimeout(() => $("#search").focus(), 30);
+}
+function hidePop(instant) {
+  const pop = openPop; if (!pop) return;
+  openPop = null; pop._btn?.classList.remove("on");
+  if (instant || mode() === "none") { pop.style.display = "none"; return; }
+  pop.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateY(-6px) scale(.97)" }],
+    { duration: 140, easing: "cubic-bezier(.4,0,1,1)" }).onfinish = () => { if (openPop !== pop) pop.style.display = "none"; };
+}
+document.addEventListener("pointerdown", e => {
+  if (openPop && !openPop.contains(e.target) && !openPop._btn?.contains(e.target)) hidePop();
+});
+
+const KINDS = { success: ["var(--success)", "check"], info: ["var(--info)", "info"], error: ["var(--error)", "alert"], warning: ["var(--warning)", "alert"] };
+function toast(text, kind = "info", title = "") {
+  const [color, ic] = KINDS[kind];
+  const el = h(`<div class="toast"><div class="ic" style="background:${color}">${icon(ic, "s16")}</div><div class="grow">${title ? `<b>${title}</b> ` : ""}${text}</div></div>`);
+  $("#toasts").prepend(el);
+  el.animate(mode() === "smooth" ? springFrames(p => ({ opacity: Math.min(1, p * 2), transform: `translateX(${(1 - p) * 60}px)` }))
+    : [{ opacity: 0 }, { opacity: 1 }], { duration: mode() === "smooth" ? springMs() : 120 });
+  const leave = () => {
+    if (el._gone) return; el._gone = true;
+    const a = el.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateX(60px)" }], { duration: 200, easing: "cubic-bezier(.4,0,1,1)" });
+    a.onfinish = () => {
+      const hgt = el.offsetHeight + 10;
+      el.style.visibility = "hidden";
+      el.animate([{ marginTop: 0 }, { marginTop: -hgt + "px" }], { duration: 180, easing: "ease" }).onfinish = () => el.remove();
+    };
+  };
+  el.addEventListener("click", leave); setTimeout(leave, 3800);
+  addNotif(text, ic, kind);
+}
+
+let dialogResolve = null;
+function dialog(title, text, okText, danger = false) {
+  $("#dlg-title").textContent = title; $("#dlg-text").textContent = text;
+  const ok = $("#dlg-ok"); ok.textContent = okText; ok.className = "btn primary" + (danger ? " danger" : "");
+  const scrim = $("#scrim"), dlg = $("#dialog");
+  scrim.style.display = "block"; dlg.style.display = "block";
+  scrim.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 180 });
+  dlg.animate(mode() === "smooth" ? springFrames(p => ({ opacity: Math.min(1, p * 1.8), transform: `scale(${.9 + .1 * p})` }))
+    : [{ opacity: 0 }, { opacity: 1 }], { duration: mode() === "smooth" ? springMs() : 120 });
+  return new Promise(res => dialogResolve = res);
+}
+function closeDialog(result) {
+  const scrim = $("#scrim"), dlg = $("#dialog");
+  scrim.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 160 }).onfinish = () => scrim.style.display = "none";
+  dlg.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "scale(.94)" }], { duration: 150, easing: "cubic-bezier(.4,0,1,1)" })
+    .onfinish = () => dlg.style.display = "none";
+  dialogResolve?.(result); dialogResolve = null;
+}
+$("#dlg-ok").onclick = () => closeDialog(true);
+$("#dlg-cancel").onclick = () => closeDialog(false);
+$("#scrim").onclick = () => closeDialog(false);
+
+/* ===================================================================================================
+   Window manager (what the compositor does with opaline-relief's effect descriptions)
+   =================================================================================================== */
+const desk = $("#desk"), tasks = $("#tasks");
+const wins = new Map();   // app id -> window record
+let zTop = 10, cascade = 0;
+const workArea = () => ({ x: 10, y: 54, w: Math.max(340, innerWidth - 20), h: Math.max(240, innerHeight - 64) });
+addEventListener("resize", () => {   /* the screen changed size: maximized windows follow it */
+  for (const w of wins.values()) if (w.max) setRect(w.el, workArea());
+});
+
+function rectOf(el) { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }
+function setRect(el, r) { Object.assign(el.style, { left: r.x + "px", top: r.y + "px", width: r.w + "px", height: r.h + "px" }); }
+function flipFrom(el, from, duration, easing) {   /* animate from an old rect to the current one */
+  const to = rectOf(el);
+  const sx = from.w / to.w, sy = from.h / to.h;
+  return el.animate([{ transformOrigin: "0 0", transform: `translate(${from.x - to.x}px, ${from.y - to.y}px) scale(${sx}, ${sy})` },
+                     { transformOrigin: "0 0", transform: "none" }], { duration, easing });
+}
+
+function focusWin(w) {
+  if (!w || w.min) return;
+  for (const o of wins.values()) { o.el.classList.toggle("inactive", o !== w); o.pill.classList.toggle("active", o === w && !o.min); }
+  w.el.style.zIndex = ++zTop;
+}
+function topVisible() { let best = null; for (const w of wins.values()) if (!w.min && (!best || +w.el.style.zIndex > +best.el.style.zIndex)) best = w; return best; }
+
+function openApp(id) {
+  hidePop();
+  const app = APPS[id];
+  const existing = wins.get(id);
+  if (existing) { existing.min ? restore(existing) : (focusWin(existing), nudge(existing)); return; }
+  const el = h(`<div class="win"><div class="titlebar"><div class="ttl">${icon(app.icon, "s16")}<span data-i18n="${id}">${t(id)}</span></div>
+    <div class="wbtns"><button class="wb min" title="Minimize">${icon("min")}</button><button class="wb max" title="Maximize">${icon("max")}</button><button class="wb close" title="Close">${icon("close")}</button></div></div>
+    <div class="wbody"></div><div class="resize"></div></div>`);
+  const wa = workArea();
+  const w = Math.max(320, Math.min(app.w, wa.w - 40)), hh = Math.max(220, Math.min(app.h, wa.h - 30));
+  const r = { x: Math.round(wa.x + (wa.w - w) / 2 + (cascade % 5) * 28 - 56), y: Math.round(wa.y + Math.max(0, (wa.h - hh) / 2 - 20) + (cascade % 5) * 24 - 30), w, h: hh };
+  r.y = Math.max(wa.y, r.y); r.x = Math.max(wa.x, r.x); cascade++;
+  setRect(el, r);
+  desk.append(el);
+  const pill = h(`<button class="task">${icon(app.icon)}<span data-i18n="${id}">${t(id)}</span></button>`);
+  tasks.append(pill);
+  pill.animate(mode() === "smooth" ? springFrames(p => ({ opacity: Math.min(1, p * 2), transform: `scale(${.6 + .4 * p})` })) : [{ opacity: 0 }, { opacity: 1 }],
+    { duration: mode() === "smooth" ? springMs() : 120 });
+  const rec = { id, el, pill, min: false, max: false, restoreRect: null };
+  wins.set(id, rec);
+  app.build($(".wbody", el), rec);
+  wireWindow(rec);
+  focusWin(rec);
+  const m = mode();
+  if (m === "smooth") el.animate(springFrames(p => ({ opacity: Math.min(1, p * 1.7), transform: `translateY(${(1 - p) * 22}px) scale(${.92 + .08 * p})` })), { duration: springMs() });
+  else if (m !== "none") el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: m === "fast" ? 110 : 120 });
+}
+
+function nudge(w) {   /* already open: a small bounce says "here it is" */
+  if (mode() === "none") return;
+  w.el.animate(springFrames(p => ({ transform: `scale(${1 + .03 * Math.sin(p * Math.PI)})` })), { duration: 300 });
+}
+
+function closeWin(w) {
+  const m = mode();
+  const finish = () => { w.el.remove(); wins.delete(w.id); APPS[w.id].onClose?.(w); focusWin(topVisible()); };
+  w.pill.animate([{ opacity: 1, transform: "none", maxWidth: w.pill.offsetWidth + "px" }, { opacity: 0, transform: "scale(.6)", maxWidth: "0px", paddingLeft: 0, paddingRight: 0 }],
+    { duration: m === "none" ? 1 : 220, easing: "ease" }).onfinish = () => w.pill.remove();
+  if (m === "none") return finish();
+  w.el.style.pointerEvents = "none";
+  w.el.animate(m === "smooth" ? [{ opacity: 1, transform: "none" }, { opacity: 0, transform: "scale(.94)" }] : [{ opacity: 1 }, { opacity: 0 }],
+    { duration: m === "smooth" ? 170 : 100, easing: "cubic-bezier(.4,0,1,1)" }).onfinish = finish;
+}
+
+function minimize(w) {
+  if (w.min) return;
+  w.min = true; w.pill.classList.add("min"); w.pill.classList.remove("active");
+  const m = mode();
+  const done = () => { w.el.style.display = "none"; focusWin(topVisible()); };
+  if (m === "none") return done();
+  if (m !== "smooth") { w.el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120 }).onfinish = done; return; }
+  const from = rectOf(w.el), to = rectOf(w.pill);
+  w.el.animate([{ transformOrigin: "0 0", transform: "none", opacity: 1 },
+                { transformOrigin: "0 0", transform: `translate(${to.x - from.x}px, ${to.y - from.y}px) scale(${to.w / from.w}, ${to.h / from.h})`, opacity: .15 }],
+    { duration: 340, easing: "cubic-bezier(.5,0,.3,1)" }).onfinish = done;
+  w.pill.animate([{ transform: "scale(1)" }, { transform: "scale(1.12)" }, { transform: "scale(1)" }], { duration: 260, delay: 260 });
+}
+
+function restore(w) {
+  if (!w.min) return;
+  w.min = false; w.pill.classList.remove("min");
+  w.el.style.display = "flex";
+  focusWin(w);
+  const m = mode();
+  if (m === "none") return;
+  if (m !== "smooth") { w.el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 120 }); return; }
+  const to = rectOf(w.el), from = rectOf(w.pill);
+  w.el.animate(springFrames(p => ({ transformOrigin: "0 0", opacity: Math.min(1, .15 + p),
+    transform: `translate(${(from.x - to.x) * (1 - p)}px, ${(from.y - to.y) * (1 - p)}px) scale(${from.w / to.w + (1 - from.w / to.w) * p}, ${from.h / to.h + (1 - from.h / to.h) * p})` })),
+    { duration: springMs() });
+}
+
+function toggleMax(w) {
+  const from = rectOf(w.el);
+  if (w.max) { setRect(w.el, w.restoreRect); w.max = false; w.el.classList.remove("max"); }
+  else { w.restoreRect = from; const wa = workArea(); setRect(w.el, { x: wa.x, y: wa.y, w: wa.w, h: wa.h }); w.max = true; w.el.classList.add("max"); }
+  const m = mode();
+  if (m === "none") return;
+  if (m === "smooth") flipFrom(w.el, from, 280, "cubic-bezier(.2,.8,.2,1)");
+  else w.el.animate([{ opacity: .6 }, { opacity: 1 }], { duration: 120 });
+  APPS[w.id].onResize?.(w);
+}
+
+function wireWindow(w) {
+  const el = w.el, bar = $(".titlebar", el);
+  el.addEventListener("pointerdown", () => focusWin(w), true);
+  $(".wb.close", el).onclick = () => closeWin(w);
+  $(".wb.min", el).onclick = () => minimize(w);
+  $(".wb.max", el).onclick = () => toggleMax(w);
+  bar.addEventListener("dblclick", e => { if (!e.target.closest(".wb")) toggleMax(w); });
+  bar.addEventListener("pointerdown", e => {
+    if (e.target.closest(".wb") || e.button !== 0) return;
+    const start = { x: e.clientX, y: e.clientY }, r0 = rectOf(el);
+    let moved = false;
+    bar.setPointerCapture(e.pointerId);
+    bar.onpointermove = ev => {
+      const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
+      if (!moved && Math.hypot(dx, dy) < 4) return;
+      if (!moved) {
+        moved = true; el.classList.add("dragging");
+        if (w.max) {   /* dragging a maximized window: it comes back to its size under the pointer */
+          w.max = false; el.classList.remove("max");
+          const rr = w.restoreRect; r0.x = start.x - rr.w * ((start.x - r0.x) / r0.w); r0.w = rr.w; r0.h = rr.h; setRect(el, r0);
+        }
+        if (mode() !== "none") el.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }], { duration: 120, fill: "forwards" });
+      }
+      const wa = workArea();
+      el.style.left = Math.min(innerWidth - 80, Math.max(-r0.w + 80, r0.x + dx)) + "px";
+      el.style.top = Math.min(innerHeight - 50, Math.max(wa.y - 4, r0.y + dy)) + "px";
+    };
+    bar.onpointerup = () => {
+      bar.onpointermove = bar.onpointerup = null;
+      if (!moved) return;
+      el.classList.remove("dragging");
+      el.getAnimations().forEach(a => a.cancel());
+      if (mode() !== "none") el.animate([{ transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 160 });
+    };
+  });
+  const rz = $(".resize", el);
+  rz.addEventListener("pointerdown", e => {
+    e.stopPropagation(); rz.setPointerCapture(e.pointerId);
+    const s = { x: e.clientX, y: e.clientY }, r0 = rectOf(el);
+    rz.onpointermove = ev => { el.style.width = Math.max(320, r0.w + ev.clientX - s.x) + "px"; el.style.height = Math.max(200, r0.h + ev.clientY - s.y) + "px"; APPS[w.id].onResize?.(w); };
+    rz.onpointerup = () => rz.onpointermove = rz.onpointerup = null;
+  });
+  w.pill.onclick = () => {
+    if (w.min) restore(w);
+    else if (w.pill.classList.contains("active")) minimize(w);
+    else focusWin(w);
+  };
+}
+
+/* ===================================================================================================
+   Apps
+   =================================================================================================== */
+const APPS = {};
+
+/* ---- Files ---- */
+const TREE = {
+  home: { icon: "home", kids: ["documents", "music", "pictures", "downloads", "projects", "welcome.txt"] },
+  documents: { icon: "files", kids: ["welcome.txt", "ação.txt", "budget.ods", "letter.odt"] },
+  music: { icon: "music", kids: ["focus.ogg", "rain.ogg", "piano.flac"] },
+  pictures: { icon: "image", kids: ["opal.png", "sunset.jpg", "desk.png", "notes.png"] },
+  downloads: { icon: "down", kids: [] },
+  projects: { icon: "code", kids: ["kernel.c", "main.py", "README.md"] },
+};
+APPS.files = { icon: "files", w: 760, h: 500, build(body) {
+  let cur = "home", list = false, history = ["home"], pos = 0;
+  body.innerHTML = `<div class="files"><div class="side panel"></div><div class="main">
+    <div class="row"><button class="icon-btn back">${icon("left")}</button><button class="icon-btn fwd">${icon("right")}</button>
+    <div class="crumbs grow" style="justify-content:flex-start"></div>
+    <div class="seg"><button class="vg on">${icon("grid", "s16")}</button><button class="vl">${icon("list", "s16")}</button></div></div>
+    <div class="panel scroll grow" style="min-height:0"><div class="fgrid"></div></div>
+    <div class="caption count" style="padding-left:4px"></div></div></div>`;
+  const side = $(".side", body), grid = $(".fgrid", body), crumbs = $(".crumbs", body);
+  const go = (dir, push = true) => {
+    if (!TREE[dir]) { openApp("editor"); return; }
+    if (push) { history = history.slice(0, pos + 1); history.push(dir); pos = history.length - 1; }
+    cur = dir; render(true);
+  };
+  const render = (animate) => {
+    side.innerHTML = Object.keys(TREE).map(k => `<button class="side-item ${k === cur ? "on" : ""}" data-k="${k}">${icon(TREE[k].icon, "s16")}<span>${t(k)}</span></button>`).join("");
+    crumbs.innerHTML = `<button data-k="home" class="${cur === "home" ? "cur" : ""}">${t("home")}</button>` + (cur !== "home" ? ` / <button class="cur">${t(cur)}</button>` : "");
+    const kids = TREE[cur].kids;
+    grid.className = "fgrid" + (list ? " flist" : "");
+    grid.innerHTML = kids.length ? kids.map(k => {
+      const isDir = !!TREE[k];
+      const ic = isDir ? TREE[k].icon : /\.(ogg|flac)$/.test(k) ? "music" : /\.(png|jpg)$/.test(k) ? "image" : /\.(c|py|md)$/.test(k) ? "code" : "doc";
+      return `<button class="fitem" data-k="${k}"><div class="fi ${isDir ? "" : "doc"}">${icon(ic)}</div><span>${isDir ? t(k) : k}</span></button>`;
+    }).join("") : `<div class="empty" style="grid-column:1/-1;margin:30px"><div class="big">${icon("files", "s24")}</div><b>${t("emptyFolder")}</b></div>`;
+    $(".count", body).textContent = t("items", { n: kids.length });
+    if (animate && mode() === "smooth") [...grid.children].forEach((c, i) => c.animate([{ opacity: 0, transform: "translateY(8px)" }, { opacity: 1, transform: "none" }],
+      { duration: 260, delay: i * 35, easing: "cubic-bezier(.2,.8,.2,1)", fill: "backwards" }));
+  };
+  side.onclick = e => { const b = e.target.closest("[data-k]"); if (b) go(b.dataset.k); };
+  crumbs.onclick = e => { const b = e.target.closest("[data-k]"); if (b) go(b.dataset.k); };
+  grid.onclick = e => { const b = e.target.closest(".fitem"); if (!b) return; grid.querySelectorAll(".sel").forEach(x => x.classList.remove("sel")); b.classList.add("sel"); };
+  grid.ondblclick = e => { const b = e.target.closest(".fitem"); if (b) go(b.dataset.k); };
+  $(".back", body).onclick = () => { if (pos > 0) go(history[--pos], false); };
+  $(".fwd", body).onclick = () => { if (pos < history.length - 1) go(history[++pos], false); };
+  $(".vg", body).onclick = () => { list = false; $(".vg", body).classList.add("on"); $(".vl", body).classList.remove("on"); render(true); };
+  $(".vl", body).onclick = () => { list = true; $(".vl", body).classList.add("on"); $(".vg", body).classList.remove("on"); render(true); };
+  langListeners.push(() => body.isConnected && render(false));
+  render(true);
+} };
+
+/* ---- Terminal ---- */
+APPS.terminal = { icon: "terminal", w: 640, h: 400, build(body, w) {
+  body.innerHTML = `<div class="term panel scroll"></div>`;
+  const term = $(".term", body);
+  let cwd = "/home";
+  const out = s => { const d = h(`<div class="line"></div>`); d.textContent = s; term.append(d); };
+  const dim = s => { const d = h(`<div class="line dim"></div>`); d.textContent = s; term.append(d); };
+  const prompt = () => {
+    const line = h(`<div class="line"><span class="prompt">opaline:${cwd}$ </span><input spellcheck="false" autocomplete="off"></div>`);
+    term.append(line); const inp = $("input", line); inp.focus();
+    inp.onkeydown = e => {
+      if (e.key !== "Enter") return;
+      const cmd = inp.value.trim(); inp.replaceWith(document.createTextNode(cmd)); run(cmd);
+    };
+  };
+  const run = cmd => {
+    const [c, ...args] = cmd.split(/\s+/);
+    switch (c) {
+      case "": break;
+      case "help": dim("Commands: help, ls, cd DIR, pwd, uname -a, date, echo TEXT, whoami, about, open APP, clear, exit"); break;
+      case "ls": { const dir = cwd === "/home" ? "home" : cwd.split("/").pop(); const k = TREE[dir]?.kids ?? []; out(k.map(x => TREE[x] ? x + "/" : x).join("   ") || ""); break; }
+      case "cd": { const d = args[0]; if (!d || d === "~" || d === "/home") cwd = "/home"; else if (TREE[d.replace(/\/$/, "")]) cwd = "/home/" + d.replace(/\/$/, ""); else if (d === "..") cwd = "/home"; else out(`cd: ${d}: ENOENT (no such file or directory)`); break; }
+      case "pwd": out(cwd); break;
+      case "uname": out(args[0] === "-a" ? "OpalineOS opaline 0.6.1-se1 #1 OpalineOS x86_64" : "OpalineOS"); break;
+      case "date": out(new Date().toUTCString()); break;
+      case "echo": out(args.join(" ")); break;
+      case "whoami": out("root"); break;
+      case "about": dim("OpalineOS 0.6.1-se1 — kernel in C, musl, POSIX; Python and opaline-relief come next."); break;
+      case "open": if (APPS[args[0]]) openApp(args[0]); else out("open: apps are " + Object.keys(APPS).join(", ")); break;
+      case "clear": term.innerHTML = ""; break;
+      case "exit": closeWin(w); return;
+      default: out(`${c}: command not found`);
+    }
+    prompt(); term.scrollTop = term.scrollHeight;
+  };
+  dim("OpalineOS 0.6.1-se1 (tty) — type \"help\"");
+  dim("Try: uname -a, ls, open settings");
+  term.onclick = () => $("input", term)?.focus();
+  prompt();
+} };
+
+/* ---- System Monitor ---- */
+APPS.monitor = { icon: "monitor", w: 700, h: 470, build(body, w) {
+  body.innerHTML = `<div class="mon-grid"><div class="card" style="padding:12px"><div class="label" data-i18n="cpu">${t("cpu")}</div>
+      <div class="ring"><svg viewBox="0 0 150 150"><circle cx="75" cy="75" r="62" fill="none" stroke="rgba(var(--sh),.25)" stroke-width="10"/>
+      <circle class="arc" cx="75" cy="75" r="62" fill="none" stroke="var(--accent)" stroke-width="10" stroke-linecap="round" stroke-dasharray="389.6" stroke-dashoffset="389.6" style="transition:stroke-dashoffset 700ms cubic-bezier(.2,.8,.2,1)"/></svg>
+      <div class="inner"><div><div class="val">0%</div><div class="caption" data-i18n="usage">${t("usage")}</div></div></div></div></div>
+    <div class="col"><div class="card" style="padding:12px 14px;flex:1;display:flex;flex-direction:column;gap:6px">
+      <div class="row"><span class="label grow" data-i18n="cpu">${t("cpu")}</span><span class="caption">60 s</span></div>
+      <canvas class="panel" style="width:100%;flex:1;min-height:110px"></canvas></div>
+      <div class="row" style="gap:14px"><div class="card grow" style="padding:12px 14px"><div class="row"><span class="label grow" data-i18n="memory">${t("memory")}</span><b class="mem">0%</b></div><div class="progress" style="margin-top:10px"><div class="memb"></div></div></div>
+      <div class="card grow" style="padding:12px 14px"><div class="row"><span class="label grow" data-i18n="disk">${t("disk")}</span><b>38%</b></div><div class="progress" style="margin-top:10px"><div style="width:38%"></div></div></div></div></div></div>
+    <div class="section-title" style="margin-top:16px" data-i18n="processes">${t("processes")}</div>
+    <div class="panel scroll" style="flex:1;min-height:0;padding:4px 8px"><table><thead><tr><th data-s="name" data-i18n="name">${t("name")}</th><th data-s="pid">PID</th><th data-s="cpu" data-i18n="cpu">CPU</th><th data-s="mem" data-i18n="memory">${t("memory")}</th><th data-i18n="status">${t("status")}</th></tr></thead><tbody></tbody></table></div>`;
+  const canvas = $("canvas", body), ctx = canvas.getContext("2d"), hist = Array(60).fill(0);
+  const procs = [["kernel", 0], ["sh", 31], ["compositor", 12], ["files", 44], ["terminal", 45], ["monitor", 46], ["posixtest", 52], ["python3", 58]]
+    .map(([name, pid]) => ({ name, pid, cpu: 0, mem: Math.round(2 + Math.random() * 60) }));
+  let sortKey = "cpu";
+  $("thead", body).onclick = e => { const th = e.target.closest("[data-s]"); if (th) { sortKey = th.dataset.s; table(); } };
+  const table = () => {
+    const rows = [...procs].sort((a, b) => sortKey === "name" ? a.name.localeCompare(b.name) : b[sortKey] - a[sortKey]);
+    $("tbody", body).innerHTML = rows.map((p, i) => `<tr class="${i === 0 ? "sel" : ""}"><td>${p.name}</td><td>${p.pid}</td><td>${p.cpu.toFixed(1)}%</td><td>${p.mem} MiB</td><td>${t(p.cpu > 1 ? "running" : "sleeping")}</td></tr>`).join("");
+  };
+  const draw = () => {
+    const dpr = devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr; ctx.scale(dpr, dpr);
+    const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
+    ctx.lineWidth = 2.5; ctx.strokeStyle = accent; ctx.lineJoin = "round";
+    const grad = ctx.createLinearGradient(0, 0, 0, H); grad.addColorStop(0, accent + "40"); grad.addColorStop(1, accent + "00");
+    ctx.beginPath();
+    hist.forEach((v, i) => { const x = i / (hist.length - 1) * W, y = H - 8 - v / 100 * (H - 16); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke(); ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.fillStyle = grad; ctx.fill();
+  };
+  const tick = () => {
+    if (!body.isConnected) return clearInterval(timer);
+    const cpu = Math.max(3, Math.min(97, (hist.at(-1) || 20) + (Math.random() - .5) * 30));
+    hist.push(cpu); hist.shift();
+    $(".arc", body).style.strokeDashoffset = 389.6 * (1 - cpu / 100);
+    $(".val", body).textContent = Math.round(cpu) + "%";
+    const mem = 41 + Math.round(Math.random() * 6); $(".mem", body).textContent = mem + "%"; $(".memb", body).style.width = mem + "%";
+    procs.forEach(p => p.cpu = Math.max(0, p.name === "monitor" ? 2 + Math.random() * 3 : Math.random() < .5 ? 0 : Math.random() * cpu / 3));
+    table(); draw();
+  };
+  const timer = setInterval(tick, 1000); tick();
+  APPS.monitor.onResize = () => draw();
+  langListeners.push(() => body.isConnected && table());
+} };
+
+/* ---- Editor ---- */
+APPS.editor = { icon: "editor", w: 600, h: 440, build(body) {
+  body.innerHTML = `<textarea class="editor scroll" spellcheck="false"></textarea><div class="status"><span class="wc"></span><span>UTF-8 · LF</span></div>`;
+  const ta = $("textarea", body); ta.value = t("noteText");
+  const count = () => { const v = ta.value; $(".wc", body).textContent = t("words", { n: (v.match(/\S+/g) || []).length }) + " · " + t("chars", { n: v.length }); };
+  ta.oninput = count; count();
+  langListeners.push(() => { if (body.isConnected) { if (ta.value === STR.en.noteText || ta.value === STR.pt.noteText) ta.value = t("noteText"); count(); } });
+} };
+
+/* ---- Settings ---- */
+APPS.settings = { icon: "settings", w: 720, h: 540, build(body) {
+  body.innerHTML = `<div class="set"><div class="side panel" style="width:190px;padding:10px;display:flex;flex-direction:column;gap:6px">
+      <button class="side-item on" data-p="appearance">${icon("palette", "s16")}<span data-i18n="appearance">${t("appearance")}</span></button>
+      <button class="side-item" data-p="motion">${icon("motion", "s16")}<span data-i18n="motion">${t("motion")}</span></button>
+      <button class="side-item" data-p="language">${icon("lang", "s16")}<span data-i18n="language">${t("language")}</span></button>
+      <button class="side-item" data-p="about">${icon("about", "s16")}<span data-i18n="about">${t("about")}</span></button></div>
+    <div class="pane scroll"></div></div>`;
+  const pane = $(".pane", body);
+  const root = document.documentElement.style;
+  const pages = {
+    appearance() {
+      pane.innerHTML = `<div class="section-title" data-i18n="appearance">${t("appearance")}</div>
+        <div class="set-row"><div class="t"><b data-i18n="depth">${t("depth")}</b><small data-i18n="depthSub">${t("depthSub")}</small></div><div class="depth" style="width:200px"></div></div>
+        <div class="set-row"><div class="t"><b data-i18n="accent">${t("accent")}</b></div><div class="row sw"></div></div>
+        <div class="set-row"><div class="t"><b data-i18n="light">${t("light")}</b></div><div class="seg lt"><button data-v="1" data-i18n="left">${t("left")}</button><button data-v="-1" data-i18n="rightSide">${t("rightSide")}</button></div></div>
+        <div class="set-row"><div class="t"><b data-i18n="contrast">${t("contrast")}</b><small data-i18n="contrastSub">${t("contrastSub")}</small></div><div class="hc"></div></div>`;
+      makeSlider($(".depth", pane), { value: +getComputedStyle(document.documentElement).getPropertyValue("--depth") || 1, min: 0, max: 1.5, step: .05,
+        fmt: v => v.toFixed(2), onChange: v => root.setProperty("--depth", v) });
+      const accents = [["#1E5D59", "#164744", "30, 93, 89"], ["#9A5B3C", "#7D4930", "154, 91, 60"], ["#5B4E86", "#483D6C", "91, 78, 134"], ["#3D5A73", "#2F475B", "61, 90, 115"], ["#7A6A2E", "#5F5323", "122, 106, 46"]];
+      const cur = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim().toUpperCase();
+      $(".sw", pane).innerHTML = accents.map(([c]) => `<button class="swatch ${c === cur ? "on" : ""}" data-c="${c}" style="background:${c};color:${c}"></button>`).join("");
+      $(".sw", pane).onclick = e => {
+        const b = e.target.closest(".swatch"); if (!b) return;
+        const a = accents.find(x => x[0] === b.dataset.c);
+        root.setProperty("--accent", a[0]); root.setProperty("--accent-strong", a[1]); root.setProperty("--accent-rgb", a[2]);
+        $(".sw", pane).querySelectorAll(".swatch").forEach(s => s.classList.toggle("on", s === b));
+      };
+      const lx = getComputedStyle(document.documentElement).getPropertyValue("--lx").trim() || "1";
+      $(".lt", pane).querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.v === lx));
+      $(".lt", pane).onclick = e => { const b = e.target.closest("button"); if (!b) return; root.setProperty("--lx", b.dataset.v); $(".lt", pane).querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); };
+      $(".hc", pane).append(makeSwitch(document.documentElement.style.getPropertyValue("--hcw") === "1px", on => root.setProperty("--hcw", on ? "1px" : "0px")));
+    },
+    motion() {
+      pane.innerHTML = `<div class="section-title" data-i18n="motion">${t("motion")}</div>
+        <div class="set-row"><div class="t"><b data-i18n="effects">${t("effects")}</b></div><div class="seg ef"><button data-v="smooth" data-i18n="smooth">${t("smooth")}</button><button data-v="fast" data-i18n="fast">${t("fast")}</button><button data-v="none" data-i18n="none">${t("none")}</button></div></div>
+        <div class="set-row"><div class="t"><b data-i18n="reduce">${t("reduce")}</b><small data-i18n="reduceSub">${t("reduceSub")}</small></div><div class="rd"></div></div>
+        <div class="set-row"><div class="t"><b data-i18n="effectsPreview">${t("effectsPreview")}</b></div><button class="btn small prv" data-i18n="preview">${t("preview")}</button></div>`;
+      $(".ef", pane).querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.v === prefs.effects));
+      $(".ef", pane).onclick = e => { const b = e.target.closest("button"); if (!b) return; prefs.effects = b.dataset.v; $(".ef", pane).querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); };
+      $(".rd", pane).append(makeSwitch(prefs.reduce, on => { prefs.reduce = on; document.body.classList.toggle("reduce", on); }));
+      $(".prv", pane).onclick = () => { const w = wins.get("settings"); minimize(w); setTimeout(() => restore(w), mode() === "smooth" ? 700 : 300); };
+    },
+    language() {
+      pane.innerHTML = `<div class="section-title" data-i18n="language">${t("language")}</div>
+        <div class="set-row"><div class="t"><b data-i18n="langLabel">${t("langLabel")}</b><small data-i18n="applyNow">${t("applyNow")}</small></div>
+        <div class="seg lg"><button data-v="en">English (US)</button><button data-v="pt">Português (Brasil)</button></div></div>`;
+      $(".lg", pane).querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.v === lang));
+      $(".lg", pane).onclick = e => { const b = e.target.closest("button"); if (!b) return; lang = b.dataset.v; $(".lg", pane).querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); applyLang(); };
+    },
+    about() {
+      pane.innerHTML = `<div class="section-title" data-i18n="about">${t("about")}</div>
+        <div class="card" style="display:flex;gap:18px;align-items:center"><div class="avatar" style="width:72px;height:72px;border-radius:22px;color:var(--accent)">${icon("logo", "s24")}</div>
+        <div><h2>OpalineOS</h2><div class="caption" data-i18n="aboutText">${t("aboutText")}</div></div></div>
+        <div class="set-row" style="margin-top:16px"><div class="t"><b data-i18n="kernel">${t("kernel")}</b></div><span class="caption">0.6.1-se1 · x86-64 · UEFI</span></div>
+        <div class="set-row"><div class="t"><b>C library</b></div><span class="caption">musl 1.2.6</span></div>
+        <div class="set-row"><div class="t"><b data-i18n="toolkit">${t("toolkit")}</b></div><span class="caption">opaline-relief (spec v0.3)</span></div>`;
+    },
+  };
+  let page = "appearance";
+  $(".side", body).onclick = e => {
+    const b = e.target.closest("[data-p]"); if (!b) return; page = b.dataset.p;
+    body.querySelectorAll(".side-item").forEach(x => x.classList.toggle("on", x === b));
+    pages[page]();
+    if (mode() === "smooth") pane.animate([{ opacity: 0, transform: "translateX(10px)" }, { opacity: 1, transform: "none" }], { duration: 220, easing: "cubic-bezier(.2,.8,.2,1)" });
+  };
+  pages[page]();
+} };
+
+/* ---- Components (the kit, live) ---- */
+APPS.components = { icon: "kit", w: 900, h: 600, build(body) {
+  body.innerHTML = `<div class="scroll" style="flex:1;min-height:0;padding:6px 10px 10px 4px"><div class="kit">
+    <div class="card"><div class="section-title" data-i18n="buttons"></div>
+      <div class="row" style="flex-wrap:wrap"><button class="btn primary send"><span data-i18n="send"></span></button><button class="btn" data-i18n="secondary"></button><button class="btn" disabled data-i18n="unavailable"></button></div>
+      <div class="row"><button class="icon-btn">${icon("settings")}</button><button class="icon-btn">${icon("user")}</button><button class="icon-btn">${icon("search")}</button><button class="icon-btn tog">${icon("bell")}</button>
+        <span class="tooltip-host"><button class="btn small" data-i18n="tooltip"></button><span class="tooltip" data-i18n="tipText"></span></span></div></div>
+    <div class="card"><div class="section-title" data-i18n="selection"></div>
+      <div class="row" style="gap:28px;align-items:flex-start"><div class="col cks"></div><div class="col rds"></div>
+      <div class="col"><div class="sw1"></div><div class="sw2"></div></div></div>
+      <div class="sl" style="margin-top:8px"></div></div>
+    <div class="card"><div class="section-title" data-i18n="fields"></div>
+      <div class="col" style="gap:6px"><input class="field mail" data-i18n-ph="email"><div class="caption hint" data-i18n="helper"></div></div>
+      <div class="col" style="gap:6px"><input class="field" type="password" value="opaline"><div class="caption">••••</div></div></div>
+    <div class="card"><div class="section-title" data-i18n="navigation"></div>
+      <div class="tabs"><span class="ind"></span><button class="tab on" data-i18n="overview"></button><button class="tab" data-i18n="details"></button><button class="tab" data-i18n="settings"></button></div>
+      <div class="crumbs" style="align-self:flex-start"><button>${t("home")}</button>/<button>${t("projects")}</button>/<button class="cur">OpalineOS</button></div>
+      <div class="pager"><button class="pg prev">${icon("left", "s16")}</button><button class="pg on">1</button><button class="pg">2</button><button class="pg">3</button><button class="pg">4</button><button class="pg nextp">${icon("right", "s16")}</button></div></div>
+    <div class="card"><div class="section-title" data-i18n="progress"></div>
+      <div class="steps"></div>
+      <div class="row"><button class="btn small sb" data-i18n="back"></button><button class="btn small primary sn" data-i18n="next"></button></div>
+      <div class="row"><div class="progress grow"><div class="pbar" style="width:50%"></div></div><b class="pv" style="width:40px;text-align:right">50%</b></div>
+      <div class="row"><div class="spinner">${Array.from({ length: 10 }, (_, i) => `<i style="transform:rotate(${i * 36}deg);animation-delay:${i * .1 - 1}s"></i>`).join("")}</div><div class="progress indet grow"><div></div></div></div></div>
+    <div class="card"><div class="section-title" data-i18n="data"></div>
+      <div class="row"><span class="badge" data-i18n="newBadge"></span><span class="badge soft" data-i18n="beta"></span><span class="badge err">24</span>
+        <div class="grow"></div><div class="avatar ringed">AL</div><div class="avatar">MR</div><div class="avatar">JS</div></div>
+      <div class="card hoverable" style="padding:14px"><div class="row"><div class="avatar" style="border-radius:12px">${icon("files", "s16")}</div><div class="grow"><b data-i18n="product"></b><div class="caption" data-i18n="productText"></div></div></div>
+        <div class="row" style="margin-top:10px"><button class="btn small primary" data-i18n="viewMore"></button></div></div>
+      <div class="col skel-box" style="gap:8px"><div class="skel"></div><div class="skel" style="width:80%"></div><div class="skel" style="width:60%"></div></div></div>
+    <div class="card"><div class="section-title" data-i18n="feedback"></div>
+      <div class="row" style="flex-wrap:wrap"><button class="btn small t1" data-i18n="showToast"></button><button class="btn small t2">Info</button><button class="btn small t3">Error</button><button class="btn small danger dlg" data-i18n="showDialog"></button></div>
+      <div class="row" style="padding:12px 14px;border-radius:14px;background:var(--accent);color:#fff">${icon("info")}<span class="grow" data-i18n="updates"></span></div>
+      <div class="empty"><div class="big">${icon("search", "s24")}</div><b data-i18n="noResults"></b><button class="btn small primary" data-i18n="clearFilters"></button></div></div>
+  </div></div>`;
+  body.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+  body.querySelectorAll("[data-i18n-ph]").forEach(el => el.placeholder = t(el.dataset.i18nPh));
+  // buttons
+  const send = $(".send", body);
+  send.onclick = () => {
+    if (send.disabled) return;
+    send.classList.add("down"); send.disabled = true;
+    send.innerHTML = `<span class="spinner" style="width:18px;height:18px;transform:scale(.6);margin:-6px">${Array.from({ length: 10 }, (_, i) => `<i style="background:#fff;transform:rotate(${i * 36}deg);animation-delay:${i * .1 - 1}s"></i>`).join("")}</span><span data-i18n="sending">${t("sending")}</span>`;
+    setTimeout(() => { send.classList.remove("down"); send.disabled = false; send.innerHTML = `<span data-i18n="send">${t("send")}</span>`; toast(t("saved"), "success"); }, 1600);
+  };
+  $(".tog", body).onclick = e => e.currentTarget.classList.toggle("on");
+  // selection
+  const cks = $(".cks", body), rds = $(".rds", body);
+  [1, 2, 3].forEach(n => {
+    const c = h(`<label class="check ${n === 1 ? "on" : ""}"><span class="box">${icon("check", "s16")}</span><span><span data-i18n="option">${t("option")}</span> ${n}</span></label>`);
+    c.onclick = () => c.classList.toggle("on"); cks.append(c);
+    const r = h(`<label class="check radio ${n === 1 ? "on" : ""}"><span class="box"><span class="dot"></span></span><span><span data-i18n="option">${t("option")}</span> ${n}</span></label>`);
+    r.onclick = () => { rds.querySelectorAll(".radio").forEach(x => x.classList.remove("on")); r.classList.add("on"); }; rds.append(r);
+  });
+  $(".sw1", body).append(makeSwitch(true)); $(".sw2", body).append(makeSwitch(false));
+  makeSlider($(".sl", body), { value: .75 });
+  // fields
+  const mail = $(".mail", body), hint = $(".hint", body);
+  mail.oninput = () => {
+    const v = mail.value, ok = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v);
+    mail.classList.toggle("error", !!v && !ok);
+    hint.className = "caption hint" + (v && !ok ? " err" : "");
+    hint.dataset.i18n = !v ? "helper" : ok ? "valid" : "invalid"; hint.textContent = t(hint.dataset.i18n);
+    if (v && !ok && !mail._shook && mode() !== "none") { mail._shook = true; mail.animate([{ transform: "translateX(0)" }, { transform: "translateX(-6px)" }, { transform: "translateX(5px)" }, { transform: "translateX(-3px)" }, { transform: "none" }], { duration: 320 }); }
+    if (ok) mail._shook = false;
+  };
+  // tabs
+  const tabs = $(".tabs", body), ind = $(".ind", tabs);
+  const placeInd = b => { ind.style.left = b.offsetLeft + "px"; ind.style.width = b.offsetWidth + "px"; };
+  tabs.onclick = e => { const b = e.target.closest(".tab"); if (!b) return; tabs.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === b)); placeInd(b); };
+  requestAnimationFrame(() => placeInd($(".tab.on", tabs)));
+  langListeners.push(() => body.isConnected && requestAnimationFrame(() => placeInd($(".tab.on", tabs))));
+  // pager
+  const pager = $(".pager", body);
+  pager.onclick = e => {
+    const b = e.target.closest(".pg"); if (!b) return;
+    const pages = [...pager.querySelectorAll(".pg:not(.prev):not(.nextp)")]; let i = pages.findIndex(p => p.classList.contains("on"));
+    i = b.classList.contains("prev") ? Math.max(0, i - 1) : b.classList.contains("nextp") ? Math.min(pages.length - 1, i + 1) : pages.indexOf(b);
+    pages.forEach((p, k) => p.classList.toggle("on", k === i));
+  };
+  // steps
+  const stepsEl = $(".steps", body); let step = 1; const names = ["account", "details", "review", "payment"];
+  const drawSteps = () => {
+    stepsEl.innerHTML = names.map((n, i) => `<div class="step ${i < step ? "done" : i === step ? "cur" : ""}"><div class="n">${i < step ? icon("check", "s16") : i + 1}</div><span>${i + 1}. ${t(n)}</span></div>`).join("");
+    const pct = Math.round(step / (names.length - 1) * 100);
+    $(".pbar", body).style.width = pct + "%"; $(".pv", body).textContent = pct + "%";
+  };
+  $(".sn", body).onclick = () => { step = Math.min(names.length - 1, step + 1); drawSteps(); if (step === names.length - 1) toast(t("review") + " ✓", "success"); };
+  $(".sb", body).onclick = () => { step = Math.max(0, step - 1); drawSteps(); };
+  drawSteps(); langListeners.push(() => body.isConnected && drawSteps());
+  // feedback
+  $(".t1", body).onclick = () => toast(t("saved"), "success", "Success:");
+  $(".t2", body).onclick = () => toast(t("updates"), "info", "Info:");
+  $(".t3", body).onclick = () => toast(t("errorConn"), "error", "Error:");
+  $(".dlg", body).onclick = async () => { if (await dialog(t("deleteAcc"), t("sure"), t("del"), true)) toast(t("deleted"), "warning"); };
+  langListeners.push(() => {
+    if (!body.isConnected) return;
+    body.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+    body.querySelectorAll("[data-i18n-ph]").forEach(el => el.placeholder = t(el.dataset.i18nPh));
+  });
+} };
+
+/* ---- About ---- */
+APPS.about = { icon: "about", w: 420, h: 330, build(body) {
+  body.innerHTML = `<div class="col" style="align-items:center;text-align:center;gap:14px;padding-top:6px">
+    <div class="avatar" style="width:84px;height:84px;border-radius:26px;box-shadow:var(--e3);color:var(--accent)"><svg class="i" style="width:44px;height:44px"><use href="#i-logo"/></svg></div>
+    <h2>OpalineOS</h2><div class="caption" data-i18n="aboutText">${t("aboutText")}</div>
+    <div class="row"><span class="badge soft">musl 1.2.6</span><span class="badge soft">POSIX</span><span class="badge">Relief</span></div></div>`;
+} };
+
+/* ===================================================================================================
+   Launcher, quick settings, notifications, clock
+   =================================================================================================== */
+const ORDER = ["files", "terminal", "settings", "monitor", "editor", "components", "about"];
+$("#appgrid").innerHTML = ORDER.map(id => `<button class="app-tile" data-app="${id}"><div class="ico">${icon(APPS[id].icon)}</div><span data-i18n="${id}">${t(id)}</span></button>`).join("");
+$("#appgrid").onclick = e => { const b = e.target.closest("[data-app]"); if (b) openApp(b.dataset.app); };
+$("#start").onclick = () => showPop($("#launcher"), $("#start"));
+$("#search").oninput = e => {
+  const q = e.target.value.trim().toLowerCase();
+  document.querySelectorAll(".app-tile").forEach(tile => tile.classList.toggle("hidden", !!q && !t(tile.dataset.app).toLowerCase().includes(q) && !tile.dataset.app.includes(q)));
+};
+$("#search").onkeydown = e => { if (e.key === "Enter") { const first = document.querySelector(".app-tile:not(.hidden)"); if (first) openApp(first.dataset.app); } };
+
+const QS = [["wifi", "wifi", true], ["bluetooth", "bt", false], ["airplane", "plane", false], ["night", "moon", false]];
+function drawQS() {
+  $("#qs").innerHTML = QS.map(([k, ic, on], i) => `<button class="qs ${on ? "on" : ""}" data-i="${i}"><div class="ic">${icon(ic, "s16")}</div><div><b>${t(k)}</b><small>${on ? (k === "wifi" ? t("connected") : t("on")) : t("off")}</small></div></button>`).join("");
+}
+$("#qs").onclick = e => {
+  const b = e.target.closest(".qs"); if (!b) return;
+  const q = QS[+b.dataset.i]; q[2] = !q[2];
+  if (q[0] === "night") $("#night").style.opacity = q[2] ? .16 : 0;
+  drawQS();
+  const nb = $(`#qs [data-i="${b.dataset.i}"] .ic`);
+  if (mode() !== "none") nb.animate(springFrames(p => ({ transform: `scale(${.8 + .2 * p})` })), { duration: springMs() });
+};
+drawQS(); langListeners.push(drawQS);
+makeSlider($("#bright"), { value: 1, min: .3, max: 1, onChange: v => $("#dim").style.opacity = (1 - v) * .8 });
+makeSlider($("#vol"), { value: .6 });
+document.querySelectorAll("[data-qs-open]").forEach(b => b.onclick = () => showPop($("#center"), $("#bell")));
+$("#bell").onclick = () => { showPop($("#center"), $("#bell")); $("#bell-dot").classList.remove("show"); };
+$("#clockbtn").onclick = () => showPop($("#center"), $("#bell"));
+const notifs = [];
+function addNotif(text, ic, kind) { notifs.unshift({ text, ic, kind, time: new Date() }); notifs.length = Math.min(notifs.length, 6); drawNotifs(); if (openPop?.id !== "center") $("#bell-dot").classList.add("show"); }
+function drawNotifs() {
+  const host = $("#notifs");
+  host.innerHTML = notifs.length ? notifs.map((n, i) => `<div class="notif" data-i="${i}"><div class="ic" style="color:${KINDS[n.kind][0]}">${icon(n.ic, "s16")}</div><div class="grow"><b style="font-size:13px">${n.text}</b><p>${n.time.toLocaleTimeString(lang === "pt" ? "pt-BR" : "en-US", { hour: "2-digit", minute: "2-digit" })}</p></div><button class="wb x">${icon("close")}</button></div>`).join("")
+    : `<div class="caption" style="text-align:center;padding:18px">${t("noNotif")}</div>`;
+}
+$("#notifs").onclick = e => {
+  const x = e.target.closest(".x"); if (!x) return;
+  const card = x.closest(".notif"), i = +card.dataset.i;
+  card.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateX(80px)" }], { duration: 200, easing: "cubic-bezier(.4,0,1,1)" })
+    .onfinish = () => { notifs.splice(i, 1); drawNotifs(); };
+};
+$("#clearall").onclick = () => {
+  const cards = [...document.querySelectorAll("#notifs .notif")];
+  cards.forEach((c, i) => c.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateX(80px)" }], { duration: 200, delay: i * 50, fill: "forwards" }));
+  setTimeout(() => { notifs.length = 0; drawNotifs(); }, 200 + cards.length * 50);
+};
+drawNotifs(); langListeners.push(drawNotifs);
+function tickClock() {
+  const now = new Date(), loc = lang === "pt" ? "pt-BR" : "en-US";
+  $("#clock").textContent = now.toLocaleDateString(loc, { weekday: "short", day: "numeric", month: "short" }) + "  " + now.toLocaleTimeString(loc, { hour: "2-digit", minute: "2-digit" });
+}
+setInterval(tickClock, 1000 * 15);
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { if ($("#dialog").style.display === "block") closeDialog(false); else hidePop(); }
+  if (e.ctrlKey && e.code === "Space") { e.preventDefault(); showPop($("#launcher"), $("#start")); }
+});
+
+/* ===================================================================================================
+   Power: boot, shut down, restart
+   =================================================================================================== */
+let booting = false;
+function boot() {
+  booting = true;
+  const b = $("#boot"), bar = $("#bootbar");
+  b.style.display = "grid"; b.style.opacity = 1;
+  $("#boothint").textContent = t("starting");
+  const logo = $(".logo-wrap", b);
+  logo.animate(springFrames(p => ({ transform: `scale(${.6 + .4 * p})`, opacity: Math.min(1, p * 2) })), { duration: springMs() * 1.4 });
+  bar.style.transition = "none"; bar.style.width = "0%";
+  requestAnimationFrame(() => { bar.style.transition = "width 1100ms cubic-bezier(.4,0,.2,1)"; bar.style.width = "100%"; });
+  setTimeout(() => {
+    b.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 380, easing: "ease" }).onfinish = () => { b.style.display = "none"; booting = false; };
+    $("#bar").animate(springFrames(p => ({ transform: `translateY(${(1 - p) * -60}px)` })), { duration: springMs() + 100 });
+    setTimeout(() => { toast(t("welcomeSub"), "info", t("welcome") + "."); }, 450);
+  }, 1300);
+}
+function powerOff(restart) {
+  hidePop(true);
+  for (const w of [...wins.values()]) closeWin(w);
+  const b = $("#boot");
+  setTimeout(() => {
+    b.style.display = "grid"; $("#bootbar").style.width = "0%"; $("#boothint").textContent = restart ? t("restartNote") : t("shutting");
+    b.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 300 });
+    setTimeout(() => {
+      if (restart) return boot();
+      b.style.background = "#1B1916"; $(".box", b).style.opacity = .0;
+      const msg = h(`<div style="position:absolute;bottom:40px;width:100%;text-align:center;color:#6F665C;font-size:13px">${t("turnOn")}</div>`);
+      b.append(msg);
+      b.onclick = () => { b.onclick = null; msg.remove(); b.style.background = ""; $(".box", b).style.opacity = 1; boot(); };
+    }, 1200);
+  }, 250);
+}
+$("#shutdown").onclick = async () => { hidePop(); if (await dialog(t("shutdown") + "?", "OpalineOS", t("shutdown"))) powerOff(false); };
+$("#restart").onclick = () => { hidePop(); powerOff(true); };
+
+/* start */
+applyLang();
+boot();
+setTimeout(() => { openApp("components"); }, 1900);
+</script>
+</body>
+</html>
