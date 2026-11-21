@@ -38,7 +38,10 @@ static i64 pipe_read(struct vnode *v, u64 off, void *out, u64 n) {
     p->head = (u32)((p->head + got) % PIPE_SIZE);
     p->len -= (u32)got;
     irq_restore(f);
-    if (got) waitqueue_wake_all(&p->wait);
+    if (got) {
+        waitqueue_wake_all(&p->wait);
+        vfs_poll_notify();
+    }
     return (i64)got;
 }
 
@@ -65,6 +68,7 @@ static i64 pipe_write(struct vnode *v, u64 off, const void *in, u64 n) {
         done += want;
         irq_restore(f);
         waitqueue_wake_all(&p->wait);
+        vfs_poll_notify();
     }
     return (i64)done;
 }
@@ -84,6 +88,14 @@ static void pipe_close(struct vnode *v, u32 flags) {
     else p->writers--;
     irq_restore(f);
     waitqueue_wake_all(&p->wait);
+    vfs_poll_notify();
+}
+
+static u32 pipe_poll(struct vnode *v, u32 flags) {
+    struct pipe *p = v->priv;
+    if ((flags & O_ACCMODE) == O_RDONLY)
+        return (p->len ? POLLIN : 0) | (p->writers == 0 ? POLLHUP : 0);   /* EOF reads as POLLHUP */
+    return (p->readers == 0 ? POLLERR : 0) | (PIPE_SIZE - p->len >= 1 ? POLLOUT : 0);
 }
 
 static void pipe_release(struct vnode *v) {
@@ -92,7 +104,8 @@ static void pipe_release(struct vnode *v) {
 }
 
 static const struct vnode_ops pipe_ops = {
-    .read = pipe_read, .write = pipe_write, .stat = pipe_stat, .close = pipe_close, .release = pipe_release};
+    .read = pipe_read, .write = pipe_write, .stat = pipe_stat, .close = pipe_close, .release = pipe_release,
+    .poll = pipe_poll};
 
 int pipe_create(struct file **read_end, struct file **write_end) {
     static u64 next_ino = 1;

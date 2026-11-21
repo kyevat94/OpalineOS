@@ -7,7 +7,11 @@
  *
  * It checks files and directories, malloc, mmap/munmap/mprotect, signals,
  * fork/exec/wait, posix_spawn, pipes between processes, pthreads (mutexes,
- * condition variables, thread-local storage) and a few system queries.
+ * condition variables, thread-local storage) and a few system queries; and,
+ * since stage SE1, copy-on-write fork, shared memory (anonymous and file),
+ * mremap, execve from a process with threads, the real clock and file times,
+ * users and permissions (as an ordinary user, set-user-id programs) and job
+ * control (stop/continue, process groups, restarted system calls).
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
 #define _GNU_SOURCE
@@ -24,10 +28,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/auxv.h>
 #include <sys/random.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <grp.h>
+#define FUTEX_WAIT 0   /* linux/futex.h; musl has no kernel headers */
+#define FUTEX_WAKE 1
 #include <time.h>
 #include <unistd.h>
 
@@ -404,6 +415,350 @@ static void test_system(void) {
     CHECK(strtod("2.5e3", NULL) == 2500.0, "strtod");
 }
 
+/* ---- stage SE1: memory -------------------------------------------------------------- */
+
+static long free_kib(void) {
+    struct sysinfo si;
+    return sysinfo(&si) == 0 ? (long)(si.freeram * si.mem_unit / 1024) : -1;
+}
+
+static void test_memory_sharing(void) {
+    printf("memory sharing:\n");
+    /* copy-on-write: a fork of 16 MiB of touched memory costs almost nothing until someone writes */
+    size_t size = 16 << 20;
+    char *big = malloc(size);
+    if (!big) {
+        CHECK(0, "malloc 16 MiB");
+        return;
+    }
+    memset(big, 0x11, size);
+    int p[2];
+    pipe(p);
+    long before = free_kib();
+    pid_t pid = fork();
+    if (pid == 0) {
+        long after = free_kib();
+        write(p[1], &after, sizeof after);
+        for (size_t i = 0; i < size; i += 4096) big[i] = 0x22;   /* now the child gets its own copies */
+        int ok = big[0] == 0x22 && big[size - 4096] == 0x22 && big[1] == 0x11;
+        _exit(ok ? 0 : 1);
+    }
+    long after = -1;
+    read(p[0], &after, sizeof after);
+    close(p[0]);
+    close(p[1]);
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(before > 0 && after > 0 && before - after < 4096, "fork shares 16 MiB copy-on-write (less than 4 MiB used)");
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the child's writes get private copies");
+    CHECK(big[0] == 0x11 && big[size - 4096] == 0x11, "the parent's memory is unchanged");
+    free(big);
+
+    /* MAP_SHARED | MAP_ANONYMOUS across fork, with a futex between the processes */
+    volatile int *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(shared != MAP_FAILED, "shared anonymous mmap");
+    if (shared == MAP_FAILED) return;
+    shared[0] = 0;
+    shared[1] = 0;
+    pid = fork();
+    if (pid == 0) {
+        for (int i = 0; i < 1000; i++) __atomic_add_fetch(&shared[1], 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&shared[0], 1, __ATOMIC_SEQ_CST);
+        syscall(SYS_futex, &shared[0], FUTEX_WAKE, 1, NULL, NULL, 0);   /* not private: across processes */
+        _exit(0);
+    }
+    while (__atomic_load_n(&shared[0], __ATOMIC_SEQ_CST) == 0)
+        syscall(SYS_futex, &shared[0], FUTEX_WAIT, 0, NULL, NULL, 0);
+    waitpid(pid, &status, 0);
+    CHECK(shared[1] == 1000, "the child's writes to shared memory are seen by the parent");
+    CHECK(1, "a shared futex wakes a waiter in another process");
+    munmap((void *)shared, 4096);
+
+    /* MAP_SHARED of a file: changes reach the file, and write() reaches the mapping */
+    int fd = open("/tmp/shared.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char zero[8192] = {0};
+    write(fd, zero, sizeof zero);
+    char *m = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(m != MAP_FAILED, "shared mmap of a file");
+    if (m != MAP_FAILED) {
+        strcpy(m + 5000, "written through the mapping");
+        char back[32] = {0};
+        CHECK(pread(fd, back, 27, 5000) == 27 && !strcmp(back, "written through the mapping"),
+              "read() sees what the mapping wrote");
+        CHECK(m[100] == 0, "the first page is mapped (and now in memory)");   /* so write() must update it */
+        pwrite(fd, "via write()", 11, 100);
+        CHECK(!memcmp(m + 100, "via write()", 11), "the mapping sees what write() wrote");
+        pid = fork();
+        if (pid == 0) {
+            strcpy(m + 200, "from the child");
+            _exit(0);
+        }
+        waitpid(pid, &status, 0);
+        CHECK(!strcmp(m + 200, "from the child"), "a forked child writes the same file pages");
+        CHECK(msync(m, 8192, MS_SYNC) == 0 && munmap(m, 8192) == 0, "msync + munmap");
+    }
+    close(fd);
+    fd = open("/tmp/shared.bin", O_RDONLY);
+    char back[16] = {0};
+    CHECK(fd >= 0 && pread(fd, back, 14, 200) == 14 && !strcmp(back, "from the child"), "the file keeps the changes");
+    close(fd);
+    unlink("/tmp/shared.bin");
+    CHECK(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, open("/etc/motd", O_RDONLY), 0) == MAP_FAILED &&
+              errno == EACCES,
+          "a writable shared mapping needs a file opened for writing");
+
+    /* mremap */
+    char *r = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mmap(r + 2 * 4096, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);   /* a neighbour: no room */
+    strcpy(r, "keep me");
+    strcpy(r + 4096, "and me");
+    char *moved = mremap(r, 2 * 4096, 64 * 4096, MREMAP_MAYMOVE);
+    CHECK(moved != MAP_FAILED && moved != r && !strcmp(moved, "keep me") && !strcmp(moved + 4096, "and me"),
+          "mremap moves a mapping that cannot grow in place, with its contents");
+    CHECK(moved != MAP_FAILED && (moved[64 * 4096 - 1] = 1) == 1, "the grown part is usable");
+    char *same = mremap(moved, 64 * 4096, 128 * 4096, 0);
+    CHECK(same == moved || same == MAP_FAILED, "mremap without MAYMOVE grows in place or fails");
+    munmap(r + 2 * 4096, 4096);
+    munmap(same != MAP_FAILED ? same : moved, same != MAP_FAILED ? 128 * 4096 : 64 * 4096);
+}
+
+/* ---- stage SE1: execve with threads, clock and file times --------------------------------- */
+
+static void *sleeper(void *arg) {
+    (void)arg;
+    for (;;) sleep(10);
+    return NULL;
+}
+
+static void test_exec_threads_and_time(void) {
+    printf("execve with threads, time:\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t[3];
+        for (int i = 0; i < 3; i++) pthread_create(&t[i], NULL, sleeper, NULL);
+        char *argv[] = {(char *)self_path, "exec-child", "arg with spaces", NULL};
+        char *envp[] = {"OPALINE_TEST=yes", NULL};
+        execve(self_path, argv, envp);
+        _exit(100 + errno);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 7, "execve from a process with 4 threads");
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    CHECK(now.tv_sec > 1767225600, "the real clock is past 2026-01-01");
+    int fd = open("/tmp/times.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    write(fd, "x", 1);
+    close(fd);
+    struct stat st;
+    stat("/tmp/times.txt", &st);
+    CHECK(st.st_mtime >= now.tv_sec - 5 && st.st_mtime <= now.tv_sec + 5, "a new file's mtime is now");
+    struct timespec times[2] = {{1000000000, 0}, {1234567890, 500}};
+    CHECK(utimensat(AT_FDCWD, "/tmp/times.txt", times, 0) == 0 && stat("/tmp/times.txt", &st) == 0 &&
+              st.st_mtime == 1234567890 && st.st_mtim.tv_nsec == 500 && st.st_atime == 1000000000,
+          "utimensat sets both times");
+    unlink("/tmp/times.txt");
+}
+
+/* ---- stage SE1: users and permissions ------------------------------------------------------- */
+
+static int stime_check(void);
+
+static int copy_file(const char *from, const char *to, mode_t mode) {
+    int in = open(from, O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    char buf[4096];
+    ssize_t n;
+    int ok = in >= 0 && out >= 0;
+    while (ok && (n = read(in, buf, sizeof buf)) > 0) ok = write(out, buf, (size_t)n) == n;
+    close(in);
+    close(out);
+    return ok;
+}
+
+static int unprivileged_checks(void) {   /* runs as user 1000 in a child; returns the number of failures */
+    int bad = 0;
+#define SUB(cond) bad += !(cond)
+    SUB(getuid() == 1000 && geteuid() == 1000 && getgid() == 1000);
+    SUB(open("/tmp/perm/secret", O_RDONLY) < 0 && errno == EACCES);       /* 0600 root */
+    SUB(access("/tmp/perm/secret", R_OK) < 0 && access("/tmp/perm/secret", F_OK) == 0);
+    SUB(open("/tmp/perm/x", O_WRONLY | O_CREAT, 0644) < 0 && errno == EACCES);   /* 0755 root directory */
+    SUB(unlink("/tmp/perm/public") < 0 && errno == EACCES);
+    int fd = open("/tmp/mine.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);   /* /tmp is 1777 */
+    SUB(fd >= 0);
+    close(fd);
+    struct stat st;
+    SUB(stat("/tmp/mine.txt", &st) == 0 && st.st_uid == 1000 && st.st_gid == 1000);
+    SUB(unlink("/tmp/rootfile") < 0 && errno == EPERM);                   /* sticky /tmp, root's file */
+    SUB(chmod("/tmp/perm/public", 0777) < 0 && errno == EPERM);
+    SUB(chown("/tmp/mine.txt", 0, 0) < 0 && errno == EPERM);
+    SUB(chmod("/tmp/mine.txt", 0600) == 0);
+    SUB(unlink("/tmp/mine.txt") == 0);
+    SUB(setuid(0) < 0 && errno == EPERM);
+    SUB(kill(getppid(), 0) < 0 && errno == EPERM);                        /* the parent is root */
+    SUB(reboot(RB_POWER_OFF) < 0 && errno == EPERM);
+    SUB(stime_check());
+    /* a set-user-id program owned by root runs with euid 0 */
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = {"/tmp/suid-posixtest", "suid-child", NULL};
+        execve(argv[0], argv, environ);
+        _exit(99);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    SUB(WIFEXITED(status) && WEXITSTATUS(status) == 5);
+    /* a file without x for others cannot be run */
+    pid = fork();
+    if (pid == 0) {
+        char *argv[] = {"/tmp/perm/noexec", NULL};
+        execve(argv[0], argv, environ);
+        _exit(errno == EACCES ? 6 : 98);
+    }
+    waitpid(pid, &status, 0);
+    SUB(WIFEXITED(status) && WEXITSTATUS(status) == 6);
+#undef SUB
+    return bad;
+}
+
+static int stime_check(void) {
+    struct timespec t = {1000, 0};
+    return clock_settime(CLOCK_REALTIME, &t) < 0 && errno == EPERM;
+}
+
+static void test_permissions(void) {
+    printf("users and permissions:\n");
+    CHECK(getuid() == 0 && geteuid() == 0, "the system starts as root");
+    mkdir("/tmp/perm", 0755);
+    int fd = open("/tmp/perm/secret", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    write(fd, "s", 1);
+    close(fd);
+    close(open("/tmp/perm/public", O_WRONLY | O_CREAT | O_TRUNC, 0666));
+    close(open("/tmp/rootfile", O_WRONLY | O_CREAT | O_TRUNC, 0666));
+    struct stat st;
+    stat("/tmp/perm/public", &st);
+    CHECK((st.st_mode & 0777) == 0644, "the umask (022) applies to new files");
+    mode_t old = umask(077);
+    close(open("/tmp/perm/private", O_WRONLY | O_CREAT | O_TRUNC, 0666));
+    stat("/tmp/perm/private", &st);
+    CHECK(old == 022 && (st.st_mode & 0777) == 0600, "umask(077)");
+    umask(old);
+    CHECK(stat("/tmp", &st) == 0 && (st.st_mode & 07777) == 01777, "/tmp is 1777 (sticky)");
+    CHECK(copy_file(self_path, "/tmp/suid-posixtest", 0755) && chmod("/tmp/suid-posixtest", 04755) == 0 &&
+              stat("/tmp/suid-posixtest", &st) == 0 && (st.st_mode & 04000),
+          "chmod 04755 (set-user-id)");
+    CHECK(copy_file(self_path, "/tmp/perm/noexec", 0744), "a program only root may run (0744)");
+    CHECK(chown("/tmp/perm/private", 1000, 100) == 0 && stat("/tmp/perm/private", &st) == 0 && st.st_uid == 1000 &&
+              st.st_gid == 100,
+          "root gives a file away (chown)");
+    pid_t pid = fork();
+    if (pid == 0) {
+        setgroups(0, NULL);
+        if (setgid(1000) || setuid(1000)) _exit(200);
+        _exit(unprivileged_checks());
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "as user 1000: permissions refuse and allow as they should");
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("       (%d checks failed as user 1000)\n", WEXITSTATUS(status));
+    CHECK(access("/tmp/perm/secret", R_OK | W_OK) == 0, "root reads and writes anything");
+    unlink("/tmp/perm/secret");
+    unlink("/tmp/perm/public");
+    unlink("/tmp/perm/private");
+    unlink("/tmp/perm/noexec");
+    unlink("/tmp/suid-posixtest");
+    unlink("/tmp/rootfile");
+    rmdir("/tmp/perm");
+}
+
+/* ---- stage SE1: job control ------------------------------------------------------------------ */
+
+static volatile sig_atomic_t chld_count, usr1_count;
+static void on_chld(int sig) { chld_count += sig == SIGCHLD; }
+static void on_usr1_job(int sig) { usr1_count += sig == SIGUSR1; }
+
+static void test_jobs(void) {
+    printf("job control:\n");
+    struct sigaction sa = {0};
+    sa.sa_handler = on_chld;
+    sa.sa_flags = SA_RESTART;   /* waitpid must not fail with EINTR because of it */
+    sigaction(SIGCHLD, &sa, NULL);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (;;) pause();
+    }
+    int status;
+    CHECK(kill(pid, SIGSTOP) == 0 && waitpid(pid, &status, WUNTRACED) == pid && WIFSTOPPED(status) &&
+              WSTOPSIG(status) == SIGSTOP,
+          "SIGSTOP stops a child (waitpid WUNTRACED)");
+    CHECK(kill(pid, SIGCONT) == 0 && waitpid(pid, &status, WCONTINUED) == pid && WIFCONTINUED(status),
+          "SIGCONT continues it (waitpid WCONTINUED)");
+    CHECK(kill(pid, SIGTSTP) == 0 && waitpid(pid, &status, WUNTRACED) == pid && WIFSTOPPED(status) &&
+              WSTOPSIG(status) == SIGTSTP,
+          "SIGTSTP (Ctrl+Z) stops it too");
+    kill(pid, SIGKILL);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+          "SIGKILL ends a stopped child");
+    CHECK(chld_count >= 3, "SIGCHLD arrives for stop, continue and end");
+
+    /* a read interrupted by a stop starts again after SIGCONT instead of failing with EINTR */
+    int p[2];
+    pipe(p);
+    pid = fork();
+    if (pid == 0) {
+        close(p[1]);
+        char buf[8] = {0};
+        ssize_t n = read(p[0], buf, sizeof buf);
+        _exit(n == 5 && !memcmp(buf, "hello", 5) ? 0 : n < 0 ? 100 + errno : 1);
+    }
+    close(p[0]);
+    struct timespec ms20 = {0, 20 * 1000000};
+    nanosleep(&ms20, NULL);   /* let it block in read() */
+    kill(pid, SIGSTOP);
+    waitpid(pid, &status, WUNTRACED);
+    kill(pid, SIGCONT);
+    nanosleep(&ms20, NULL);
+    signal(SIGPIPE, SIG_IGN);   /* if the child is gone already, report it instead of dying */
+    write(p[1], "hello", 5);
+    signal(SIGPIPE, SIG_DFL);
+    close(p[1]);
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "a system call stopped in the middle starts again");
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("       (child status 0x%x)\n", status);
+
+    /* process groups and sessions */
+    CHECK(getpgrp() == getpgid(0) && getsid(0) > 0, "getpgrp, getpgid, getsid");
+    signal(SIGUSR1, on_usr1_job);
+    pid_t a = fork();
+    if (a == 0) {
+        setpgid(0, 0);
+        for (;;) pause();
+    }
+    setpgid(a, a);   /* both sides set it, as shells do */
+    pid_t b = fork();
+    if (b == 0) {
+        setpgid(0, a);
+        for (;;) pause();
+    }
+    setpgid(b, a);
+    nanosleep(&ms20, NULL);
+    CHECK(getpgid(a) == a && getpgid(b) == a, "setpgid puts two children in one group");
+    CHECK(kill(-a, SIGTERM) == 0, "kill(-pgid) signals the group");
+    int st1, st2;
+    waitpid(a, &st1, 0);
+    waitpid(b, &st2, 0);
+    CHECK(WIFSIGNALED(st1) && WIFSIGNALED(st2), "both members of the group got it");
+    raise(SIGUSR1);
+    CHECK(kill(0, SIGUSR1) == 0 && usr1_count == 2, "kill(0) signals the caller's own group");
+    pid = fork();
+    if (pid == 0) _exit(setsid() == getpid() && getsid(0) == getpid() && getpgrp() == getpid() ? 0 : 1);
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "setsid makes a new session");
+    signal(SIGCHLD, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "exec-child")) {
@@ -411,6 +766,12 @@ int main(int argc, char **argv) {
         return argc == 3 && !strcmp(argv[2], "arg with spaces") && t && !strcmp(t, "yes") && !getenv("PATH") ? 7 : 1;
     }
     if (argc >= 2 && !strcmp(argv[1], "spawn-child")) return 9;
+    if (argc >= 2 && !strcmp(argv[1], "suid-child")) return geteuid() == 0 && getuid() == 1000 && getauxval(AT_SECURE) ? 5 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "sleep")) {   /* for the shell test: Ctrl+C and Ctrl+Z */
+        printf("sleeping...\n");
+        sleep(300);
+        return 0;
+    }
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("posixtest (%s): musl C library on OpalineOS, pid %d\n", argv[0], (int)getpid());
@@ -420,6 +781,10 @@ int main(int argc, char **argv) {
     test_processes();
     test_threads();
     test_system();
+    test_memory_sharing();
+    test_exec_threads_and_time();
+    test_permissions();
+    test_jobs();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

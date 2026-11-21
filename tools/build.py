@@ -186,7 +186,7 @@ def make_root_tree(programs, posix_programs=()):
     if os.path.isdir(ROOT_TREE):
         shutil.rmtree(ROOT_TREE)
     shutil.copytree(ROOTFS_SRC, ROOT_TREE)
-    for folder in ("dev", "home", "tmp"):   # mount points and empty folders (git keeps no empty folders)
+    for folder in ("dev", "home", "home/user", "root", "tmp"):   # mount points and empty folders (git keeps none)
         os.makedirs(os.path.join(ROOT_TREE, folder), exist_ok=True)
     for name in programs:
         dest = os.path.join(ROOT_TREE, *SYSTEM_PROGRAMS.get(name, "apps/" + name).split("/"))

@@ -386,6 +386,10 @@ parede espacial próprio.
 | **E4** ✅ | Ring 3, syscalls e carregador ELF64 estático | programa em C de usuário escreve via syscall; um app com erro não derruba o kernel. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E5** ✅ | VFS, EFS3 (nomes de arquivo em UTF-8), disco (virtio-blk ou AHCI), pipes, terminal (TTY) | ler e gravar arquivos do espaço de usuário, inclusive com nomes acentuados. **Concluída em 2026-11-19** (QEMU e VirtualBox) |
 | **E6** ✅ | **Camada POSIX + musl** portada + carregador dinâmico (`ld.so`) | programas de teste em C (arquivos, `fork`/`exec`, threads, `mmap`) passam. **Concluída em 2026-11-20** (QEMU e VirtualBox) |
+| **SE1** ✅ | Sub-etapa: o que a E6 simplificou — copy-on-write, `MAP_SHARED` real, `mremap`, `execve` com threads, relógio real e tempos de arquivo, usuários e permissões, controle de tarefas (Ctrl+C/Ctrl+Z) | `posixtest` (104 verificações) passa, inclusive como usuário comum. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
+| **SE2** | Sub-etapa: sistema de arquivos — journal no EFS3, links simbólicos e físicos | queda de energia simulada no meio de uma escrita não corrompe o disco (fsck limpo) |
+| **SE3** | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente |
+| **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, blur, sombras, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela de vidro arrastável a 60 fps; digitar "ação, über, ñ" funciona |
 | **E9** | **`opaline.vitrum`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra, dock, lançador) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
@@ -635,7 +639,7 @@ OpalineOS/
   Antes de desligar, o cache do disco é descarregado (`FLUSH CACHE`).
 - **Syscall `reboot` (169)** com os números mágicos do Linux; o shell tem `poweroff` e `reboot`. **Sair
   do shell principal (`exit` ou Ctrl+D) desliga o computador**; um `sh` aberto dentro de outro só volta
-  ao anterior. Qualquer processo pode desligar por enquanto (não há usuários); a E15 restringe.
+  ao anterior. Desde a SE1, só o root pode desligar ou reiniciar.
 - **Testes**: o teste do shell faz seis edições (Tab+Backspace, setas+Backspace, Home+digitar,
   Delete, ↑ do histórico, Tab no meio + setas + Delete) e compara a linha pixel a pixel com o mesmo
   comando digitado direto; no fim digita `exit` e exige que o QEMU desligue sozinho. O teste do
@@ -663,15 +667,15 @@ OpalineOS/
   baixo abaixo de 0x7F0000000000), `munmap`, `mprotect` (divide áreas), `brk`; `mremap` só encolhe.
   Pilha principal de 8 MiB reservada e paginada sob demanda. Cada ponteiro recebido numa syscall é
   conferido contra as áreas e as páginas já são trazidas, então o kernel nunca falha ao copiá-los.
-  Simplificações por enquanto: `MAP_SHARED` age como `MAP_PRIVATE` e o `fork` copia todas as páginas
-  na hora (sem *copy-on-write*).
+  (Na E6, `MAP_SHARED` agia como `MAP_PRIVATE` e o `fork` copiava todas as páginas; a SE1 resolveu,
+  seção 10.1.8.)
 - **Processos e threads** (`kernel/proc/process.c`): `fork`, `vfork`, `clone` (threads com
   `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`;
   `CLONE_VM|CLONE_VFORK` do `posix_spawn` da musl), `execve` (fecha os descritores `FD_CLOEXEC`, zera
   os sinais tratados), `exit` (só a thread) e `exit_group` (todas). PIDs e TIDs saem do mesmo contador:
   o TID da thread principal é o PID, como no Linux. Um processo termina com a última thread, libera
-  memória e arquivos na hora e fica **zumbi** até o pai (ou o kernel) recolher o status. `execve` num
-  processo com várias threads ainda devolve `EAGAIN`.
+  memória e arquivos na hora e fica **zumbi** até o pai (ou o kernel) recolher o status. (`execve` num
+  processo com várias threads devolvia `EAGAIN`; resolvido na SE1.)
 - **TLS**: `arch_prctl(ARCH_SET_FS)` guarda a base do FS por thread; o escalonador a recarrega a cada
   troca. **Futex** (`kernel/proc/futex.c`): `WAIT`, `WAKE`, `REQUEUE`, `CMP_REQUEUE`, `WAIT_BITSET`,
   com tempo limite — a base dos mutexes, variáveis de condição e do `pthread_join` da musl.
@@ -680,8 +684,8 @@ OpalineOS/
   com o mesmo `rt_sigframe` do Linux (registradores, `siginfo`, estado da FPU) e retorno por
   `rt_sigreturn`; `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND`, `SA_ONSTACK`. Falhas da CPU
   viram sinais (`SIGSEGV` com `si_addr`, `SIGILL`, `SIGFPE`...) que o programa pode tratar; sem
-  tratador, o processo é encerrado como antes. Ação padrão: terminar (sinais de parada são ignorados
-  por enquanto). `SIGPIPE` ao escrever num pipe sem leitores.
+  tratador, o processo é encerrado como antes. Ação padrão: terminar (parar e continuar desde a SE1).
+  `SIGPIPE` ao escrever num pipe sem leitores.
 - **Esperas interrompíveis**: leitura de pipe/terminal, `wait4`, `nanosleep` e futex terminam com
   `EINTR` quando chega um sinal ou o processo está saindo; o escalonador ganhou bloqueio com tempo
   limite (`thread_block`) e interrupção (`thread_interrupt`).
@@ -695,8 +699,8 @@ OpalineOS/
   `pause`, `futex`, `set_tid_address`, `set_robust_list`, `arch_prctl`, `openat`/`newfstatat`/
   `faccessat`/`mkdirat`/`unlinkat`/`renameat`/`readlinkat` relativos a um diretório aberto, `fcntl`,
   `dup3`, `pread64`, `pwrite64`, `access`, `readlink`, `uname`, `getrandom`, `prlimit64`, `getrlimit`,
-  `clock_nanosleep`, `clock_getres`, `gettimeofday`, `time`, `sched_getaffinity`, `getuid`... (um só
-  usuário até a E15). Relógio: todos contam desde o boot (sem RTC ainda).
+  `clock_nanosleep`, `clock_getres`, `gettimeofday`, `time`, `sched_getaffinity`, `getuid`... (na E6
+  havia um só usuário e o relógio contava desde o boot; a SE1 trouxe usuários e o relógio real).
 - **Ambiente padrão** dos programas iniciados pelo kernel: `HOME=/home`, `PATH=/apps:/system/bin`,
   `LANG=C.UTF-8`. Aleatoriedade (`AT_RANDOM`, `getrandom`): RDRAND quando existe, misturado ao TSC.
 - **Testes da E6**: `tests/posix/posixtest.c`, programa C comum, compilado duas vezes —
@@ -714,6 +718,99 @@ OpalineOS/
   o pedido de desligamento vindo de fora). Agora usa o estado da VM (`VMState`) e só acredita em
   "desligada" se a resposta se repetir 1 s depois. Era a origem das falhas esporádicas do VirtualBox
   registradas desde a E4; depois da correção, 10 boots seguidos passaram.
+
+### 10.1.8 Como a SE1 funciona (simplificações da E6 resolvidas)
+
+- **Contagem de referências por página física** (`kernel/mm/pmm.c`): 16 bits por página, guardados
+  junto do bitmap. Uma página de usuário só é liberada quando a última entrada de tabela de páginas
+  (ou objeto de memória) que a usa vai embora.
+- **Copy-on-write no `fork`** (`kernel/mm/uvm.c`): pai e filho mapeiam as mesmas páginas privadas
+  como somente leitura; a primeira escrita de qualquer um dos dois ganha uma cópia própria (ou, se a
+  outra cópia já se foi, a página só volta a ser gravável). O kernel também quebra o COW antes de
+  escrever em memória de usuário (ponteiros de syscalls, `CLONE_CHILD_SETTID`).
+- **`MAP_SHARED` de verdade**: um **objeto de memória** guarda as páginas por índice. Para um arquivo,
+  é o cache de páginas dele (`vnode->memobj`, enquanto houver mapeamento compartilhado); para memória
+  anônima compartilhada, um objeto próprio que o `fork` compartilha. `read()`/`pread()` gravam no
+  arquivo antes o que os mapeamentos mudaram; `write()`/`pwrite()` atualizam as páginas já carregadas,
+  então os dois lados sempre concordam. `msync`, `fsync` e o último `munmap` gravam de volta (todas as
+  páginas de um mapeamento gravável, nunca além do fim do arquivo). Mapear gravável e compartilhado
+  exige o arquivo aberto para leitura e escrita (`EACCES`).
+- **Futex compartilhado**: sem `FUTEX_PRIVATE_FLAG`, um endereço dentro de memória compartilhada vira a
+  chave (objeto, deslocamento), igual em todos os processos que a mapeiam.
+- **`mremap`**: encolhe, cresce no lugar se houver espaço livre logo depois, ou (com `MREMAP_MAYMOVE`)
+  muda a área de lugar levando as páginas e suas referências; `MREMAP_FIXED` também.
+- **`execve` num processo com várias threads**: depois que o novo programa carregou, as outras threads
+  terminam (na próxima volta ao modo usuário; esperas interrompíveis acabam na hora), a que chamou
+  `execve` vira a thread principal (TID = PID) e o processo segue.
+- **Relógio real** (`kernel/dev/rtc.c`): o RTC CMOS é lido uma vez no boot (BCD ou binário, 12/24 h,
+  lido duas vezes até as leituras baterem); daí em diante, hora = leitura + ticks. `CLOCK_REALTIME`,
+  `gettimeofday` e `time` usam esse relógio; os outros relógios contam desde o boot.
+  `clock_settime`/`settimeofday` só para o root. O RTC guarda UTC (o `vm.py` liga `--rtc-use-utc` no
+  VirtualBox; o QEMU já é UTC). Com Windows no mesmo PC (que guarda hora local no RTC), a E14 resolve.
+- **Tempos de arquivo**: o inode do EFS3 ganhou `uid`, `gid` e `atime` no espaço reservado (formato
+  compatível: imagens antigas têm zero ali, ou seja, root e 1970). `mtime`/`ctime` mudam ao gravar,
+  truncar e mexer em diretórios; `ctime` ao mudar dono, modo ou links; `atime` só na criação e no
+  `utimensat` (não muda a cada leitura, para não gravar no disco a cada `read`). `stat` devolve os
+  três com nanossegundos. O `efs3.py` grava a hora do build em todos os arquivos da imagem.
+- **Usuários e permissões** (`opaline/cred.h`, `kernel/proc/cred.c`): uid/euid/suid, gid/egid/sgid e
+  até 32 grupos por processo; `fork` copia, `execve` aplica os bits **setuid/setgid** do arquivo (e passa
+  `AT_SECURE` à musl). O VFS confere, com o uid efetivo: `x` em cada diretório de um caminho, `r`/`w` no
+  `open` (e `w` com `O_TRUNC`), `w`+`x` no diretório para criar, apagar e renomear, o **sticky bit**
+  (em `/tmp`, só o dono apaga), `x` para executar. Root passa em tudo, mas só executa arquivos com algum
+  bit `x`. `access()` usa o uid real. Arquivos novos: modo pedido menos a `umask` (022), dono = uid
+  efetivo, grupo = gid efetivo (ou o do diretório, se ele tiver setgid). `chmod` (dono ou root), `chown`
+  (root; o dono pode trocar o grupo para um dos seus; tira setuid/setgid), `utimensat` (dono, ou só
+  "agora" com permissão de escrita), `umask`, `setuid`/`setreuid`/`setresuid` e os de grupo com as
+  regras POSIX, `getgroups`/`setgroups`, `kill` só para processos do mesmo usuário (ou root),
+  `reboot` só root. `/etc/passwd` e `/etc/group` têm `root` (0) e `user` (1000, em `/home/user`);
+  `/tmp` é 1777 e `/root` é 0700. **O sistema continua iniciando como root**: login, senhas e `sudo`
+  ficam para a E15.
+- **Controle de tarefas**: cada processo tem grupo (`pgid`) e sessão (`sid`); os iniciados pelo kernel
+  abrem uma sessão que é dona do terminal. `setpgid`, `getpgid`, `getpgrp`, `setsid`, `getsid`;
+  `kill(0, …)` e `kill(-pgid, …)` mandam para um grupo. O terminal sabe qual grupo está em **primeiro
+  plano** (`TIOCGPGRP`/`TIOCSPGRP`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCGSID`): **Ctrl+C = `SIGINT`,
+  Ctrl+Z = `SIGTSTP`, Ctrl+\ = `SIGQUIT`** para esse grupo. Um grupo em segundo plano que lê o terminal
+  recebe `SIGTTIN` (ou `EIO`, se o ignora); trocar o primeiro plano de fora dele dá `SIGTTOU`.
+- **Parar e continuar**: `SIGSTOP` (na hora, não pode ser tratado nem bloqueado), `SIGTSTP`, `SIGTTIN` e
+  `SIGTTOU` sem tratador param o processo inteiro: cada thread espera na volta ao modo usuário até
+  `SIGCONT` (ou `SIGKILL`). Um processo sem pai ignora os de parada (ninguém o continuaria). O pai
+  recebe **`SIGCHLD`** quando o filho termina, para ou continua (a não ser com `SA_NOCLDSTOP`), e o
+  `wait4` informa com `WUNTRACED`/`WCONTINUED` (status no formato do Linux); grupos em `wait4(0)` e
+  `wait4(-pgid)`. Um pai que ignora `SIGCHLD` (ou usa `SA_NOCLDWAIT`) não deixa zumbis.
+- **Syscalls que recomeçam**: uma chamada interrompida por um sinal que não roda tratador (ignorado,
+  ou uma parada e continuação) recomeça sozinha em vez de devolver `EINTR`, como no Linux; com
+  tratador, só com `SA_RESTART`. Uma leitura bloqueada que o Ctrl+Z parou continua normalmente
+  depois do `fg`.
+- **`poll`/`ppoll`** (adiantado da SE3, porque a musl usa `poll` ao iniciar programas setuid): pipes e
+  terminal dizem quando estão prontos e avisam a cada mudança; arquivos estão sempre prontos. Espera
+  por eventos com tempo limite e máscara de sinais (`ppoll`). `select` fica para a SE3.
+- **`sysinfo`**: memória total e livre (usada pelo teste do copy-on-write).
+- **Shell**: cada comando roda como um job em primeiro plano (`spawn` ganhou a opção
+  `SPAWN_FOREGROUND`); o próprio shell ignora os sinais do teclado; Ctrl+Z mostra
+  `[programa stopped; type fg to continue it]` e `fg` continua o programa.
+- **Testes da SE1** (no `posixtest`, que passou de 63 para 104 verificações, dinâmico e estático):
+  - um `fork` de 16 MiB já tocados gasta menos de 4 MiB, e as escritas do filho viram cópias;
+  - memória anônima compartilhada com um futex entre processos;
+  - mapeamento compartilhado de arquivo nos dois sentidos, e com um filho;
+  - `mremap` que muda de lugar e cresce;
+  - `execve` a partir de 4 threads;
+  - relógio depois de 2026, `mtime` de arquivo novo e `utimensat`;
+  - `umask`, `/tmp` 1777, setuid 04755, `chown`;
+  - **um filho como usuário 1000** (setgid/setuid) confere 18 recusas e permissões (`EACCES`, `EPERM`,
+    sticky bit, programa setuid com `AT_SECURE`, `reboot` e `clock_settime` recusados, `kill` no root
+    recusado);
+  - `SIGSTOP`/`SIGCONT`/`SIGTSTP`/`SIGKILL` com `WUNTRACED`/`WCONTINUED` e `SIGCHLD`;
+  - `read` parado no meio que recomeça;
+  - grupos com `setpgid`, `kill(-pgid)`, `kill(0)` e `setsid`.
+
+  O teste do shell digita `posixtest sleep` (um programa que dorme 300 s) e exige que **Ctrl+C**
+  devolva o prompt; depois para com **Ctrl+Z**, continua com `fg` e encerra com Ctrl+C.
+
+  Testes negativos feitos, cada um acusado: sem copiar no COW, o teste do `fork` falha (o pai vê as
+  escritas do filho); sem a checagem de permissão, 6 verificações do usuário 1000 falham; sem marcar
+  as threads paradas para recomeçar, a leitura volta com `EINTR`; sem atualizar as páginas no `write()`,
+  o mapeamento compartilhado fica velho. (Este último exigiu corrigir o teste: a página precisava já
+  estar carregada.)
 
 ### 10.2 Geral
 
@@ -768,6 +865,8 @@ OpalineOS/
 | 2026-11-19 | **E4 concluída**: processos com espaço de endereços próprio, carregador ELF64, SYSCALL/SYSRET com numeração Linux e verificação de ponteiros, FPU por thread, falhas de programas encerram só o processo. Biblioteca mínima de usuário (`user/lib`) sob LGPL-3.0-or-later |
 | 2026-11-19 | **E5 concluída**: PCI + AHCI, cache de blocos, GPT com partição raiz EFS3, VFS com nomes UTF-8 em NFC, devfs, pipes, TTY canônico, teclado PS/2, syscalls de arquivos com numeração Linux, `spawn` (1000) + `wait4`, shell mínimo. Programas agora vêm do disco (`/apps`, `/system/bin`) |
 | 2026-11-20 | **E6 concluída**: musl 1.2.6 sem modificações (build próprio em Python, SHA-256 conferido, patch da CVE-2026-107891), `libc.so` como `/lib/ld-musl-x86_64.so.1`, runtime do compilador próprio em `ports/rt` (LGPL). Kernel: memória por áreas com paginação sob demanda, `mmap`/`mprotect`/`brk`, `fork`/`vfork`/`clone`/`execve` com ELF dinâmico e vetor auxiliar, threads com TLS e futex, sinais no formato do Linux, esperas interrompíveis. STAR com RPL 3 (correção para CPUs AMD). Simplificações registradas: `MAP_SHARED` privado, `fork` sem copy-on-write, `execve` só em processo de uma thread |
+| 2026-11-21 | Antes da E7, quatro **sub-etapas** (SE1–SE4) para o que ficou simplificado ou pendente até a E6. Usuários: permissões reais no kernel já na SE1, mas o sistema continua iniciando como root (login e `sudo` na E15). Controle de tarefas com Ctrl+C/Ctrl+Z junto na SE1 |
+| 2026-11-21 | **SE1 concluída**: refcount de páginas, copy-on-write, `MAP_SHARED` real com cache de páginas coerente com `read`/`write`, futex compartilhado, `mremap` completo, `execve` com threads, RTC e tempos de arquivo, uid/gid/modo no EFS3 e permissões POSIX no VFS, setuid/setgid, grupos e sessões, parar/continuar, `SIGCHLD`, Ctrl+C/Ctrl+Z/Ctrl+\\, syscalls que recomeçam, `poll`/`ppoll`. `reboot` só root |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema

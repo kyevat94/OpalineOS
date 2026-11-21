@@ -33,11 +33,12 @@
 #include <opaline/panic.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
+#include <opaline/time.h>
 #include <opaline/serial.h>
 #include <opaline/string.h>
 #include <opaline/vfs.h>
 
-#define OPALINE_VERSION "0.6.0-e6"
+#define OPALINE_VERSION "0.6.1-se1"
 
 static const char *const region_names[] = {
     "?", "usable", "reserved", "ACPI reclaimable", "ACPI NVS", "MMIO", "bad",
@@ -86,7 +87,7 @@ static void mount_root_file_system(void) {
 static int run_program(const char *path) {
     const char *argv[] = {path, NULL};
     int err;
-    struct process *p = process_spawn_path(path, argv, NULL, &err);
+    struct process *p = process_spawn_path(path, argv, NULL, 0, &err);
     if (!p) return err;
     return process_wait(p);
 }
@@ -213,6 +214,7 @@ void kmain(struct boot_info *bi) {
             timer_hz / 1000000, TIMER_HZ, TIME_SLICE_MS);
     console_start_cursor_blink();
     if (!sched_selftest()) panic("scheduler self-test failed");
+    time_init();   /* the wall clock: the RTC plus the timer from now on */
     static const char sched_marker[] = "TEST_OK E3 scheduler\n";
     serial_write(sched_marker, sizeof sched_marker - 1);
 

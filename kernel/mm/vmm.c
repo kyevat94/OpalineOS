@@ -335,7 +335,7 @@ void vmm_destroy_address_space(u64 page_table) {
                 if (!(pd[k] & PTE_PRESENT)) continue;
                 u64 *pt = phys_to_virt(pd[k] & PTE_ADDR);
                 for (unsigned l = 0; l < 512; l++)
-                    if (pt[l] & PTE_PRESENT) pmm_free_page(pt[l] & PTE_ADDR);
+                    if (pt[l] & PTE_PRESENT) pmm_page_put(pt[l] & PTE_ADDR);   /* may be shared */
                 pmm_free_page(pd[k] & PTE_ADDR);
             }
             pmm_free_page(pdpt[j] & PTE_ADDR);

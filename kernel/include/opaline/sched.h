@@ -13,6 +13,7 @@
 #ifndef OPALINE_SCHED_H
 #define OPALINE_SCHED_H
 
+#include <opaline/cred.h>
 #include <opaline/types.h>
 
 #define TIMER_HZ        1000
@@ -29,6 +30,11 @@ enum thread_state {
 struct file;
 struct vnode;
 struct mm;
+
+/* A list of blocked threads (see waitqueue_wait below). */
+struct waitqueue {
+    struct thread *head;
+};
 
 #define PROCESS_MAX_FDS 64
 #define NSIG 65                   /* signals 1..64, as in Linux */
@@ -51,6 +57,15 @@ struct process {
     bool user;                /* has a user-mode address space */
     struct thread *main_thread;
     struct mm *mm;            /* user memory (stage E6); shared by CLONE_VM */
+    struct cred cred;         /* user and groups (opaline/cred.h) */
+    u32 umask;
+    /* job control (stage SE1) */
+    u64 pgid, sid;            /* process group and session */
+    bool ctty;                /* the terminal is its controlling terminal */
+    bool stopped;             /* SIGSTOP/SIGTSTP...: every thread waits for SIGCONT */
+    int stop_sig;
+    int report;               /* for the parent's wait4: 1 stopped, 2 continued, 0 nothing new */
+    struct waitqueue stop_wq;
     /* files (stage E5) */
     struct file *fds[PROCESS_MAX_FDS];
     u8 fd_flags[PROCESS_MAX_FDS];   /* FD_CLOEXEC */
@@ -67,6 +82,7 @@ struct process {
     int exit_code;            /* for exit_group */
     int signal;               /* set when killed by a signal (POSIX signal number) */
     bool vfork_done;          /* a CLONE_VFORK child exec'd or ended */
+    struct thread *exec_thread;   /* a thread in execve, waiting for the others to end */
     /* signals (stage E6) */
     struct sigaction_k sigactions[NSIG];
     u64 sigpending;           /* sent to the process, taken by any thread that does not block it */
@@ -106,6 +122,8 @@ struct thread {
     u64 altstack_sp, altstack_size;
     int altstack_flags;
     bool iret_return;         /* the user registers were rewritten: return through IRETQ */
+    bool exit_pending;        /* another thread's execve: end at the next return to user mode */
+    bool restart_syscall;     /* a stop interrupted it: an EINTR system call starts again */
     void *start_frame;        /* new user thread: the registers it starts with (kmalloc'd) */
 };
 
@@ -139,11 +157,10 @@ void thread_detach(struct thread *t); /* nobody will join: freed automatically w
  * waitqueue_wait_intr() also returns -EINTR when the thread is interrupted (a signal
  * arrived, or the process is ending); the caller then gives up and returns -EINTR.
  */
-struct waitqueue {
-    struct thread *head;
-};
 void waitqueue_wait(struct waitqueue *wq);      /* interrupts disabled */
 int waitqueue_wait_intr(struct waitqueue *wq);  /* interrupts disabled; 0 or -EINTR */
+/* Interruptible, at most `ms` milliseconds (0: no limit): 0, -ETIMEDOUT or -EINTR. */
+int waitqueue_wait_timeout(struct waitqueue *wq, u64 ms);
 void waitqueue_wake_all(struct waitqueue *wq);
 
 /*

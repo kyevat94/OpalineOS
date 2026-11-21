@@ -13,12 +13,15 @@
 #include <opaline/arch/idt.h>
 #include <opaline/arch/syscall.h>
 #include <opaline/console.h>
+#include <opaline/cred.h>
 #include <opaline/errno.h>
 #include <opaline/mm.h>
 #include <opaline/power.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
+#include <opaline/spinlock.h>
 #include <opaline/string.h>
+#include <opaline/time.h>
 #include <opaline/uvm.h>
 #include <opaline/vfs.h>
 
@@ -42,7 +45,10 @@ enum {
     SYS_exit_group = 231, SYS_tgkill = 234, SYS_openat = 257, SYS_mkdirat = 258, SYS_newfstatat = 262,
     SYS_unlinkat = 263, SYS_renameat = 264, SYS_readlinkat = 267, SYS_fchmodat = 268, SYS_faccessat = 269,
     SYS_set_robust_list = 273, SYS_dup3 = 292, SYS_pipe2 = 293, SYS_prlimit64 = 302, SYS_renameat2 = 316,
-    SYS_getrandom = 318, SYS_faccessat2 = 439,
+    SYS_getrandom = 318, SYS_faccessat2 = 439, SYS_creat = 85, SYS_lchown = 94, SYS_setreuid = 113,
+    SYS_setregid = 114, SYS_setgroups = 116, SYS_setresuid = 117, SYS_getresuid = 118, SYS_setresgid = 119,
+    SYS_getresgid = 120, SYS_setfsuid = 122, SYS_setfsgid = 123, SYS_settimeofday = 164, SYS_clock_settime = 227,
+    SYS_fchownat = 260, SYS_utimensat = 280, SYS_sysinfo = 99, SYS_poll = 7, SYS_ppoll = 271,
     SYS_opaline_spawn = 1000,   /* spawn(path, argv): starts a program, returns its pid */
 };
 
@@ -138,8 +144,8 @@ static i64 sys_pread(u64 fd, u64 buf, u64 len, i64 off, bool write) {
     if (!user_ok(buf, len, !write)) return -EFAULT;
     u32 mode = f->flags & O_ACCMODE;
     if (write ? mode == O_RDONLY : mode == O_WRONLY) return -EBADF;
-    if (write) return f->vn->ops->write ? f->vn->ops->write(f->vn, (u64)off, (const void *)buf, len) : -EINVAL;
-    return f->vn->ops->read ? f->vn->ops->read(f->vn, (u64)off, (void *)buf, len) : -EINVAL;
+    if (write) return vnode_write_at(f->vn, (u64)off, (const void *)buf, len);
+    return vnode_read_at(f->vn, (u64)off, (void *)buf, len);
 }
 
 static i64 sys_rwv(u64 fd, u64 iov_addr, u64 count, bool write) {
@@ -157,7 +163,7 @@ static i64 sys_rwv(u64 fd, u64 iov_addr, u64 count, bool write) {
     return total;
 }
 
-static i64 sys_openat(i64 dirfd, u64 path_addr, u64 flags) {
+static i64 sys_openat(i64 dirfd, u64 path_addr, u64 flags, u64 mode) {
     char path[PATH_MAX];
     int r = copy_string(path_addr, path, sizeof path);
     if (r < 0) return r;
@@ -165,7 +171,7 @@ static i64 sys_openat(i64 dirfd, u64 path_addr, u64 flags) {
     if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
     if (path[0] == '/') dir = NULL;
     struct file *f;
-    r = vfs_open(path, dir, (u32)flags & ~(u32)O_CLOEXEC, &f);
+    r = vfs_open(path, dir, (u32)flags & ~(u32)O_CLOEXEC, (u32)mode, &f);
     if (r < 0) return r;
     r = install(f, 0, flags & O_CLOEXEC);
     if (r < 0) file_put(f);
@@ -191,6 +197,11 @@ static void to_linux_stat(const struct vnode_stat *s, struct linux_stat *out) {
     out->st_size = (i64)s->size;
     out->st_blksize = 4096;
     out->st_blocks = (i64)s->blocks;
+    out->st_uid = s->uid;
+    out->st_gid = s->gid;
+    out->st_atime = (i64)(s->atime / NS_PER_SEC), out->st_atime_nsec = (i64)(s->atime % NS_PER_SEC);
+    out->st_mtime = (i64)(s->mtime / NS_PER_SEC), out->st_mtime_nsec = (i64)(s->mtime % NS_PER_SEC);
+    out->st_ctime = (i64)(s->ctime / NS_PER_SEC), out->st_ctime_nsec = (i64)(s->ctime % NS_PER_SEC);
 }
 
 static i64 sys_fstat(u64 fd, u64 buf) {
@@ -223,18 +234,19 @@ static i64 sys_fstatat(i64 dirfd, u64 path_addr, u64 buf, u64 flags) {
     return 0;
 }
 
-static i64 sys_faccessat(i64 dirfd, u64 path_addr) {
+/* access(): mode 0 = exists, else R_OK 4 | W_OK 2 | X_OK 1; real ids unless AT_EACCESS */
+static i64 sys_faccessat(i64 dirfd, u64 path_addr, u64 mode, u64 flags) {
     char path[PATH_MAX];
+    if (mode & ~7ULL) return -EINVAL;
     int r = copy_string(path_addr, path, sizeof path);
     if (r < 0) return r;
     struct vnode *dir = NULL;
     if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
-    struct vnode_stat s;
-    return vfs_stat(path, dir, &s);   /* no permissions yet: existing means accessible */
+    return vfs_access(path, dir, (int)mode, !(flags & 0x200 /* AT_EACCESS */));
 }
 
 static i64 sys_readlinkat(i64 dirfd, u64 path_addr) {
-    i64 r = sys_faccessat(dirfd, path_addr);
+    i64 r = sys_faccessat(dirfd, path_addr, 0, 0);
     return r < 0 ? r : -EINVAL;   /* there are no symbolic links */
 }
 
@@ -261,6 +273,8 @@ static i64 sys_ioctl(u64 fd, u64 request, u64 arg) {
     if (!f) return -EBADF;
     if (!f->vn->ops->ioctl) return -ENOTTY;
     if (request == TIOCGWINSZ && !user_ok(arg, 8, true)) return -EFAULT;
+    if ((request == 0x540F || request == 0x5429) && !user_ok(arg, 4, true)) return -EFAULT;   /* TIOCGPGRP, TIOCGSID */
+    if (request == 0x5410 && !user_ok(arg, 4, false)) return -EFAULT;                        /* TIOCSPGRP */
     return f->vn->ops->ioctl(f->vn, request, arg);
 }
 
@@ -341,6 +355,7 @@ static i64 sys_ftruncate(u64 fd, i64 size) {
 static i64 sys_fsync(u64 fd) {
     struct file *f = get_file(fd);
     if (!f) return -EBADF;
+    if (f->vn->memobj) memobj_sync(f->vn->memobj);   /* shared mappings first */
     return f->vn->ops->sync ? f->vn->ops->sync(f->vn) : 0;
 }
 
@@ -449,13 +464,13 @@ static i64 sys_getcwd(u64 buf, u64 size) {
 }
 
 /* mkdir(at), rmdir, unlink(at): op 0 = mkdir, 1 = rmdir, 2 = unlink */
-static i64 path_call(i64 dirfd, u64 path_addr, int op) {
+static i64 path_call(i64 dirfd, u64 path_addr, int op, u64 mode) {
     char path[PATH_MAX];
     int r = copy_string(path_addr, path, sizeof path);
     if (r < 0) return r;
     struct vnode *dir = NULL;
     if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
-    if (op == 0) return vfs_mkdir(path, dir);
+    if (op == 0) return vfs_mkdir(path, dir, (u32)mode);
     return vfs_remove(path, dir, op == 1);
 }
 
@@ -470,6 +485,68 @@ static i64 sys_renameat(i64 olddir, u64 old_addr, i64 newdir, u64 new_addr) {
     if (b[0] != '/' && (r = at_dir(newdir, &db)) < 0) return r;
     if (a[0] != '/' && b[0] != '/' && da != db) return -EXDEV;   /* vfs_rename takes one base directory */
     return vfs_rename(a, b, a[0] != '/' ? da : db);
+}
+
+/* ---- poll ------------------------------------------------------------------------------------- */
+
+struct pollfd_k {
+    i32 fd;
+    i16 events, revents;
+};
+
+/* Waits until one of the files is ready, the time (ms; ~0 = for ever) passes or a signal comes. */
+static i64 do_poll(u64 fds_addr, u64 nfds, u64 timeout_ms) {
+    if (nfds > PROCESS_MAX_FDS * 4) return -EINVAL;
+    if (nfds && !user_ok(fds_addr, nfds * sizeof(struct pollfd_k), true)) return -EFAULT;
+    struct pollfd_k *fds = (struct pollfd_k *)fds_addr;
+    u64 deadline = timeout_ms == ~0ULL ? 0 : time_ms() + timeout_ms;
+    for (;;) {
+        u64 gen = vfs_poll_generation();
+        i64 ready = 0;
+        for (u64 i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;
+            struct file *f = get_file((u64)fds[i].fd);
+            u32 ev = f ? file_poll(f) : POLLNVAL;
+            ev &= (u32)(u16)fds[i].events | POLLERR | POLLHUP | POLLNVAL;   /* these three always count */
+            fds[i].revents = (i16)ev;
+            if (ev) ready++;
+        }
+        if (ready || timeout_ms == 0) return ready;
+        u64 now = time_ms();
+        if (deadline && now >= deadline) return 0;
+        u64 fl = irq_save();
+        int r = 0;
+        if (vfs_poll_generation() == gen) r = waitqueue_wait_timeout(vfs_poll_queue(), deadline ? deadline - now : 0);
+        irq_restore(fl);
+        if (r == -EINTR) return -EINTR;
+    }
+}
+
+static i64 sys_ppoll(u64 fds, u64 nfds, u64 tsp, u64 sigmask, u64 size) {
+    u64 ms = ~0ULL;
+    if (tsp) {
+        if (!user_ok(tsp, sizeof(struct timespec), false)) return -EFAULT;
+        struct timespec t = *(const struct timespec *)tsp;
+        if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000) return -EINVAL;
+        ms = (u64)t.tv_sec * 1000 + ((u64)t.tv_nsec + 999999) / 1000000;
+    }
+    struct thread *t = thread_current();
+    u64 old = t->sigmask;
+    if (sigmask) {   /* the mask applies only while waiting */
+        if (size != 8 || !user_ok(sigmask, 8, false)) return -EINVAL;
+        t->sigmask = *(const u64 *)sigmask & ~((1ULL << 8) | (1ULL << 18));   /* never SIGKILL/SIGSTOP */
+    }
+    i64 r = do_poll(fds, nfds, ms);
+    if (sigmask) {
+        if (r == -EINTR) {   /* a handler must run with the temporary mask: restore at sigreturn */
+            t->saved_sigmask = old;
+            t->restore_sigmask = true;
+        } else {
+            t->sigmask = old;
+        }
+    }
+    return r;
 }
 
 /* ---- programs --------------------------------------------------------------------------- */
@@ -513,7 +590,7 @@ static i64 run_program(struct interrupt_frame *f, u64 path_addr, u64 argv_addr, 
     if (result == 0) {
         if (spawn) {
             int err;
-            struct process *child = process_spawn_path(path, argv, self(), &err);
+            struct process *child = process_spawn_path(path, argv, self(), (int)envp_addr & SPAWN_FOREGROUND, &err);
             result = child ? (i64)child->pid : err;
         } else {
             result = process_execve(f, path, argv, envp);
@@ -527,15 +604,21 @@ static i64 run_program(struct interrupt_frame *f, u64 path_addr, u64 argv_addr, 
 static i64 sys_wait4(i64 pid, u64 status_addr, u64 options) {
     if (status_addr && !user_ok(status_addr, 4, true)) return -EFAULT;
     int status = 0;
-    i64 r = process_wait_child(self(), pid, &status, options & 1 /* WNOHANG */);
+    if (options & ~(u64)(1 | 2 | 8 | 0x40000000 /* __WNOTHREAD */)) return -EINVAL;
+    i64 r = process_wait_child(self(), pid, &status, options);
     if (r > 0 && status_addr) *(int *)status_addr = status;
     return r;
 }
 
+static bool may_signal(struct process *p);
+
 static i64 sys_kill(i64 pid, u64 sig) {
     if (sig >= NSIG) return -EINVAL;
-    struct process *p = pid == 0 || pid == -1 ? self() : process_by_pid((u64)(pid < 0 ? -pid : pid));
+    if (pid == 0) return process_signal_group(self()->pgid, (int)sig, true);   /* the caller's group */
+    if (pid < -1) return process_signal_group((u64)-pid, (int)sig, true);
+    struct process *p = pid == -1 ? self() : process_by_pid((u64)pid);   /* -1 ("everyone"): only itself for now */
     if (!p) return -ESRCH;
+    if (!may_signal(p)) return -EPERM;
     return sig ? signal_send_process(p, (int)sig) : 0;
 }
 
@@ -543,13 +626,14 @@ static i64 sys_tgkill(i64 tgid, i64 tid, u64 sig) {
     if (sig >= NSIG || tid <= 0) return -EINVAL;
     struct thread *t = thread_by_tid((u64)tid);
     if (!t || (tgid > 0 && t->process->pid != (u64)tgid)) return -ESRCH;
+    if (!may_signal(t->process)) return -EPERM;
     return sig ? signal_send_thread(t, (int)sig) : 0;
 }
 
-/* reboot(magic1, magic2, cmd): the Linux interface. Any process may call it for now (there are
-   no users yet); stage E15 restricts it to administrators. */
+/* reboot(magic1, magic2, cmd): the Linux interface; only root may call it. */
 static i64 sys_reboot(u64 magic1, u64 magic2, u64 cmd) {
     if ((u32)magic1 != 0xFEE1DEAD || (u32)magic2 != 672274793) return -EINVAL;
+    if (cred_current()->euid != 0) return -EPERM;
     if ((u32)cmd == 0x4321FEDC) system_poweroff();   /* LINUX_REBOOT_CMD_POWER_OFF */
     if ((u32)cmd == 0x01234567) system_reboot();     /* LINUX_REBOOT_CMD_RESTART */
     return -EINVAL;
@@ -564,30 +648,35 @@ static i64 sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, i64 fd, u64 off) {
         if (!f) return -EBADF;
         if (f->vn->type != VN_FILE) return -ENODEV;
         if ((f->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+        bool shared = (flags & MAP_SHARED_VALIDATE) != MAP_PRIVATE;
+        if (shared && (prot & PROT_WRITE) && (f->flags & O_ACCMODE) != O_RDWR) return -EACCES;
         file = f->vn;
     }
     return mm_map(self()->mm, addr, len, (u32)prot, (u32)flags, file, off);
 }
 
-static i64 sys_mremap(u64 old, u64 old_len, u64 new_len) {
-    if (old % PAGE_SIZE || !new_len) return -EINVAL;
-    old_len = ALIGN_UP(old_len, PAGE_SIZE);
-    new_len = ALIGN_UP(new_len, PAGE_SIZE);
-    if (new_len == old_len) return (i64)old;
-    if (new_len < old_len) {   /* shrinking: drop the tail */
-        int r = mm_unmap(self()->mm, old + new_len, old_len - new_len);
-        return r < 0 ? r : (i64)old;
-    }
-    return -ENOMEM;   /* growing is not supported yet: callers fall back to a new mapping */
-}
-
 /* ---- time --------------------------------------------------------------------------------- */
 
+/* CLOCK_REALTIME (0) and CLOCK_REALTIME_COARSE (5) are the wall clock; the others count from boot. */
+static bool realtime_clock(u64 clock) { return clock == 0 || clock == 5; }
+
+static u64 clock_ns(u64 clock) { return realtime_clock(clock) ? time_realtime_ns() : time_monotonic_ns(); }
+
 static i64 sys_clock_gettime(u64 clock, u64 tp) {
-    if (clock > 7) return -EINVAL;   /* every clock counts from boot, in milliseconds (no RTC yet) */
+    if (clock > 7) return -EINVAL;
     if (!user_ok(tp, sizeof(struct timespec), true)) return -EFAULT;
-    u64 ms = time_ms();
-    *(struct timespec *)tp = (struct timespec){(i64)(ms / 1000), (i64)(ms % 1000) * 1000000};
+    u64 ns = clock_ns(clock);
+    *(struct timespec *)tp = (struct timespec){(i64)(ns / NS_PER_SEC), (i64)(ns % NS_PER_SEC)};
+    return 0;
+}
+
+static i64 sys_clock_settime(u64 clock, u64 tp) {
+    if (clock != 0) return -EINVAL;
+    if (cred_current()->euid != 0) return -EPERM;
+    if (!user_ok(tp, sizeof(struct timespec), false)) return -EFAULT;
+    struct timespec t = *(const struct timespec *)tp;
+    if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000) return -EINVAL;
+    time_set_realtime_ns((u64)t.tv_sec * NS_PER_SEC + (u64)t.tv_nsec);
     return 0;
 }
 
@@ -599,7 +688,10 @@ static i64 sys_clock_nanosleep(u64 clock, u64 flags, u64 req, u64 rem) {
     if (t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000) return -EINVAL;
     u64 ms = (u64)t.tv_sec * 1000 + ((u64)t.tv_nsec + 999999) / 1000000;
     u64 start = time_ms();
-    if (flags & 1) ms = ms > start ? ms - start : 0;   /* TIMER_ABSTIME */
+    if (flags & 1) {   /* TIMER_ABSTIME: until that time of the clock */
+        u64 now = clock_ns(clock) / 1000000;
+        ms = ms > now ? ms - now : 0;
+    }
     int r = thread_sleep_intr(ms);
     if (r < 0 && rem && !(flags & 1)) {
         u64 left = ms - MIN(ms, time_ms() - start);
@@ -612,7 +704,7 @@ static i64 sys_clock_nanosleep(u64 clock, u64 flags, u64 req, u64 rem) {
 
 static i64 sys_uname(u64 buf) {
     if (!user_ok(buf, 6 * 65, true)) return -EFAULT;
-    static const char *const fields[6] = {"OpalineOS", "opaline", "0.6.0-e6", "#1 OpalineOS", "x86_64", "(none)"};
+    static const char *const fields[6] = {"OpalineOS", "opaline", "0.6.1-se1", "#1 OpalineOS", "x86_64", "(none)"};
     char *out = (char *)buf;
     memset(out, 0, 6 * 65);
     for (int i = 0; i < 6; i++) memcpy(out + i * 65, fields[i], strlen(fields[i]));
@@ -628,6 +720,20 @@ static i64 sys_prlimit(u64 pid, u64 resource, u64 new_limit, u64 old) {
         u64 v = resource == 3 ? USER_STACK_SIZE : resource == 7 ? PROCESS_MAX_FDS : ~0ULL;   /* STACK, NOFILE */
         ((u64 *)old)[0] = ((u64 *)old)[1] = v;
     }
+    return 0;
+}
+
+/* sysinfo(): uptime, memory and the number of processes (struct sysinfo of Linux, 112 bytes). */
+static i64 sys_sysinfo(u64 buf) {
+    if (!user_ok(buf, 112, true)) return -EFAULT;
+    struct pmm_stats ps;
+    pmm_get_stats(&ps);
+    u8 *out = (u8 *)buf;
+    memset(out, 0, 112);
+    *(i64 *)out = (i64)(time_monotonic_ns() / NS_PER_SEC);   /* uptime */
+    *(u64 *)(out + 32) = ps.total_pages;                       /* totalram */
+    *(u64 *)(out + 40) = ps.free_pages;                        /* freeram */
+    *(u32 *)(out + 104) = (u32)PAGE_SIZE;                      /* mem_unit: the values count pages */
     return 0;
 }
 
@@ -654,6 +760,148 @@ static i64 sys_getrandom(u64 buf, u64 len) {
     return (i64)len;
 }
 
+/* ---- owners, permissions and times --------------------------------------------------------- */
+
+#define UTIME_NOW  ((1L << 30) - 1)
+#define UTIME_OMIT ((1L << 30) - 2)
+
+/*
+ * chmod (op 'm', a = mode), chown (op 'o', b = uid, c = gid, -1 keeps) and utimensat
+ * (op 't', a = struct timespec[2] or 0) on a path relative to dirfd, or on the open file
+ * dirfd itself with AT_EMPTY_PATH and no path.
+ */
+static i64 sys_attr(i64 dirfd, u64 path_addr, u64 flags, int op, u64 a, u64 b, u64 c) {
+    struct vnode *v;
+    int r;
+    if (!path_addr && (flags & AT_EMPTY_PATH)) {
+        struct file *f = get_file((u64)dirfd);
+        if (!f) return -EBADF;
+        v = f->vn;
+        vnode_ref(v);
+    } else {
+        char path[PATH_MAX];
+        r = copy_string(path_addr, path, sizeof path);
+        if (r < 0) return r;
+        struct vnode *dir = NULL;
+        if (path[0] != '/' && (r = at_dir(dirfd, &dir)) < 0) return r;
+        r = vfs_lookup(path, dir, &v);
+        if (r < 0) return r;
+    }
+    struct vnode_stat st;
+    r = v->ops->stat ? v->ops->stat(v, &st) : -EPERM;
+    const struct cred *cr = cred_current();
+    bool owner = cr->euid == 0 || cr->euid == st.uid;
+    struct vnode_attr attr = {0};
+    if (r == 0 && op == 'm') {
+        if (!owner) r = -EPERM;
+        attr.mask = ATTR_MODE;
+        attr.mode = (u32)a & 07777;
+        if (cr->euid && !cred_in_group(cr, st.gid)) attr.mode &= ~(u32)S_ISGID;   /* as Linux */
+    } else if (r == 0 && op == 'o') {
+        u32 uid = (u32)b, gid = (u32)c;
+        bool change_uid = uid != (u32)-1 && uid != st.uid, change_gid = gid != (u32)-1 && gid != st.gid;
+        if (change_uid && cr->euid) r = -EPERM;   /* only root gives files away */
+        if (change_gid && cr->euid && (cr->euid != st.uid || !cred_in_group(cr, gid))) r = -EPERM;
+        attr.mask = (change_uid ? ATTR_UID : 0) | (change_gid ? ATTR_GID : 0);
+        attr.uid = uid;
+        attr.gid = gid;
+        if ((st.mode & S_IFMT) == S_IFREG && (st.mode & (S_ISUID | S_ISGID)) && attr.mask) {
+            attr.mask |= ATTR_MODE;   /* a new owner does not inherit the set-id bits */
+            attr.mode = st.mode & 07777 & ~(u32)(S_ISUID | S_ISGID);
+        }
+    } else if (r == 0 && op == 't') {
+        u64 now = time_realtime_ns();
+        struct timespec ts[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+        if (a) {
+            if (!user_ok(a, sizeof ts, false)) r = -EFAULT;
+            else memcpy(ts, (const void *)a, sizeof ts);
+        }
+        bool only_now = ts[0].tv_nsec == UTIME_NOW && ts[1].tv_nsec == UTIME_NOW;
+        for (int i = 0; i < 2 && r == 0; i++) {
+            if (ts[i].tv_nsec == UTIME_OMIT) continue;
+            if (ts[i].tv_nsec != UTIME_NOW && (ts[i].tv_nsec < 0 || ts[i].tv_nsec >= 1000000000 || ts[i].tv_sec < 0)) {
+                r = -EINVAL;
+                break;
+            }
+            u64 t = ts[i].tv_nsec == UTIME_NOW ? now : (u64)ts[i].tv_sec * NS_PER_SEC + (u64)ts[i].tv_nsec;
+            attr.mask |= i == 0 ? ATTR_ATIME : ATTR_MTIME;
+            if (i == 0) attr.atime = t;
+            else attr.mtime = t;
+        }
+        /* "now" needs write permission; any other time needs ownership */
+        if (r == 0 && !owner && (!only_now || vfs_permission(v, MAY_WRITE) < 0)) r = only_now ? -EACCES : -EPERM;
+    }
+    if (r == 0 && attr.mask) r = vfs_setattr(v, &attr);
+    vnode_put(v);
+    return r;
+}
+
+/* setuid family: root may set anything; others only switch among their real, effective
+   and saved ids. -1 keeps an id. */
+static bool id_allowed(u32 id, u32 a, u32 b, u32 c) { return id == (u32)-1 || id == a || id == b || id == c; }
+
+static i64 set_ids(bool group, u64 r_in, u64 e_in, u64 s_in) {
+    struct cred *c = &self()->cred;
+    u32 *real = group ? &c->gid : &c->uid, *eff = group ? &c->egid : &c->euid, *saved = group ? &c->sgid : &c->suid;
+    u32 r = (u32)r_in, e = (u32)e_in, s = (u32)s_in;
+    if (c->euid != 0 && !(id_allowed(r, *real, *eff, *saved) && id_allowed(e, *real, *eff, *saved) &&
+                          id_allowed(s, *real, *eff, *saved)))
+        return -EPERM;
+    if (r != (u32)-1) *real = r;
+    if (e != (u32)-1) *eff = e;
+    if (s != (u32)-1) *saved = s;
+    return 0;
+}
+
+static i64 sys_setid(bool group, u64 id) {   /* setuid / setgid */
+    struct cred *c = &self()->cred;
+    u32 v = (u32)id;
+    if (v == (u32)-1) return -EINVAL;
+    if (c->euid == 0) return set_ids(group, v, v, v);
+    return set_ids(group, (u64)-1, v, (u64)-1);   /* allowed only if v is the real or saved id */
+}
+
+static i64 sys_setreid(bool group, u64 r_in, u64 e_in) {   /* setreuid / setregid */
+    struct cred *c = &self()->cred;
+    u32 *real = group ? &c->gid : &c->uid, *eff = group ? &c->egid : &c->euid, *saved = group ? &c->sgid : &c->suid;
+    u32 r = (u32)r_in, e = (u32)e_in, none = (u32)-1;
+    if (c->euid != 0 && ((r != none && r != *real && r != *eff) || !id_allowed(e, *real, *eff, *saved))) return -EPERM;
+    u32 old_real = *real;
+    if (r != none) *real = r;
+    if (e != none) *eff = e;
+    if (r != none || (e != none && e != old_real)) *saved = *eff;   /* as Linux */
+    return 0;
+}
+
+static i64 sys_getresid(bool group, u64 ra, u64 ea, u64 sa) {
+    if (!user_ok(ra, 4, true) || !user_ok(ea, 4, true) || !user_ok(sa, 4, true)) return -EFAULT;
+    const struct cred *c = &self()->cred;
+    *(u32 *)ra = group ? c->gid : c->uid;
+    *(u32 *)ea = group ? c->egid : c->euid;
+    *(u32 *)sa = group ? c->sgid : c->suid;
+    return 0;
+}
+
+static i64 sys_groups(bool set, u64 size, u64 list) {
+    struct cred *c = &self()->cred;
+    if (!set) {
+        if (!size) return c->ngroups;
+        if (size < c->ngroups) return -EINVAL;
+        if (!user_ok(list, c->ngroups * 4, true)) return -EFAULT;
+        memcpy((void *)list, c->groups, c->ngroups * 4);
+        return c->ngroups;
+    }
+    if (c->euid) return -EPERM;
+    if (size > NGROUPS_MAX) return -EINVAL;
+    if (size && !user_ok(list, size * 4, false)) return -EFAULT;
+    memcpy(c->groups, (const void *)list, size * 4);
+    c->ngroups = (u32)size;
+    return 0;
+}
+
+/* May the caller send a signal to p? Root, or the same user (real or effective vs real or saved). */
+static bool may_signal(struct process *p) { return cred_may_signal(cred_current(), &p->cred); }
+
 int syscall_dispatch(struct interrupt_frame *f) {
     u64 nr = f->rax;
     f->error = nr;   /* kept for SA_RESTART (signal.c) */
@@ -667,16 +915,17 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_write:         r = sys_write(a, b, c); break;
     case SYS_pread64:       r = sys_pread(a, b, c, (i64)d, false); break;
     case SYS_pwrite64:      r = sys_pread(a, b, c, (i64)d, true); break;
-    case SYS_open:          r = sys_openat(AT_FDCWD, a, b); break;
-    case SYS_openat:        r = sys_openat((i64)a, b, c); break;
+    case SYS_open:          r = sys_openat(AT_FDCWD, a, b, c); break;
+    case SYS_openat:        r = sys_openat((i64)a, b, c, d); break;
+    case SYS_creat:         r = sys_openat(AT_FDCWD, a, O_CREAT | O_WRONLY | O_TRUNC, b); break;
     case SYS_close:         r = sys_close(a); break;
     case SYS_stat:
     case SYS_lstat:         r = sys_fstatat(AT_FDCWD, a, b, 0); break;   /* no symbolic links yet */
     case SYS_fstat:         r = sys_fstat(a, b); break;
     case SYS_newfstatat:    r = sys_fstatat((i64)a, b, c, d); break;
-    case SYS_access:        r = sys_faccessat(AT_FDCWD, a); break;
-    case SYS_faccessat:
-    case SYS_faccessat2:    r = sys_faccessat((i64)a, b); break;
+    case SYS_access:        r = sys_faccessat(AT_FDCWD, a, b, 0); break;
+    case SYS_faccessat:     r = sys_faccessat((i64)a, b, c, 0); break;
+    case SYS_faccessat2:    r = sys_faccessat((i64)a, b, c, d); break;
     case SYS_readlink:      r = sys_readlinkat(AT_FDCWD, a); break;
     case SYS_readlinkat:    r = sys_readlinkat((i64)a, b); break;
     case SYS_lseek:         r = sys_lseek(a, (i64)b, c); break;
@@ -699,32 +948,40 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_rename:        r = sys_renameat(AT_FDCWD, a, AT_FDCWD, b); break;
     case SYS_renameat:
     case SYS_renameat2:     r = d && nr == SYS_renameat2 ? -EINVAL : sys_renameat((i64)a, b, (i64)c, d); break;
-    case SYS_mkdir:         r = path_call(AT_FDCWD, a, 0); break;
-    case SYS_mkdirat:       r = path_call((i64)a, b, 0); break;
-    case SYS_rmdir:         r = path_call(AT_FDCWD, a, 1); break;
-    case SYS_unlink:        r = path_call(AT_FDCWD, a, 2); break;
-    case SYS_unlinkat:      r = path_call((i64)a, b, c & AT_REMOVEDIR ? 1 : 2); break;
-    case SYS_chmod:
-    case SYS_fchmod:
-    case SYS_fchmodat:
+    case SYS_mkdir:         r = path_call(AT_FDCWD, a, 0, b); break;
+    case SYS_mkdirat:       r = path_call((i64)a, b, 0, c); break;
+    case SYS_rmdir:         r = path_call(AT_FDCWD, a, 1, 0); break;
+    case SYS_unlink:        r = path_call(AT_FDCWD, a, 2, 0); break;
+    case SYS_unlinkat:      r = path_call((i64)a, b, c & AT_REMOVEDIR ? 1 : 2, 0); break;
+    case SYS_chmod:         r = sys_attr(AT_FDCWD, a, 0, 'm', b, 0, 0); break;
+    case SYS_fchmod:        r = sys_attr((i64)a, 0, AT_EMPTY_PATH, 'm', b, 0, 0); break;
+    case SYS_fchmodat:      r = sys_attr((i64)a, b, d, 'm', c, 0, 0); break;
     case SYS_chown:
-    case SYS_fchown:        r = 0; break;   /* no permissions yet */
-    case SYS_umask:         r = 022; break;
+    case SYS_lchown:        r = sys_attr(AT_FDCWD, a, 0, 'o', 0, b, c); break;
+    case SYS_fchown:        r = sys_attr((i64)a, 0, AT_EMPTY_PATH, 'o', 0, b, c); break;
+    case SYS_fchownat:      r = sys_attr((i64)a, b, e, 'o', 0, c, d); break;
+    case SYS_utimensat:     r = sys_attr((i64)a, b, d | (b ? 0 : AT_EMPTY_PATH), 't', c, 0, 0); break;
+    case SYS_umask: {
+        u32 old = p->umask;
+        p->umask = (u32)a & 0777;
+        r = old;
+        break;
+    }
     case SYS_getdents64:    r = sys_getdents64(a, b, c); break;
     /* memory */
     case SYS_mmap:          r = sys_mmap(a, b, c, d, (i64)e, g); break;
     case SYS_munmap:        r = mm_unmap(p->mm, a, b); break;
     case SYS_mprotect:      r = mm_protect(p->mm, a, b, (u32)c); break;
     case SYS_brk:           r = (i64)mm_brk(p->mm, a); break;
-    case SYS_mremap:        r = sys_mremap(a, b, c); break;
-    case SYS_madvise:
-    case SYS_msync:         r = 0; break;
+    case SYS_mremap:        r = mm_remap(p->mm, a, b, c, (u32)d, e); break;
+    case SYS_msync:         r = mm_sync(p->mm, a, b); break;
+    case SYS_madvise:       r = 0; break;
     /* processes and threads */
     case SYS_clone:         r = process_clone(f, a, b, c, d, e); break;
     case SYS_fork:          r = process_clone(f, SIGCHLD, 0, 0, 0, 0); break;
     case SYS_vfork:         r = process_clone(f, 0x4000 | 0x100 | SIGCHLD, 0, 0, 0, 0); break;
     case SYS_execve:        r = run_program(f, a, b, c, false); break;
-    case SYS_opaline_spawn: r = run_program(f, a, b, 0, true); break;
+    case SYS_opaline_spawn: r = run_program(f, a, b, c, true); break;   /* c: SPAWN_* flags */
     case SYS_exit:          thread_exit_user((int)(a & 0xFF));
     case SYS_exit_group:    process_exit((int)(a & 0xFF));
     case SYS_wait4:         r = sys_wait4((i64)a, b, c); break;
@@ -739,22 +996,34 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_sched_getaffinity:
         r = c && b >= 8 && user_ok(c, 8, true) ? (*(u64 *)c = 1, 8) : -EINVAL;   /* one CPU */
         break;
-    case SYS_getpgid:
-    case SYS_getpgrp:
-    case SYS_getsid:
-    case SYS_setsid:        r = (i64)p->pid; break;   /* every process leads its own group for now */
-    case SYS_setpgid:       r = 0; break;
-    case SYS_getuid:
-    case SYS_geteuid:
-    case SYS_getgid:
-    case SYS_getegid:
-    case SYS_setuid:
-    case SYS_setgid:
-    case SYS_getgroups:     r = 0; break;   /* one user (root) until stage E15 */
+    case SYS_getpgid:       r = process_getpgid(a); break;
+    case SYS_getpgrp:       r = (i64)p->pgid; break;
+    case SYS_getsid:        r = process_getsid(a); break;
+    case SYS_setsid:        r = process_setsid(); break;
+    case SYS_setpgid:       r = process_setpgid(a, b); break;
+    case SYS_getuid:        r = p->cred.uid; break;
+    case SYS_geteuid:       r = p->cred.euid; break;
+    case SYS_getgid:        r = p->cred.gid; break;
+    case SYS_getegid:       r = p->cred.egid; break;
+    case SYS_setuid:        r = sys_setid(false, a); break;
+    case SYS_setgid:        r = sys_setid(true, a); break;
+    case SYS_setreuid:      r = sys_setreid(false, a, b); break;
+    case SYS_setregid:      r = sys_setreid(true, a, b); break;
+    case SYS_setresuid:     r = set_ids(false, a, b, c); break;
+    case SYS_setresgid:     r = set_ids(true, a, b, c); break;
+    case SYS_getresuid:     r = sys_getresid(false, a, b, c); break;
+    case SYS_getresgid:     r = sys_getresid(true, a, b, c); break;
+    case SYS_setfsuid:      r = p->cred.euid; break;   /* the file-system ids are the effective ones */
+    case SYS_setfsgid:      r = p->cred.egid; break;
+    case SYS_getgroups:     r = sys_groups(false, a, b); break;
+    case SYS_setgroups:     r = sys_groups(true, a, b); break;
     case SYS_getrlimit:     r = sys_prlimit(0, a, 0, b); break;
     case SYS_setrlimit:     r = 0; break;
     case SYS_prlimit64:     r = sys_prlimit(a, b, c, d); break;
     case SYS_uname:         r = sys_uname(a); break;
+    case SYS_sysinfo:       r = sys_sysinfo(a); break;
+    case SYS_poll:          r = do_poll(a, b, (i64)c < 0 ? ~0ULL : c); break;
+    case SYS_ppoll:         r = sys_ppoll(a, b, c, d, e); break;
     case SYS_getrandom:     r = sys_getrandom(a, b); break;
     case SYS_reboot:        r = sys_reboot(a, b, c); break;
     /* signals */
@@ -772,16 +1041,30 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_nanosleep:     r = sys_clock_nanosleep(1, 0, a, b); break;
     case SYS_clock_nanosleep: r = sys_clock_nanosleep(a, b, c, d); break;
     case SYS_clock_gettime: r = sys_clock_gettime(a, b); break;
+    case SYS_clock_settime: r = sys_clock_settime(a, b); break;
+    case SYS_settimeofday:
+        if (!a) r = 0;
+        else if (!user_ok(a, 16, false)) r = -EFAULT;
+        else {
+            i64 sec = ((const i64 *)a)[0], usec = ((const i64 *)a)[1];
+            if (sec < 0 || usec < 0 || usec >= 1000000) r = -EINVAL;
+            else if (cred_current()->euid != 0) r = -EPERM;
+            else {
+                time_set_realtime_ns((u64)sec * NS_PER_SEC + (u64)usec * 1000);
+                r = 0;
+            }
+        }
+        break;
     case SYS_clock_getres:
         r = a > 7 ? -EINVAL : !b ? 0 : user_ok(b, 16, true) ? (*(struct timespec *)b = (struct timespec){0, 1000000}, 0) : -EFAULT;
         break;
     case SYS_gettimeofday: {
-        u64 ms = time_ms();
-        r = !a ? 0 : user_ok(a, 16, true) ? (((i64 *)a)[0] = (i64)(ms / 1000), ((i64 *)a)[1] = (i64)(ms % 1000) * 1000, 0) : -EFAULT;
+        u64 ns = time_realtime_ns();
+        r = !a ? 0 : user_ok(a, 16, true) ? (((i64 *)a)[0] = (i64)(ns / NS_PER_SEC), ((i64 *)a)[1] = (i64)(ns % NS_PER_SEC) / 1000, 0) : -EFAULT;
         break;
     }
     case SYS_time:
-        r = (i64)(time_ms() / 1000);
+        r = (i64)(time_realtime_ns() / NS_PER_SEC);
         if (a) {
             if (user_ok(a, 8, true)) *(i64 *)a = r;
             else r = -EFAULT;

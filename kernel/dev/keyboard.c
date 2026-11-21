@@ -77,6 +77,7 @@ static void handle(u8 sc) {
     if (!c) return;
     if (caps && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c ^= 0x20;
     if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c = (char)((c & 0x1F));   /* Ctrl+letter */
+    else if (ctrl && c == '\\') c = 0x1C;   /* Ctrl+\ */
     tty_input(&c, 1);
 }
 

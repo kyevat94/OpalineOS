@@ -7,6 +7,11 @@
  * "bootloader" regions (the bootloader's code and buffers are dead once the
  * kernel runs; everything the kernel keeps is in "kernel"/"boot data").
  * The first 1 MiB is never handed out (kept for SMP startup code later).
+ *
+ * Pages of user memory can be shared (copy-on-write after fork, shared
+ * mappings), so every page also has a reference count: pmm_alloc_page()
+ * returns it with one reference, pmm_page_ref() adds one and pmm_page_put()
+ * frees the page when the last one goes.
  */
 #include <opaline/console.h>
 #include <opaline/mm.h>
@@ -19,6 +24,7 @@
 static spinlock_t lock = SPINLOCK_INIT;
 
 static u64 *bitmap;          /* HHDM pointer */
+static u16 *refs;            /* reference count per page (HHDM pointer), right after the bitmap */
 static u64 page_count;       /* pages covered by the bitmap */
 static u64 total_pages, free_pages;
 static u64 search_hint;      /* word index where the next search starts */
@@ -37,9 +43,10 @@ void pmm_init(const struct boot_info *bi) {
     for (u64 i = 0; i < n; i++)
         if (managed(r[i].type)) top = MAX(top, r[i].base + r[i].length);
     page_count = top / PAGE_SIZE;
-    u64 bitmap_bytes = ALIGN_UP((page_count + 63) / 64 * 8, PAGE_SIZE);
+    u64 bitmap_only = ALIGN_UP((page_count + 63) / 64 * 8, 8);
+    u64 bitmap_bytes = ALIGN_UP(bitmap_only + page_count * sizeof(u16), PAGE_SIZE);   /* + the counts */
 
-    /* the bitmap goes into the first usable region (above 1 MiB) that can hold it */
+    /* the bitmap and the counts go into the first usable region (above 1 MiB) that can hold them */
     u64 bitmap_phys = 0;
     for (u64 i = 0; i < n && !bitmap_phys; i++) {
         if (r[i].type != BOOT_MEM_USABLE) continue;
@@ -50,7 +57,9 @@ void pmm_init(const struct boot_info *bi) {
     if (!bitmap_phys) panic("pmm: no room for the page bitmap (%lu KiB)", bitmap_bytes / KiB);
 
     bitmap = phys_to_virt(bitmap_phys);
-    memset(bitmap, 0xFF, bitmap_bytes);   /* everything used until proven free */
+    memset(bitmap, 0xFF, bitmap_only);   /* everything used until proven free */
+    refs = (u16 *)((u8 *)bitmap + bitmap_only);
+    memset(refs, 0, page_count * sizeof(u16));
 
     for (u64 i = 0; i < n; i++) {
         if (!managed(r[i].type)) continue;
@@ -76,6 +85,7 @@ static u64 alloc_one(void) {
         u64 page = w * 64 + (u64)__builtin_ctzll(~bitmap[w]);
         if (page >= page_count) continue;
         bit_set(page);
+        refs[page] = 1;
         free_pages--;
         search_hint = w;
         return page * PAGE_SIZE;
@@ -92,7 +102,10 @@ static u64 alloc_run(size_t count) {
         }
         if (++run == count) {
             u64 first = p + 1 - count;
-            for (u64 q = first; q <= p; q++) bit_set(q);
+            for (u64 q = first; q <= p; q++) {
+                bit_set(q);
+                refs[q] = 1;
+            }
             free_pages -= count;
             return first * PAGE_SIZE;
         }
@@ -121,6 +134,8 @@ void pmm_free_pages(u64 phys, size_t count) {
     for (u64 p = phys / PAGE_SIZE; p < phys / PAGE_SIZE + count; p++) {
         if (p >= page_count) panic("pmm: freeing page %p outside managed memory", (void *)(p * PAGE_SIZE));
         if (!bit_used(p)) panic("pmm: double free of page %p", (void *)(p * PAGE_SIZE));
+        if (refs[p] > 1) panic("pmm: freeing page %p that is still shared (%u references)", (void *)(p * PAGE_SIZE), refs[p]);
+        refs[p] = 0;
         bit_clear(p);
         free_pages++;
     }
@@ -128,6 +143,38 @@ void pmm_free_pages(u64 phys, size_t count) {
 }
 
 void pmm_free_page(u64 phys) { pmm_free_pages(phys, 1); }
+
+static u64 checked_page(u64 phys, const char *what) {
+    u64 p = phys / PAGE_SIZE;
+    if (phys % PAGE_SIZE || p >= page_count || !bit_used(p) || !refs[p])
+        panic("pmm: %s of page %p, which is not allocated", what, (void *)phys);
+    return p;
+}
+
+void pmm_page_ref(u64 phys) {
+    u64 flags = spin_lock(&lock);
+    u64 p = checked_page(phys, "pmm_page_ref");
+    if (refs[p] == 0xFFFF) panic("pmm: page %p has too many references", (void *)phys);
+    refs[p]++;
+    spin_unlock(&lock, flags);
+}
+
+void pmm_page_put(u64 phys) {
+    u64 flags = spin_lock(&lock);
+    u64 p = checked_page(phys, "pmm_page_put");
+    if (--refs[p] == 0) {
+        bit_clear(p);
+        free_pages++;
+    }
+    spin_unlock(&lock, flags);
+}
+
+u32 pmm_page_refs(u64 phys) {
+    u64 flags = spin_lock(&lock);
+    u32 r = refs[checked_page(phys, "pmm_page_refs")];
+    spin_unlock(&lock, flags);
+    return r;
+}
 
 void pmm_get_stats(struct pmm_stats *out) {
     u64 flags = spin_lock(&lock);

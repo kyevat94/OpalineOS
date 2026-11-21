@@ -61,13 +61,28 @@ struct mm;
  * current directory; without one, descriptors 0-2 are the terminal and the directory
  * is "/". NULL on error (`error` says why).
  */
-struct process *process_spawn_path(const char *path, const char *const *argv, struct process *parent, int *error);
+#define SPAWN_FOREGROUND 1   /* the child gets a process group of its own, in the terminal's foreground */
+struct process *process_spawn_path(const char *path, const char *const *argv, struct process *parent, int flags,
+                                   int *error);
 
 /* Waits for a process started by the kernel (parent NULL), frees it, returns its exit
    code (128 + signal if a signal killed it). */
 int process_wait(struct process *p);
-/* wait4() for user processes: waits for a child of `parent` (pid -1 = any). */
-i64 process_wait_child(struct process *parent, i64 pid, int *status, bool nohang);
+/* wait4() for user processes: waits for a child of `parent` (pid -1 = any, 0 = own group, < -1 = that
+   group). options: WNOHANG 1, WUNTRACED 2 (report stopped children), WCONTINUED 8. */
+i64 process_wait_child(struct process *parent, i64 pid, int *status, u64 options);
+
+/* Job control: process groups, sessions, signals to a group. */
+i64 process_setpgid(u64 pid, u64 pgid);
+i64 process_getpgid(u64 pid);
+i64 process_setsid(void);
+i64 process_getsid(u64 pid);
+bool process_group_exists(u64 pgid, u64 sid);
+/* Sends sig to every process of the group; with `check`, only to those the caller may signal.
+   0, -ESRCH (no such group) or -EPERM (none allowed). */
+int process_signal_group(u64 pgid, int sig, bool check);
+/* A child stopped or continued (p->report says which): wakes its parent's wait4, sends SIGCHLD. */
+void process_notify_parent(struct process *p);
 
 /* exit_group(): ends every thread of the calling process. */
 NORETURN void process_exit(int code);
@@ -86,6 +101,7 @@ void process_kill(struct process *p, int sig);
 /* Signals (kernel/proc/signal.c) */
 int signal_send_process(struct process *p, int sig);
 int signal_send_thread(struct thread *t, int sig);
+bool signal_blocked_or_ignored(struct thread *t, int sig);
 /* Runs on every return to user mode: ends the thread if the process is ending, delivers signals. */
 void user_return(struct interrupt_frame *f);
 /* A CPU exception in user mode: becomes a signal (a handler may catch it) or kills the process. */

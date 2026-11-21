@@ -21,9 +21,11 @@ On-disk format (little endian, 4 KiB blocks; kernel/fs/efs3.c is the other imple
                  block_bitmap_block, block_bitmap_blocks, inode_table_block, inode_table_blocks,
                  first_data_block, root_inode (1), free_blocks, free_inodes, reserved,
                  label[32] (UTF-8), uuid[16]
-    inode:       mode u16 (0x4000 dir / 0x8000 file | permissions), links u16, flags u32,
-                 size u64, ctime u64, mtime u64, direct[12] u32, indirect u32,
-                 double_indirect u32, 40 reserved bytes  (block number 0 = hole/none)
+    inode:       mode u16 (0x4000 dir / 0x8000 file | permissions, set-id and sticky bits),
+                 links u16, flags u32, size u64, ctime u64, mtime u64, direct[12] u32,
+                 indirect u32, double_indirect u32, uid u32, gid u32, atime u64,
+                 24 reserved bytes  (block number 0 = hole/none; times in nanoseconds since
+                 1970 UTC; images from before stage SE1 have zero there: root, 1970)
     directory:   records that cover every byte of each data block:
                  inode u32 (0 = free), rec_len u16 (multiple of 4), name_len u8,
                  type u8 (1 file, 2 directory), name (UTF-8, NFC, no '/' or NUL, 1..255 bytes)
@@ -33,6 +35,7 @@ Names are stored NFC-normalized, so "ação" typed with combining accents is the
 import os
 import struct
 import sys
+import time
 import unicodedata
 import uuid
 
@@ -45,7 +48,7 @@ S_IFDIR, S_IFREG = 0x4000, 0x8000
 FT_FILE, FT_DIR = 1, 2
 
 SUPER_FMT = "<4s14I32s16s"
-INODE_FMT = "<HHIQQQ12III40s"
+INODE_FMT = "<HHIQQQ12IIIIIQ24s"
 assert struct.calcsize(INODE_FMT) == INODE_SIZE
 
 # GPT partition type of the OpalineOS root partition
@@ -94,8 +97,19 @@ def dir_records(entries):
     return out
 
 
-def make_fs(source_dir, size_bytes, label="OpalineOS"):
-    """Builds an EFS3 image of `size_bytes` containing the files under `source_dir`."""
+# Owner and mode of some folders of the OpalineOS root tree (path relative to the root): mode, uid, gid.
+# Everything else belongs to root (0:0), with 0755 for folders and programs and 0644 for files.
+SPECIAL = {
+    "tmp": (0o1777, 0, 0),         # everyone may create files; only the owner deletes them (sticky)
+    "root": (0o700, 0, 0),         # root's home
+    "home/user": (0o755, 1000, 1000),
+}
+
+
+def make_fs(source_dir, size_bytes, label="OpalineOS", when_ns=None):
+    """Builds an EFS3 image of `size_bytes` containing the files under `source_dir`.
+    Every file gets the time `when_ns` (default: now)."""
+    stamp = time.time_ns() if when_ns is None else when_ns
     block_count = size_bytes // BLOCK
     inode_count, bbmap_blocks, itable, itable_blocks, first_data = layout(block_count)
     img = bytearray(block_count * BLOCK)
@@ -143,6 +157,11 @@ def make_fs(source_dir, size_bytes, label="OpalineOS"):
                 struct.pack_into("<I", img, dind * BLOCK + (k // PTRS) * 4, ib)
         return direct, ind, dind
 
+    def special(full, mode):
+        rel = os.path.relpath(full, source_dir).replace(os.sep, "/")
+        m, uid, gid = SPECIAL.get(rel, (mode, 0, 0))
+        return dict(mode=(mode & 0o170000) | m, uid=uid, gid=gid)
+
     def add_dir(path, ino, parent):
         children = []
         for name in sorted(os.listdir(path)):
@@ -156,14 +175,14 @@ def make_fs(source_dir, size_bytes, label="OpalineOS"):
                     data = f.read()
                 d, i, di = write_data(data)
                 executable = data[:4] == b"\x7fELF"
-                inodes[child] = dict(mode=S_IFREG | (0o755 if executable else 0o644), links=1,
+                inodes[child] = dict(special(full, S_IFREG | (0o755 if executable else 0o644)), links=1,
                                      size=len(data), direct=d, ind=i, dind=di)
                 children.append((raw, child, FT_FILE, None))
         entries = [(b".", ino, FT_DIR), (b"..", parent, FT_DIR)] + [(r, c, t) for r, c, t, _ in children]
         data = b"".join(dir_records(entries))
         d, i, di = write_data(data)
         subdirs = sum(1 for c in children if c[2] == FT_DIR)
-        inodes[ino] = dict(mode=S_IFDIR | 0o755, links=2 + subdirs, size=len(data), direct=d, ind=i, dind=di)
+        inodes[ino] = dict(special(path, S_IFDIR | 0o755), links=2 + subdirs, size=len(data), direct=d, ind=i, dind=di)
         for raw, child, ftype, full in children:
             if ftype == FT_DIR:
                 add_dir(full, child, ino)
@@ -174,7 +193,8 @@ def make_fs(source_dir, size_bytes, label="OpalineOS"):
 
     for n, ino in inodes.items():
         struct.pack_into(INODE_FMT, img, itable * BLOCK + n * INODE_SIZE, ino["mode"], ino["links"], 0,
-                         ino["size"], 0, 0, *ino["direct"], ino["ind"], ino["dind"], b"\0" * 40)
+                         ino["size"], stamp, stamp, *ino["direct"], ino["ind"], ino["dind"], ino["uid"], ino["gid"],
+                         stamp, b"\0" * 24)
     used_inodes = next_inode[0]          # 0 .. used_inodes-1 are taken (0 is reserved)
     for n in range(used_inodes):
         img[BLOCK + n // 8] |= 1 << (n % 8)
@@ -218,7 +238,8 @@ class Efs3:
 
     def inode(self, n):
         v = struct.unpack_from(INODE_FMT, self.data, self.itable * BLOCK + n * INODE_SIZE)
-        return dict(mode=v[0], links=v[1], size=v[3], direct=list(v[6:18]), ind=v[18], dind=v[19])
+        return dict(mode=v[0], links=v[1], size=v[3], ctime=v[4], mtime=v[5], direct=list(v[6:18]), ind=v[18],
+                    dind=v[19], uid=v[20], gid=v[21], atime=v[22])
 
     def blocks(self, ino):
         nb = (ino["size"] + BLOCK - 1) // BLOCK

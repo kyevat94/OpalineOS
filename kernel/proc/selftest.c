@@ -28,7 +28,7 @@ static struct process *spawn(const char *name) {
     ksnprintf(path, sizeof path, "/apps/%s", name);
     const char *argv[] = {path, NULL};
     int err;
-    struct process *p = process_spawn_path(path, argv, NULL, &err);
+    struct process *p = process_spawn_path(path, argv, NULL, 0, &err);
     if (!p) kprintf("  cannot start %s: error %d\n", path, err);
     return p;
 }
@@ -82,7 +82,7 @@ bool posix_selftest(void) {
     for (unsigned i = 0; i < 2; i++) {
         const char *argv[] = {programs[i], NULL};
         int err;
-        struct process *p = process_spawn_path(programs[i], argv, NULL, &err);
+        struct process *p = process_spawn_path(programs[i], argv, NULL, 0, &err);
         if (!p) FAIL("cannot start %s: error %d", programs[i], err);
         int code = process_wait(p);
         if (code != 0) FAIL("%s exited with code %d", programs[i], code);

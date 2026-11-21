@@ -89,11 +89,48 @@ static void help(void) {
            "  rm FILE         remove a file          mv OLD NEW     rename or move\n"
            "  cd [DIR]        change directory       pwd            show the directory\n"
            "  poweroff        turn the computer off  reboot         restart the computer\n"
+           "  fg              continue the stopped program\n"
            "  help            this text              exit [CODE]    leave the shell\n"
            "Leaving the main shell (exit or Ctrl+D) turns the computer off.\n"
            "Arrows, Home/End and Delete edit the line; Up/Down bring back earlier lines.\n"
            "Anything else runs a program from /apps or /system/bin (try: hello, usertest).\n"
+           "Ctrl+C ends the running program, Ctrl+Z stops it (fg continues it).\n"
            "End a line with \"> FILE\" or \">> FILE\" to send the output to a file.\n");
+}
+
+/* The program stopped with Ctrl+Z, if any (one job at a time for now). */
+static long stopped_pid;
+static char stopped_name[64];
+
+/* Waits for the foreground job, then takes the terminal back. */
+static int wait_job(long pid, const char *name) {
+    int status = 0;
+    wait4(pid, &status, WUNTRACED);
+    tcsetpgrp(0, getpgrp());
+    if (WIFSTOPPED(status)) {
+        stopped_pid = pid;
+        snprintf(stopped_name, sizeof stopped_name, "%s", name);
+        dprintf(2, "[%s stopped; type fg to continue it]\n", name);
+        return 128 + WSTOPSIG(status);
+    }
+    if (pid == stopped_pid) stopped_pid = 0;
+    if (!WIFEXITED(status)) {
+        if (WTERMSIG(status) != SIGINT) dprintf(2, "[%s was stopped by signal %d]\n", name, WTERMSIG(status));
+        return 128 + WTERMSIG(status);
+    }
+    return WEXITSTATUS(status);
+}
+
+static int fg(void) {
+    if (!stopped_pid) {
+        dprintf(2, "fg: no stopped program\n");
+        return 1;
+    }
+    long pid = stopped_pid;
+    printf("%s\n", stopped_name);
+    tcsetpgrp(0, pid);   /* the job's group has its leader's pid */
+    kill(-pid, SIGCONT);
+    return wait_job(pid, stopped_name);
 }
 
 /* Runs a program and waits for it. */
@@ -107,19 +144,13 @@ static int run(int argc, char **argv) {
         snprintf(path, sizeof path, "/apps/%s", argv[0]);
         if (stat(path, &st) < 0) snprintf(path, sizeof path, "/system/bin/%s", argv[0]);
     }
-    long pid = spawn(path, argv);
+    long pid = spawn(path, argv, SPAWN_FOREGROUND);
     if (pid < 0) {
         if (pid == -ENOENT) dprintf(2, "%s: command not found\n", argv[0]);
         else err("sh", argv[0], pid);
         return 127;
     }
-    int status = 0;
-    wait4(pid, &status, 0);
-    if (!WIFEXITED(status)) {
-        dprintf(2, "[%s was stopped by signal %d]\n", argv[0], WTERMSIG(status));
-        return 128 + WTERMSIG(status);
-    }
-    return WEXITSTATUS(status);
+    return wait_job(pid, argv[0]);
 }
 
 static int execute(int argc, char **argv) {
@@ -128,6 +159,7 @@ static int execute(int argc, char **argv) {
         help();
         return 0;
     }
+    if (!strcmp(c, "fg")) return fg();
     if (!strcmp(c, "ls")) return cmd_ls(argc, argv);
     if (!strcmp(c, "cat")) return cmd_cat(argc, argv);
     if (!strcmp(c, "echo")) {
@@ -197,6 +229,10 @@ int main(void) {
         close(fd);
     }
     printf("Type \"help\" for the list of commands.\n");
+    /* the shell itself is not stopped or ended from the keyboard; its programs are (they start
+       with the default actions again) */
+    static const int job_signals[] = {SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU};
+    for (unsigned i = 0; i < sizeof job_signals / sizeof job_signals[0]; i++) ignore_signal(job_signals[i]);
     chdir("/home");
 
     for (;;) {

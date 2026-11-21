@@ -56,23 +56,52 @@ struct vnode_stat {
     u64 blocks;                 /* 512-byte units */
     u64 dev;
     u64 rdev;
+    u32 uid, gid;               /* owner */
+    u64 atime, mtime, ctime;    /* nanoseconds since 1970 (opaline/time.h) */
 };
+
+/* Attributes to set (setattr) or to give a new file (create). */
+struct vnode_attr {
+    u32 mask;                   /* ATTR_* that are set */
+    u32 mode;                   /* permission bits (07777) */
+    u32 uid, gid;
+    u64 atime, mtime;
+};
+#define ATTR_MODE  1
+#define ATTR_UID   2
+#define ATTR_GID   4
+#define ATTR_ATIME 8
+#define ATTR_MTIME 16
+
+/* poll() events (Linux values) */
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
 
 struct vnode_ops {
     i64 (*read)(struct vnode *v, u64 offset, void *buf, u64 len);
     i64 (*write)(struct vnode *v, u64 offset, const void *buf, u64 len);
     int (*truncate)(struct vnode *v, u64 size);
     int (*lookup)(struct vnode *dir, const char *name, u32 len, struct vnode **out);
-    int (*create)(struct vnode *dir, const char *name, u32 len, int type, struct vnode **out);
+    /* attr: mode, uid and gid of the new file (always all three) */
+    int (*create)(struct vnode *dir, const char *name, u32 len, int type, const struct vnode_attr *attr,
+                  struct vnode **out);
     int (*remove)(struct vnode *dir, const char *name, u32 len, bool is_dir);
     int (*rename)(struct vnode *old_dir, const char *old_name, u32 old_len, struct vnode *new_dir,
                   const char *new_name, u32 new_len);
     int (*readdir)(struct vnode *dir, u64 *cookie, struct dir_entry *out);   /* 1 entry, 0 end, <0 error */
     int (*stat)(struct vnode *v, struct vnode_stat *out);
+    int (*setattr)(struct vnode *v, const struct vnode_attr *attr);   /* also sets ctime */
     int (*ioctl)(struct vnode *v, u64 request, u64 arg);
     int (*sync)(struct vnode *v);
     void (*close)(struct vnode *v, u32 open_flags);   /* an open file of this vnode was closed */
     void (*release)(struct vnode *v);                  /* the last reference is gone */
+    /* poll(): the events that are true now (an open file with these flags). Without it: always
+       readable and writable. A vnode with poll calls vfs_poll_notify() when they may change. */
+    u32 (*poll)(struct vnode *v, u32 open_flags);
 };
 
 struct vnode {
@@ -85,6 +114,7 @@ struct vnode {
     struct vnode *mounted;      /* a file system mounted on this directory */
     struct vnode *covers;       /* for a mounted root: the directory it is mounted on */
     struct vnode *cache_next;   /* used by the file system's vnode cache */
+    struct memobj *memobj;      /* page cache while the file has shared mappings (opaline/uvm.h) */
 };
 
 /* An open file (shared by dup'ed descriptors). */
@@ -111,17 +141,31 @@ int vfs_lookup(const char *path, struct vnode *cwd, struct vnode **out);
 /* Finds the parent directory of `path` and copies the final (normalized) name. */
 int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len);
 
-int vfs_open(const char *path, struct vnode *cwd, u32 flags, struct file **out);
+/* `mode`: permission bits of a file O_CREAT makes (the process's umask is applied). */
+int vfs_open(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct file **out);
 struct file *file_new(struct vnode *v, u32 flags);   /* takes over the reference to v */
 void file_ref(struct file *f);
 void file_put(struct file *f);
+/* poll() support: a counter that every readiness change bumps, and the queue poll() sleeps on. */
+void vfs_poll_notify(void);
+u64 vfs_poll_generation(void);
+struct waitqueue *vfs_poll_queue(void);
+u32 file_poll(struct file *f);
+
 i64 file_read(struct file *f, void *buf, u64 len);
 i64 file_write(struct file *f, const void *buf, u64 len);
+/* Reads/writes at an offset, consistent with shared mappings of the file (pread/pwrite). */
+i64 vnode_read_at(struct vnode *v, u64 offset, void *buf, u64 len);
+i64 vnode_write_at(struct vnode *v, u64 offset, const void *buf, u64 len);
 
-int vfs_mkdir(const char *path, struct vnode *cwd);
+int vfs_mkdir(const char *path, struct vnode *cwd, u32 mode);
 int vfs_remove(const char *path, struct vnode *cwd, bool is_dir);
 int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd);
 int vfs_stat(const char *path, struct vnode *cwd, struct vnode_stat *out);
+/* Permission checks with the calling process's credentials (opaline/cred.h): 0 or -EACCES. */
+int vfs_permission(struct vnode *v, int want);
+int vfs_access(const char *path, struct vnode *cwd, int want, bool real_ids);
+int vfs_setattr(struct vnode *v, const struct vnode_attr *attr);
 
 /* Reads a whole file into a kmalloc'd buffer (for the program loader). */
 int vfs_read_file(const char *path, struct vnode *cwd, void **data, u64 *size);
@@ -133,6 +177,8 @@ void efs3_info(struct vnode *root, u64 *total_blocks, u64 *free_blocks, char *la
 struct vnode *devfs_init(void);
 int pipe_create(struct file **read_end, struct file **write_end);
 struct vnode *tty_vnode(void);
+void tty_set_foreground(u64 sid, u64 pgid);    /* job control (stage SE1) */
+u64 tty_session(void);
 void tty_input(const char *utf8, u32 len);     /* keyboard -> terminal */
 void tty_init(void);
 void keyboard_init(void);

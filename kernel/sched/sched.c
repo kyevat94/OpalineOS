@@ -359,6 +359,12 @@ void waitqueue_wait(struct waitqueue *wq) {
     thread_block(0, false);
 }
 
+int waitqueue_wait_timeout(struct waitqueue *wq, u64 ms) {
+    if (current->intr) return -EINTR;
+    wq_add(wq);
+    return thread_block(ms, true);
+}
+
 int waitqueue_wait_intr(struct waitqueue *wq) {
     if (current->intr) return -EINTR;
     wq_add(wq);

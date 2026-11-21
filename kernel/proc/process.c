@@ -14,6 +14,7 @@
 #include <opaline/arch/idt.h>
 #include <opaline/arch/syscall.h>
 #include <opaline/console.h>
+#include <opaline/cred.h>
 #include <opaline/errno.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
@@ -37,6 +38,7 @@ static struct process *all_processes;
 static spinlock_t list_lock = SPINLOCK_INIT;
 static struct waitqueue child_exit_wq;     /* woken whenever a process ends */
 static struct waitqueue vfork_wq;          /* woken when a vfork child exec'd or ended */
+static struct waitqueue dethread_wq;       /* execve waits here for the other threads to end */
 
 static const char *const default_env[] = {"HOME=/home", "PATH=/apps:/system/bin", "LANG=C.UTF-8", NULL};
 
@@ -153,6 +155,18 @@ static struct process *process_new(const char *name, struct process *parent) {
     p->refs = 1;   /* until the exit status is collected */
     p->state = PROCESS_ALIVE;
     p->pid = new_id();
+    if (parent) {
+        p->cred = parent->cred;
+        p->umask = parent->umask;
+        p->pgid = parent->pgid;
+        p->sid = parent->sid;
+        p->ctty = parent->ctty;
+    } else {
+        p->umask = 022;   /* root, as the kernel itself */
+        /* started by the kernel: leads a new session that owns the terminal, in the foreground */
+        p->pgid = p->sid = p->pid;
+        p->ctty = true;   /* process_spawn_path gives it the terminal once the program loaded */
+    }
     setup_files(p, parent);
     return p;
 }
@@ -221,7 +235,7 @@ enum {
  *   the strings and AT_RANDOM's 16 bytes above them, up to USER_STACK_TOP.
  */
 static int build_stack(struct mm *mm, const char *path, const char *const *argv, const char *const *envp,
-                       const struct elf_info *info, u64 interp_base, u64 *sp_out) {
+                       const struct elf_info *info, u64 interp_base, const struct cred *c, u64 *sp_out) {
     static const char platform[] = "x86_64";
     u64 bytes = strlen(path) + 1 + sizeof platform + 16;
     u64 argc = count_strings(argv, &bytes), envc = count_strings(envp, &bytes);
@@ -258,13 +272,13 @@ static int build_stack(struct mm *mm, const char *path, const char *const *argv,
     for (u64 i = 0; i < envc; i++) w[k++] = PUT(envp[i]);
     w[k++] = 0;
 #undef PUT
-    u32 a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
+    u32 ca, cb, cc, cd;
+    cpuid(1, 0, &ca, &cb, &cc, &cd);
     const u64 aux[AUX_COUNT][2] = {
         {AT_PHDR, info->phdr}, {AT_PHENT, 56}, {AT_PHNUM, info->phnum}, {AT_PAGESZ, PAGE_SIZE},
-        {AT_BASE, interp_base}, {AT_FLAGS, 0}, {AT_ENTRY, info->entry}, {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0},
-        {AT_EGID, 0}, {AT_SECURE, 0}, {AT_RANDOM, random_addr}, {AT_EXECFN, execfn}, {AT_PLATFORM, plat},
-        {AT_HWCAP, d}, {AT_CLKTCK, 100}, {AT_NULL, 0},
+        {AT_BASE, interp_base}, {AT_FLAGS, 0}, {AT_ENTRY, info->entry}, {AT_UID, c->uid}, {AT_EUID, c->euid},
+        {AT_GID, c->gid}, {AT_EGID, c->egid}, {AT_SECURE, c->euid != c->uid || c->egid != c->gid}, {AT_RANDOM, random_addr}, {AT_EXECFN, execfn}, {AT_PLATFORM, plat},
+        {AT_HWCAP, cd}, {AT_CLKTCK, 100}, {AT_NULL, 0},
     };
     for (u64 i = 0; i < AUX_COUNT; i++) {
         w[k++] = aux[i][0];
@@ -278,12 +292,26 @@ static int build_stack(struct mm *mm, const char *path, const char *const *argv,
     return 0;
 }
 
-/* Loads the program at `path` (and its interpreter) into the empty address space mm. */
+/*
+ * Loads the program at `path` (and its interpreter) into the empty address space mm.
+ * `cred` comes in as the caller's and goes out as the program's: a set-user-id or
+ * set-group-id file runs with its owner's (or group's) effective id.
+ */
 static int exec_image(struct mm *mm, const char *path, struct vnode *cwd, const char *const *argv,
-                      const char *const *envp, u64 *entry, u64 *sp) {
+                      const char *const *envp, struct cred *cred, u64 *entry, u64 *sp) {
+    struct vnode_stat st;
+    int err = vfs_stat(path, cwd, &st);
+    if (err < 0) return err;
+    if ((st.mode & S_IFMT) != S_IFREG) return -EACCES;
+    err = vfs_access(path, cwd, MAY_EXEC, false);
+    if (err < 0) return err;
+    if (st.mode & S_ISUID) cred->euid = st.uid;
+    if (st.mode & S_ISGID) cred->egid = st.gid;
+    cred->suid = cred->euid;
+    cred->sgid = cred->egid;
     void *elf;
     u64 size;
-    int err = vfs_read_file(path, cwd, &elf, &size);
+    err = vfs_read_file(path, cwd, &elf, &size);
     if (err < 0) return err;
     struct elf_info info;
     const char *why;
@@ -319,7 +347,7 @@ static int exec_image(struct mm *mm, const char *path, struct vnode *cwd, const 
     i64 r = mm_map(mm, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, PROT_READ | PROT_WRITE,
                    MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, NULL, 0);
     if (r < 0) return (int)r;
-    return build_stack(mm, path, argv, envp ? envp : default_env, &info, interp_base, sp);
+    return build_stack(mm, path, argv, envp ? envp : default_env, &info, interp_base, cred, sp);
 }
 
 static void user_frame(struct interrupt_frame *f, u64 entry, u64 sp) {
@@ -331,8 +359,10 @@ static void user_frame(struct interrupt_frame *f, u64 entry, u64 sp) {
     f->rflags = 0x202;   /* interrupts on */
 }
 
-struct process *process_spawn_path(const char *path, const char *const *argv, struct process *parent, int *error) {
+struct process *process_spawn_path(const char *path, const char *const *argv, struct process *parent, int flags,
+                                   int *error) {
     struct process *p = process_new(base_name(path), parent);
+    if (p && (flags & SPAWN_FOREGROUND)) p->pgid = p->pid;   /* a job of its own (a shell's command) */
     struct mm *mm = p ? mm_create() : NULL;
     if (!mm) {
         if (p) {
@@ -343,7 +373,7 @@ struct process *process_spawn_path(const char *path, const char *const *argv, st
         return NULL;
     }
     u64 entry, sp;
-    *error = exec_image(mm, path, parent ? parent->cwd : NULL, argv, NULL, &entry, &sp);
+    *error = exec_image(mm, path, parent ? parent->cwd : NULL, argv, NULL, &p->cred, &entry, &sp);
     if (*error < 0) {
         mm_put(mm);
         close_files(p);
@@ -355,6 +385,10 @@ struct process *process_spawn_path(const char *path, const char *const *argv, st
     struct interrupt_frame f;
     user_frame(&f, entry, sp);
     list_add(p);
+    /* the terminal's foreground: a new session from the kernel, or a shell's job (only now that the
+       program exists: a failed start must not take the terminal away from the shell) */
+    if (!parent || ((flags & SPAWN_FOREGROUND) && p->ctty && p->sid == tty_session()))
+        tty_set_foreground(p->sid, p->pgid);
     struct thread_setup s = {.tid = p->pid};
     p->main_thread = new_user_thread(p, &f, &s);
     if (!p->main_thread) {
@@ -371,18 +405,40 @@ struct process *process_spawn_path(const char *path, const char *const *argv, st
 int process_execve(struct interrupt_frame *f, const char *path, const char *const *argv, const char *const *envp) {
     struct thread *t = thread_current();
     struct process *p = t->process;
-    if (p->live_threads > 1) return -EAGAIN;   /* not supported yet: exec from a multithreaded process */
+    if (p->exec_thread) return -EAGAIN;   /* another thread is already in execve */
     struct mm *mm = mm_create();
     if (!mm) return -ENOMEM;
     u64 entry, sp;
-    int err = exec_image(mm, path, p->cwd, argv, envp, &entry, &sp);
+    struct cred cred = p->cred;
+    int err = exec_image(mm, path, p->cwd, argv, envp, &cred, &entry, &sp);
     if (err < 0) {
         mm_put(mm);
         return err;
     }
+    /* the new program is loaded: the other threads end now (as on Linux), then this one carries on */
+    u64 lf = spin_lock(&list_lock);
+    p->exec_thread = t;
+    for (struct thread *o = p->threads; o; o = o->proc_next)
+        if (o != t) {
+            o->exit_pending = true;   /* user_return ends it */
+            thread_interrupt(o);
+        }
+    spin_unlock(&list_lock, lf);
+    u64 fl = irq_save();
+    while (p->live_threads > 1) waitqueue_wait(&dethread_wq);
+    p->exec_thread = NULL;
+    irq_restore(fl);
+    if (p->exiting) {   /* exit_group or a fatal signal meanwhile: this thread ends too */
+        mm_put(mm);
+        return -EINTR;
+    }
+    t->tid = p->pid;   /* the thread that remains is the main thread */
+    p->main_thread = t;
+    p->cred = cred;
+
     /* no way back from here: switch to the new program */
     struct mm *old = p->mm;
-    u64 fl = irq_save();
+    fl = irq_save();
     p->mm = mm;
     p->page_table = mm->page_table;
     write_cr3(mm->page_table);
@@ -507,6 +563,7 @@ void process_kill(struct process *p, int sig) {
     }
     for (struct thread *t = p->threads; t; t = t->proc_next) thread_interrupt(t);
     spin_unlock(&list_lock, f);
+    waitqueue_wake_all(&p->stop_wq);   /* a stopped process must also end */
 }
 
 /* The last thread of p ended: release everything but the struct, become a zombie. */
@@ -546,8 +603,16 @@ static NORETURN void process_finish(struct process *p, int code) {
     u64 lf = spin_lock(&list_lock);
     p->state = PROCESS_ZOMBIE;
     p->vfork_done = true;
+    struct process *parent = p->parent;
+    if (parent && (parent->sigactions[SIGCHLD].handler == 1 /* SIG_IGN */ ||
+                   (parent->sigactions[SIGCHLD].flags & 2 /* SA_NOCLDWAIT */))) {
+        p->parent = NULL;   /* POSIX: the parent will not wait, so nobody collects it */
+        p->orphan = true;
+        parent = NULL;
+    }
     bool drop = p->orphan;
     spin_unlock(&list_lock, lf);
+    if (parent) signal_send_process(parent, SIGCHLD);
     waitqueue_wake_all(&child_exit_wq);
     waitqueue_wake_all(&vfork_wq);
     if (drop) process_put(p);   /* this thread's reference keeps it until the thread is freed */
@@ -571,6 +636,7 @@ void thread_exit_user(int code) {
     bool last = --p->live_threads == 0;
     spin_unlock(&list_lock, f);
     if (last) process_finish(p, code);
+    if (p->exec_thread) waitqueue_wake_all(&dethread_wq);   /* execve waits for the others to end */
     thread_exit(code);
 }
 
@@ -602,29 +668,45 @@ int process_wait(struct process *p) {
     return code;
 }
 
-i64 process_wait_child(struct process *parent, i64 pid, int *status, bool nohang) {
+static bool wait_matches(const struct process *c, const struct process *parent, i64 pid) {
+    if (c->parent != parent) return false;
+    if (pid > 0) return (i64)c->pid == pid;
+    if (pid == 0) return c->pgid == parent->pgid;
+    if (pid < -1) return (i64)c->pgid == -pid;
+    return true;
+}
+
+i64 process_wait_child(struct process *parent, i64 pid, int *status, u64 options) {
     u64 f = irq_save();
-    struct process *zombie;
+    struct process *found;
+    int report = 0;
     for (;;) {
         bool any = false;
-        zombie = NULL;
+        found = NULL;
         u64 lf = spin_lock(&list_lock);
         for (struct process *c = all_processes; c; c = c->all_next) {
-            if (c->parent != parent || (pid > 0 && (i64)c->pid != pid)) continue;
+            if (!wait_matches(c, parent, pid)) continue;
             any = true;
             if (c->state == PROCESS_ZOMBIE) {
-                zombie = c;
+                found = c;
                 c->parent = NULL;   /* collected: no other wait finds it */
+                break;
+            }
+            if ((c->report == 1 && (options & 2)) || (c->report == 2 && (options & 8))) {
+                found = c;          /* stopped (WUNTRACED) or continued (WCONTINUED): told once */
+                report = c->report;
+                *status = report == 1 ? 0x7F | (c->stop_sig << 8) : 0xFFFF;
+                c->report = 0;
                 break;
             }
         }
         spin_unlock(&list_lock, lf);
-        if (zombie) break;
+        if (found) break;
         if (!any) {
             irq_restore(f);
             return -ECHILD;
         }
-        if (nohang) {
+        if (options & 1) {   /* WNOHANG */
             irq_restore(f);
             return 0;
         }
@@ -634,9 +716,84 @@ i64 process_wait_child(struct process *parent, i64 pid, int *status, bool nohang
         }
     }
     irq_restore(f);
-    *status = wait_status(zombie);
-    i64 r = (i64)zombie->pid;
-    process_put(zombie);
+    i64 r = (i64)found->pid;
+    if (report) return r;
+    *status = wait_status(found);
+    process_put(found);
     sched_free_dead();
     return r;
+}
+
+void process_notify_parent(struct process *p) {
+    u64 lf = spin_lock(&list_lock);
+    struct process *parent = p->parent;
+    bool quiet = parent && (parent->sigactions[SIGCHLD].flags & 1);   /* SA_NOCLDSTOP */
+    spin_unlock(&list_lock, lf);
+    waitqueue_wake_all(&child_exit_wq);
+    if (parent && !quiet) signal_send_process(parent, SIGCHLD);
+}
+
+/* ---- process groups and sessions ------------------------------------------------------- */
+
+bool process_group_exists(u64 pgid, u64 sid) {
+    bool found = false;
+    u64 f = spin_lock(&list_lock);
+    for (struct process *p = all_processes; p && !found; p = p->all_next)
+        found = p->state == PROCESS_ALIVE && p->pgid == pgid && p->sid == sid;
+    spin_unlock(&list_lock, f);
+    return found;
+}
+
+i64 process_setpgid(u64 pid, u64 pgid) {
+    struct process *me = thread_current()->process;
+    struct process *t = pid == 0 || pid == me->pid ? me : process_by_pid(pid);
+    if (!t || (t != me && t->parent != me)) return -ESRCH;
+    if (t->sid != me->sid || t->sid == t->pid) return -EPERM;   /* another session, or a session leader */
+    if ((i64)pgid < 0) return -EINVAL;
+    if (pgid == 0) pgid = t->pid;
+    if (pgid != t->pid && !process_group_exists(pgid, me->sid)) return -EPERM;
+    t->pgid = pgid;
+    return 0;
+}
+
+i64 process_getpgid(u64 pid) {
+    struct process *t = pid == 0 ? thread_current()->process : process_by_pid(pid);
+    return t ? (i64)t->pgid : -ESRCH;
+}
+
+i64 process_getsid(u64 pid) {
+    struct process *t = pid == 0 ? thread_current()->process : process_by_pid(pid);
+    return t ? (i64)t->sid : -ESRCH;
+}
+
+i64 process_setsid(void) {
+    struct process *me = thread_current()->process;
+    if (me->pgid == me->pid || process_group_exists(me->pid, me->sid)) return -EPERM;   /* already leads a group */
+    me->sid = me->pgid = me->pid;
+    me->ctty = false;   /* a new session has no terminal until it opens one (TIOCSCTTY) */
+    return (i64)me->sid;
+}
+
+int process_signal_group(u64 pgid, int sig, bool check) {
+    /* references first: sending may take locks that the list lock must not hold */
+    struct process *targets[64];
+    int n = 0, found = 0, sent = 0;
+    const struct cred *me = cred_current();
+    u64 f = spin_lock(&list_lock);
+    for (struct process *p = all_processes; p; p = p->all_next) {
+        if (p->state != PROCESS_ALIVE || p->pgid != pgid || !p->user) continue;
+        found++;
+        if (check && !cred_may_signal(me, &p->cred)) continue;
+        if (n < 64) {
+            p->refs++;
+            targets[n++] = p;
+        }
+    }
+    spin_unlock(&list_lock, f);
+    for (int i = 0; i < n; i++) {
+        if (sig) signal_send_process(targets[i], sig);
+        sent++;
+        process_put(targets[i]);
+    }
+    return !found ? -ESRCH : !sent ? -EPERM : 0;
 }

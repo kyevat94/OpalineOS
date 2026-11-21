@@ -187,15 +187,15 @@ static void test_pipes_and_fds(void) {
 
 static void test_processes(void) {
     char *argv[] = {"/apps/hello", "um", "dois", NULL};
-    long pid = spawn("/apps/hello", argv);
+    long pid = spawn("/apps/hello", argv, 0);
     int status = -1;
     CHECK(pid > 0 && wait4(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
           "spawn /apps/hello and wait for it");
     char *crash[] = {"/apps/crashnull", NULL};
-    pid = spawn("/apps/crashnull", crash);
+    pid = spawn("/apps/crashnull", crash, 0);
     CHECK(pid > 0 && wait4(pid, &status, 0) == pid && !WIFEXITED(status) && WTERMSIG(status) == 11,
           "a crashing child ends with signal 11 (SIGSEGV)");
-    CHECK(spawn("/apps/no-such-program", argv) == -ENOENT, "spawning a missing program gives ENOENT");
+    CHECK(spawn("/apps/no-such-program", argv, 0) == -ENOENT, "spawning a missing program gives ENOENT");
     CHECK(wait4(-1, &status, 0) == -ECHILD, "wait4 without children gives ECHILD");
 }
 

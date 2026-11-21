@@ -44,6 +44,9 @@
 #define SYS_clock_gettime 228
 #define SYS_exit_group   231
 #define SYS_opaline_spawn 1000
+#define SYS_rt_sigaction  13
+#define SYS_kill          62
+#define SYS_getpgrp      111
 
 #define ENOENT        2
 #define EBADF         9
@@ -161,10 +164,29 @@ static inline long nanosleep(const struct timespec *req, struct timespec *rem) {
     return syscall2(SYS_nanosleep, (long)req, (long)rem);
 }
 static inline long clock_gettime(int clock, struct timespec *tp) { return syscall2(SYS_clock_gettime, clock, (long)tp); }
-/* Starts a program; returns its pid or -errno. */
-static inline long spawn(const char *path, char *const argv[]) {
-    return syscall2(SYS_opaline_spawn, (long)path, (long)argv);
+/* Starts a program; returns its pid or -errno. SPAWN_FOREGROUND: as a job of its own that gets the
+   terminal (the shell gives it back with tcsetpgrp once the job ends or stops). */
+#define SPAWN_FOREGROUND 1
+static inline long spawn(const char *path, char *const argv[], int flags) {
+    return syscall3(SYS_opaline_spawn, (long)path, (long)argv, flags);
 }
+static inline long kill(long pid, int sig) { return syscall2(SYS_kill, pid, sig); }
+static inline long getpgrp(void) { return syscall0(SYS_getpgrp); }
+static inline int tcsetpgrp(int fd, long pgid) {
+    int id = (int)pgid;
+    return ioctl(fd, 0x5410 /* TIOCSPGRP */, &id);
+}
+/* Ignores a signal (rt_sigaction with SIG_IGN). */
+static inline long ignore_signal(int sig) {
+    long action[4] = {1 /* SIG_IGN */, 0, 0, 0};
+    return syscall4(SYS_rt_sigaction, sig, (long)action, 0, 8);
+}
+#define SIGINT  2
+#define SIGQUIT 3
+#define SIGCONT 18
+#define SIGTSTP 20
+#define SIGTTIN 21
+#define SIGTTOU 22
 /* Linux reboot(): turns the computer off or restarts it (does not return on success). */
 static inline long poweroff(void) { return syscall3(SYS_reboot, 0xFEE1DEAD, 672274793, 0x4321FEDC); }
 static inline long reboot(void) { return syscall3(SYS_reboot, 0xFEE1DEAD, 672274793, 0x01234567); }
@@ -174,6 +196,9 @@ static inline long wait4(long pid, int *status, int options) {
 #define WIFEXITED(s)   (((s) & 0x7F) == 0)
 #define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
 #define WTERMSIG(s)    ((s) & 0x7F)
+#define WIFSTOPPED(s)  (((s) & 0xFF) == 0x7F)
+#define WSTOPSIG(s)    (((s) >> 8) & 0xFF)
+#define WUNTRACED 2
 
 _Noreturn void _exit(int code);
 void sleep_ms(long ms);

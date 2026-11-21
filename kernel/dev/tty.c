@@ -20,6 +20,7 @@
  */
 #include <opaline/console.h>
 #include <opaline/errno.h>
+#include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
 #include <opaline/string.h>
@@ -45,7 +46,16 @@ static struct {
     u32 draft_len;
     int esc;                      /* escape sequence state: 0 none, 1 after ESC, 2 after ESC [ */
     u32 esc_param;
+    u64 sid, fg;                  /* the session that owns the terminal and its foreground group */
+    int pending_signal;           /* from Ctrl+C / Ctrl+Z / Ctrl+\, sent after the console lock */
 } tty;
+
+void tty_set_foreground(u64 sid, u64 pgid) {
+    tty.sid = sid;
+    tty.fg = pgid;
+}
+
+u64 tty_session(void) { return tty.sid; }
 
 /* ---- drawing (all with the console lock held) ------------------------------------------ */
 
@@ -276,10 +286,13 @@ static bool input_byte(char c) {
             reset_line();
         }
         return true;
-    case 0x03:   /* Ctrl+C */
+    case 0x03:   /* Ctrl+C: SIGINT to the foreground job */
+    case 0x1A:   /* Ctrl+Z: SIGTSTP (stop it) */
+    case 0x1C:   /* Ctrl+\: SIGQUIT */
         move_end();
-        console_write("^C\n", 3);
+        console_write(c == 0x03 ? "^C\n" : c == 0x1A ? "^Z\n" : "^\\\n", 3);
         reset_line();
+        tty.pending_signal = c == 0x03 ? SIGINT : c == 0x1A ? SIGTSTP : SIGQUIT;
         return false;
     default:
         if ((u8)c >= 0x20 || c == '\t') insert_byte(c);
@@ -292,12 +305,30 @@ void tty_input(const char *s, u32 n) {
     bool wake = false;
     u64 f = console_lock();
     for (u32 i = 0; i < n; i++) wake |= input_byte(s[i]);
+    int sig = tty.pending_signal;
+    tty.pending_signal = 0;
     console_unlock(f);
-    if (wake) waitqueue_wake_all(&tty.readers);
+    if (wake) {
+        waitqueue_wake_all(&tty.readers);
+        vfs_poll_notify();
+    }
+    if (sig && tty.fg) process_signal_group(tty.fg, sig, false);
+}
+
+/* A background job of the terminal's session may not read it: SIGTTIN stops it (as POSIX says). */
+static int background_check(int sig) {
+    struct thread *t = thread_current();
+    struct process *p = t->process;
+    if (!p->user || !p->ctty || p->sid != tty.sid || !tty.fg || p->pgid == tty.fg) return 0;
+    if (signal_blocked_or_ignored(t, sig)) return sig == SIGTTIN ? -EIO : 0;
+    process_signal_group(p->pgid, sig, false);
+    return -EINTR;   /* the call starts again once the job is continued in the foreground */
 }
 
 static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
     (void)v, (void)off;
+    int bg = background_check(SIGTTIN);
+    if (bg < 0) return bg;
     if (len == 0) return 0;
     u64 f = irq_save();
     while (tty.ready_len == 0 && tty.eof_pending == 0)
@@ -331,6 +362,38 @@ static i64 tty_write(struct vnode *v, u64 off, const void *buf, u64 len) {
 
 static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
     (void)v;
+    struct process *p = thread_current()->process;
+    switch (request) {
+    case 0x540F:   /* TIOCGPGRP: the foreground group */
+        if (!p->ctty || p->sid != tty.sid) return -ENOTTY;
+        *(i32 *)arg = (i32)tty.fg;
+        return 0;
+    case 0x5429:   /* TIOCGSID */
+        if (!p->ctty || p->sid != tty.sid) return -ENOTTY;
+        *(i32 *)arg = (i32)tty.sid;
+        return 0;
+    case 0x5410: { /* TIOCSPGRP: a new foreground group (tcsetpgrp) */
+        if (!p->ctty || p->sid != tty.sid) return -ENOTTY;
+        i32 pgid = *(const i32 *)arg;
+        if (pgid <= 0) return -EINVAL;
+        if (!process_group_exists((u64)pgid, p->sid)) return -EPERM;
+        int bg = background_check(SIGTTOU);
+        if (bg < 0) return bg;
+        tty.fg = (u64)pgid;
+        return 0;
+    }
+    case 0x540E:   /* TIOCSCTTY: a session leader takes the terminal */
+        if (p->sid != p->pid) return -EPERM;
+        p->ctty = true;
+        tty.sid = p->sid;
+        tty.fg = p->pgid;
+        return 0;
+    case 0x5422:   /* TIOCNOTTY */
+        if (!p->ctty) return -ENOTTY;
+        p->ctty = false;
+        return 0;
+    default: break;
+    }
     if (request != TIOCGWINSZ) return -ENOTTY;
     u32 cols, rows;
     console_get_size(&cols, &rows);
@@ -344,15 +407,20 @@ static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
 static int tty_stat(struct vnode *v, struct vnode_stat *st) {
     memset(st, 0, sizeof *st);
     st->ino = v->ino;
-    st->mode = 0x2000 | 0620;   /* S_IFCHR */
+    st->mode = 0x2000 | 0666;   /* S_IFCHR; everyone may use the terminal until there is a login (E15) */
     st->links = 1;
     st->dev = 2;
     st->rdev = 0x0501;          /* like Linux /dev/console (5, 1) */
     return 0;
 }
 
+static u32 tty_poll(struct vnode *v, u32 flags) {
+    (void)v, (void)flags;
+    return (tty.ready_len || tty.eof_pending ? POLLIN : 0) | POLLOUT;
+}
+
 static const struct vnode_ops tty_ops = {
-    .read = tty_read, .write = tty_write, .ioctl = tty_ioctl, .stat = tty_stat};
+    .read = tty_read, .write = tty_write, .ioctl = tty_ioctl, .stat = tty_stat, .poll = tty_poll};
 static struct vnode tty_node = {.type = VN_CHARDEV, .refs = 1, .ino = 2, .ops = &tty_ops};
 
 struct vnode *tty_vnode(void) { return &tty_node; }

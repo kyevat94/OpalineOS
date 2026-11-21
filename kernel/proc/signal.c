@@ -5,8 +5,9 @@
  *
  * A signal is pending on a thread (tkill, CPU exceptions) or on the process
  * (kill). It is acted on when the thread next returns to user mode
- * (user_return): ignored, the default action (end the process; stop signals
- * are ignored for now), or a handler call. For a handler the kernel pushes a
+ * (user_return): ignored, the default action (end the process, or stop it for
+ * SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU until SIGCONT), or a handler call. A system
+ * call that a signal interrupted without running a handler starts again. For a handler the kernel pushes a
  * struct rt_sigframe on the user stack, the same layout as Linux: the saved
  * registers (ucontext), the siginfo and the FPU state. The handler returns to
  * sa_restorer, which calls rt_sigreturn to restore them.
@@ -67,10 +68,11 @@ struct rt_sigframe {
 
 static struct thread *self_thread(void) { return thread_current(); }
 
-static bool default_ignored(int sig) {
-    return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT || sig == SIGSTOP ||
-           sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;   /* stopping is not supported yet */
-}
+static bool default_ignored(int sig) { return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT; }
+
+static bool is_stop(int sig) { return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU; }
+
+#define STOP_BITS (BIT(SIGSTOP) | BIT(SIGTSTP) | BIT(SIGTTIN) | BIT(SIGTTOU))
 
 static bool ignored(struct process *p, int sig) {
     u64 h = p->sigactions[sig].handler;
@@ -79,40 +81,81 @@ static bool ignored(struct process *p, int sig) {
 
 /* ---- sending ------------------------------------------------------------------------------ */
 
-int signal_send_thread(struct thread *t, int sig) {
-    if (sig < 1 || sig >= NSIG) return -EINVAL;
-    struct process *p = t->process;
-    if (!sig || ignored(p, sig)) return 0;
-    if (sig == SIGKILL) {
-        process_kill(p, SIGKILL);
-        return 0;
-    }
+/* Every thread of p waits at its next return to user mode (SIGSTOP and friends). */
+static void stop_process(struct process *p, int sig) {
     u64 f = irq_save();
-    t->sigpending |= BIT(sig);
-    bool wake = !(t->sigmask & BIT(sig));
+    bool now = !p->stopped && !p->exiting;
+    if (now) {
+        p->stopped = true;
+        p->stop_sig = sig;
+        p->report = 1;
+        for (struct thread *t = p->threads; t; t = t->proc_next) {
+            t->restart_syscall = true;   /* its call starts again, even if SIGCONT comes before it stops */
+            thread_interrupt(t);
+        }
+    }
     irq_restore(f);
-    if (wake) thread_interrupt(t);
-    return 0;
+    if (now) process_notify_parent(p);
 }
 
-int signal_send_process(struct process *p, int sig) {
+static void continue_process(struct process *p) {
+    u64 f = irq_save();
+    bool was = p->stopped;
+    p->stopped = false;
+    if (was) p->report = 2;
+    irq_restore(f);
+    if (!was) return;
+    waitqueue_wake_all(&p->stop_wq);
+    process_notify_parent(p);
+}
+
+static void clear_pending(struct process *p, u64 bits) {
+    u64 f = irq_save();
+    p->sigpending &= ~bits;
+    for (struct thread *t = p->threads; t; t = t->proc_next) t->sigpending &= ~bits;
+    irq_restore(f);
+}
+
+/* to: a thread, or NULL for the whole process (any thread that does not block it takes it). */
+static int send(struct process *p, struct thread *to, int sig) {
     if (sig < 1 || sig >= NSIG) return -EINVAL;
-    if (ignored(p, sig)) return 0;
+    if (p->state != PROCESS_ALIVE) return 0;
     if (sig == SIGKILL) {
         process_kill(p, SIGKILL);
         return 0;
     }
+    if (sig == SIGCONT) {   /* continues the process whatever its action is */
+        clear_pending(p, STOP_BITS);
+        continue_process(p);
+    }
+    if (is_stop(sig)) clear_pending(p, BIT(SIGCONT));
+    if (sig == SIGSTOP) {   /* cannot be caught or blocked */
+        stop_process(p, SIGSTOP);
+        return 0;
+    }
+    if (is_stop(sig) && p->sigactions[sig].handler == SIG_DFL && !p->parent) return 0;   /* nobody would continue it */
+    if (ignored(p, sig)) return 0;
     u64 f = irq_save();
-    p->sigpending |= BIT(sig);
-    struct thread *target = NULL;
-    for (struct thread *t = p->threads; t; t = t->proc_next)
-        if (!(t->sigmask & BIT(sig))) {
-            target = t;
-            break;
-        }
+    struct thread *target = to;
+    if (to) {
+        to->sigpending |= BIT(sig);
+        if (to->sigmask & BIT(sig)) target = NULL;
+    } else {
+        p->sigpending |= BIT(sig);
+        for (struct thread *t = p->threads; t && !target; t = t->proc_next)
+            if (!(t->sigmask & BIT(sig))) target = t;
+    }
     irq_restore(f);
     if (target) thread_interrupt(target);
     return 0;
+}
+
+int signal_send_thread(struct thread *t, int sig) { return send(t->process, t, sig); }
+
+int signal_send_process(struct process *p, int sig) { return send(p, NULL, sig); }
+
+bool signal_blocked_or_ignored(struct thread *t, int sig) {
+    return (t->sigmask & BIT(sig)) || t->process->sigactions[sig].handler == SIG_IGN;
 }
 
 /* ---- delivery ----------------------------------------------------------------------------- */
@@ -195,10 +238,20 @@ void user_return(struct interrupt_frame *f) {
     struct thread *t = self_thread();
     struct process *p = t->process;
     if (!p || !p->user) return;
+    /* a signal taken without a handler (or a stop) interrupted the call: it starts again */
+    bool restart = t->restart_syscall;
+    t->restart_syscall = false;
     for (;;) {
-        if (p->exiting) {
+        if (p->exiting || t->exit_pending) {
             __asm__ volatile("sti");
             thread_exit_user(0);
+        }
+        if (p->stopped) {   /* wait here until SIGCONT (or SIGKILL) */
+            u64 fl = irq_save();
+            while (p->stopped && !p->exiting) waitqueue_wait(&p->stop_wq);
+            irq_restore(fl);
+            restart = true;
+            continue;
         }
         bool from_process;
         u64 fl = irq_save();
@@ -210,6 +263,11 @@ void user_return(struct interrupt_frame *f) {
             }
             t->intr = false;   /* nothing left that should interrupt a wait */
             irq_restore(fl);
+            if (restart && f->vector == SYSCALL_VECTOR && (i64)f->rax == -EINTR) {
+                f->rax = f->error;   /* the system call number (syscall_dispatch keeps it there) */
+                f->rip -= 2;         /* back to the SYSCALL instruction */
+                t->iret_return = true;
+            }
             return;
         }
         if (from_process) p->sigpending &= ~BIT(sig);
@@ -217,9 +275,15 @@ void user_return(struct interrupt_frame *f) {
         irq_restore(fl);
 
         struct sigaction_k act = p->sigactions[sig];
-        if (act.handler == SIG_IGN) continue;
+        if (act.handler == SIG_IGN || (act.handler == SIG_DFL && default_ignored(sig))) {
+            restart = true;
+            continue;
+        }
         if (act.handler == SIG_DFL) {
-            if (default_ignored(sig)) continue;
+            if (is_stop(sig)) {
+                stop_process(p, sig);   /* the loop waits at the top */
+                continue;
+            }
             process_kill(p, sig);
             continue;   /* p->exiting is now set */
         }

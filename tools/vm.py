@@ -355,6 +355,13 @@ def shell_test():
             ("ls\n", "fstest"),
             ("cat /home/Documentos/nada\n", "ENOENT"),
             ("nosuchcmd\n", "nosuchcmd: command not found"),
+            # job control: the program sleeps 300 s, so only the keys can bring the prompt back in time
+            ("posixtest sleep\n", "sleeping..."),
+            ("<ctrl-c>", "opaline:/apps$ "),
+            ("posixtest sleep\n", "sleeping..."),
+            ("<ctrl-z>", "[posixtest stopped; type fg to continue it]"),
+            ("fg\n", "posixtest"),
+            ("<ctrl-c>", "opaline:/apps$ "),
         ]
         for keys, expect in steps:
             mark = len(s.text())
@@ -455,7 +462,8 @@ def vbox_prepare(serial_log):
              "--portcount", "1")
         vbox("storageattach", VM_NAME, "--storagectl", "SATA", "--port", "0", "--device", "0",
              "--type", "hdd", "--medium", VMDK)
-    vbox("modifyvm", VM_NAME, "--uart1", "0x3F8", "4", "--uart-mode1", "file", serial_log)
+    vbox("modifyvm", VM_NAME, "--uart1", "0x3F8", "4", "--uart-mode1", "file", serial_log,
+         "--rtc-use-utc", "on")   # the RTC holds UTC, as the kernel expects
 
 
 def vbox_run(cmdline):

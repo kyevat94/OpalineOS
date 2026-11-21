@@ -20,13 +20,11 @@
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
 #include <opaline/string.h>
+#include <opaline/time.h>
 #include <opaline/vfs.h>
 
 #define INODE_SIZE 128
 #define PTRS (BLOCK_SIZE / 4)
-#define S_IFMT  0xF000
-#define S_IFDIR 0x4000
-#define S_IFREG 0x8000
 #define FT_FILE 1
 #define FT_DIR  2
 
@@ -41,10 +39,12 @@ struct efs3_super {
 struct efs3_inode {
     u16 mode, links;
     u32 flags;
-    u64 size, ctime, mtime;
+    u64 size, ctime, mtime;     /* nanoseconds since 1970 */
     u32 direct[12];
     u32 indirect, dindirect;
-    u8 reserved[40];
+    u32 uid, gid;               /* owner (format 1.1: zero in older images = root) */
+    u64 atime;
+    u8 reserved[24];
 } PACKED;
 _Static_assert(sizeof(struct efs3_inode) == INODE_SIZE, "EFS3 inode size");
 
@@ -512,6 +512,20 @@ static void efs3_release(struct vnode *v) {
 
 /* ---- operations ---------------------------------------------------------------- */
 
+/* Change times: `mtime` for content changes (write, truncate, directory entries). */
+static void stamp(struct efs3_inode *in, bool mtime) {
+    u64 now = time_realtime_ns();
+    in->ctime = now;
+    if (mtime) in->mtime = now;
+}
+
+static void touch_dir(struct efs3 *fs, u32 ino) {
+    struct efs3_inode d;
+    if (!inode_get(fs, ino, &d)) return;
+    stamp(&d, true);
+    inode_put(fs, ino, &d);
+}
+
 #define LOCKED(fs, expr)              \
     ({                                \
         mutex_lock(&(fs)->lock);      \
@@ -536,6 +550,7 @@ static i64 do_write(struct efs3 *fs, struct vnode *v, u64 off, const void *buf, 
     struct efs3_inode in;
     if (!inode_get(fs, (u32)v->ino, &in)) return -EIO;
     i64 r = data_write(fs, &in, off, buf, len);
+    if (r > 0) stamp(&in, true);
     if (!inode_put(fs, (u32)v->ino, &in)) return -EIO;
     return r;
 }
@@ -550,6 +565,7 @@ static int do_truncate(struct efs3 *fs, struct vnode *v, u64 size) {
     struct efs3_inode in;
     if (!inode_get(fs, (u32)v->ino, &in)) return -EIO;
     set_size(fs, &in, size);
+    stamp(&in, true);
     return inode_put(fs, (u32)v->ino, &in) ? 0 : -EIO;
 }
 
@@ -574,7 +590,8 @@ static int efs3_lookup(struct vnode *dir, const char *name, u32 len, struct vnod
     return LOCKED(fs, do_lookup(fs, dir, name, len, out));
 }
 
-static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, int type, struct vnode **out) {
+static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, int type,
+                     const struct vnode_attr *attr, struct vnode **out) {
     struct efs3_inode d;
     if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
     if (d.links == 0) return -ENOENT;   /* the directory was deleted */
@@ -587,8 +604,11 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
     if (!ino) return -ENOSPC;
     struct efs3_inode in;
     memset(&in, 0, sizeof in);
+    in.uid = attr->uid;
+    in.gid = attr->gid;
+    in.atime = in.mtime = in.ctime = time_realtime_ns();
     if (type == VN_DIR) {
-        in.mode = S_IFDIR | 0755;
+        in.mode = (u16)(S_IFDIR | (attr->mode & 07777));
         in.links = 2;
         u32 b = bmap(fs, &in, 0, true);
         u8 *data = b ? block_read(fs->dev, b) : NULL;
@@ -605,7 +625,7 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
         block_write(fs->dev, b, data);
         in.size = BLOCK_SIZE;
     } else {
-        in.mode = S_IFREG | 0644;
+        in.mode = (u16)(S_IFREG | (attr->mode & 07777));
         in.links = 1;
     }
     if (!inode_put(fs, ino, &in)) return -EIO;
@@ -615,23 +635,24 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
         destroy_inode(fs, ino, &in);
         return r;
     }
-    if (type == VN_DIR) {
-        if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
-        d.links++;
-        inode_put(fs, (u32)dir->ino, &d);
-    }
+    if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
+    if (type == VN_DIR) d.links++;
+    stamp(&d, true);
+    inode_put(fs, (u32)dir->ino, &d);
     *out = get_vnode(fs, ino);
     return *out ? 0 : -EIO;
 }
 
-static int efs3_create(struct vnode *dir, const char *name, u32 len, int type, struct vnode **out) {
+static int efs3_create(struct vnode *dir, const char *name, u32 len, int type, const struct vnode_attr *attr,
+                       struct vnode **out) {
     struct efs3 *fs = dir->fs;
-    return LOCKED(fs, do_create(fs, dir, name, len, type, out));
+    return LOCKED(fs, do_create(fs, dir, name, len, type, attr, out));
 }
 
 /* Drops one link of `ino`; frees it once unused (now, or when the last open file closes). */
 static void unlink_inode(struct efs3 *fs, u32 ino, struct efs3_inode *in, bool is_dir) {
     in->links = is_dir ? 0 : in->links - 1;
+    stamp(in, false);
     inode_put(fs, ino, in);
     if (in->links == 0 && !is_open(fs, ino)) destroy_inode(fs, ino, in);
 }
@@ -653,11 +674,10 @@ static int do_remove(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
     r = dir_remove(fs, &d, name, len);
     if (r < 0) return r;
     unlink_inode(fs, c.ino, &t, target_dir);
-    if (target_dir) {
-        if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
-        d.links--;
-        inode_put(fs, (u32)dir->ino, &d);
-    }
+    if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
+    if (target_dir) d.links--;
+    stamp(&d, true);
+    inode_put(fs, (u32)dir->ino, &d);
     return 0;
 }
 
@@ -721,6 +741,12 @@ static int do_rename(struct efs3 *fs, struct vnode *od, const char *on, u32 ol, 
             inode_put(fs, (u32)nd->ino, &ndir);
         }
     }
+    touch_dir(fs, (u32)od->ino);
+    if (nd->ino != od->ino) touch_dir(fs, (u32)nd->ino);
+    if (inode_get(fs, s.ino, &src)) {
+        stamp(&src, false);
+        inode_put(fs, s.ino, &src);
+    }
     return 0;
 }
 
@@ -778,7 +804,29 @@ static int do_stat(struct efs3 *fs, struct vnode *v, struct vnode_stat *st) {
     st->blocks = ALIGN_UP(in.size, BLOCK_SIZE) / 512;
     st->dev = 1;
     st->rdev = 0;
+    st->uid = in.uid;
+    st->gid = in.gid;
+    st->atime = in.atime;
+    st->mtime = in.mtime;
+    st->ctime = in.ctime;
     return 0;
+}
+
+static int do_setattr(struct efs3 *fs, struct vnode *v, const struct vnode_attr *a) {
+    struct efs3_inode in;
+    if (!inode_get(fs, (u32)v->ino, &in)) return -EIO;
+    if (a->mask & ATTR_MODE) in.mode = (u16)((in.mode & S_IFMT) | (a->mode & 07777));
+    if (a->mask & ATTR_UID) in.uid = a->uid;
+    if (a->mask & ATTR_GID) in.gid = a->gid;
+    if (a->mask & ATTR_ATIME) in.atime = a->atime;
+    if (a->mask & ATTR_MTIME) in.mtime = a->mtime;
+    stamp(&in, false);
+    return inode_put(fs, (u32)v->ino, &in) ? 0 : -EIO;
+}
+
+static int efs3_setattr(struct vnode *v, const struct vnode_attr *a) {
+    struct efs3 *fs = v->fs;
+    return LOCKED(fs, do_setattr(fs, v, a));
 }
 
 static int efs3_stat(struct vnode *v, struct vnode_stat *st) {
@@ -801,6 +849,7 @@ static const struct vnode_ops efs3_ops = {
     .rename = efs3_rename,
     .readdir = efs3_readdir,
     .stat = efs3_stat,
+    .setattr = efs3_setattr,
     .sync = efs3_sync,
     .release = efs3_release,
 };

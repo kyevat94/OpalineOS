@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 The OpalineOS authors */
+#include <opaline/cred.h>
 #include <opaline/errno.h>
 #include <opaline/mm.h>
+#include <opaline/sched.h>
 #include <opaline/string.h>
+#include <opaline/uvm.h>
 #include <opaline/vfs.h>
 
 static struct vnode *root;
@@ -121,8 +124,56 @@ int vfs_mount(const char *path, struct vnode *fs_root) {
     return 0;
 }
 
+static int may(struct vnode *v, int want, bool real) {
+    if (!v->ops->stat) return 0;
+    struct vnode_stat st;
+    int r = v->ops->stat(v, &st);
+    if (r < 0) return r;
+    return cred_may(cred_current(), st.mode, st.uid, st.gid, want, real) ? 0 : -EACCES;
+}
+
+int vfs_permission(struct vnode *v, int want) { return may(v, want, false); }
+
+int vfs_setattr(struct vnode *v, const struct vnode_attr *attr) {
+    return v->ops->setattr ? v->ops->setattr(v, attr) : -EPERM;
+}
+
+/* Mode, owner and group of a file created in `parent`. */
+static int new_attr(struct vnode *parent, int type, u32 mode, struct vnode_attr *a) {
+    const struct cred *c = cred_current();
+    struct vnode_stat st;
+    int r = parent->ops->stat ? parent->ops->stat(parent, &st) : -EIO;
+    if (r < 0) return r;
+    a->mask = ATTR_MODE | ATTR_UID | ATTR_GID;
+    a->mode = mode & 07777 & ~cred_umask();
+    a->uid = c->euid;
+    a->gid = c->egid;
+    if (st.mode & S_ISGID) {   /* a set-group-id directory gives its group to new files */
+        a->gid = st.gid;
+        if (type == VN_DIR) a->mode |= S_ISGID;
+    }
+    return 0;
+}
+
+/* The sticky bit: in such a directory only root and the owners may delete or rename a file. */
+static int sticky_ok(struct vnode *dir, const char *name, u32 len) {
+    struct vnode_stat ds, ts;
+    if (!dir->ops->stat || dir->ops->stat(dir, &ds) < 0 || !(ds.mode & S_ISVTX)) return 0;
+    const struct cred *c = cred_current();
+    if (c->euid == 0 || c->euid == ds.uid) return 0;
+    struct vnode *t;
+    if (dir->ops->lookup(dir, name, len, &t) < 0) return 0;   /* not there: the operation says so */
+    int r = t->ops->stat && t->ops->stat(t, &ts) == 0 && ts.uid == c->euid ? 0 : -EPERM;
+    vnode_put(t);
+    return r;
+}
+
 /* One step of a path walk: `cur` (referenced) -> child (referenced). */
 static int step(struct vnode *cur, const char *name, u32 len, struct vnode **next) {
+    if (cur->type == VN_DIR && !(len == 1 && name[0] == '.')) {
+        int r = may(cur, MAY_EXEC, false);   /* searching a directory needs its x bit */
+        if (r < 0) return r;
+    }
     if (len == 1 && name[0] == '.') {
         vnode_ref(cur);
         *next = cur;
@@ -243,16 +294,21 @@ void file_put(struct file *f) {
     kfree(f);
 }
 
-int vfs_open(const char *path, struct vnode *cwd, u32 flags, struct file **out) {
+int vfs_open(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct file **out) {
     struct vnode *v;
     int r = vfs_lookup(path, cwd, &v);
+    bool created = false;
     if (r == -ENOENT && (flags & O_CREAT)) {
         struct vnode *parent;
         char name[NAME_MAX + 1];
         u32 len;
         r = vfs_lookup_parent(path, cwd, &parent, name, &len);
         if (r < 0) return r;
-        r = parent->ops->create ? parent->ops->create(parent, name, len, VN_FILE, &v) : -EPERM;
+        struct vnode_attr attr;
+        r = may(parent, MAY_WRITE | MAY_EXEC, false);
+        if (r == 0) r = new_attr(parent, VN_FILE, mode, &attr);
+        if (r == 0) r = parent->ops->create ? parent->ops->create(parent, name, len, VN_FILE, &attr, &v) : -EPERM;
+        created = r == 0;
         vnode_put(parent);
         if (r == -EEXIST && !(flags & O_EXCL)) r = vfs_lookup(path, cwd, &v);   /* created meanwhile */
         if (r < 0) return r;
@@ -262,16 +318,24 @@ int vfs_open(const char *path, struct vnode *cwd, u32 flags, struct file **out) 
         vnode_put(v);
         return -EEXIST;
     }
-    u32 mode = flags & O_ACCMODE;
-    if (v->type == VN_DIR && mode != O_RDONLY) {
+    u32 acc = flags & O_ACCMODE;
+    if (v->type == VN_DIR && acc != O_RDONLY) {
         vnode_put(v);
         return -EISDIR;
+    }
+    if (!created) {   /* the creator may write its new file even if the mode says otherwise */
+        int want = (acc != O_WRONLY ? MAY_READ : 0) | (acc != O_RDONLY || (flags & O_TRUNC) ? MAY_WRITE : 0);
+        r = v->type == VN_PIPE ? 0 : may(v, want, false);
+        if (r < 0) {
+            vnode_put(v);
+            return r;
+        }
     }
     if ((flags & O_DIRECTORY) && v->type != VN_DIR) {
         vnode_put(v);
         return -ENOTDIR;
     }
-    if ((flags & O_TRUNC) && mode != O_RDONLY && v->type == VN_FILE && v->ops->truncate) {
+    if ((flags & O_TRUNC) && acc != O_RDONLY && v->type == VN_FILE && v->ops->truncate) {
         r = v->ops->truncate(v, 0);
         if (r < 0) {
             vnode_put(v);
@@ -282,10 +346,44 @@ int vfs_open(const char *path, struct vnode *cwd, u32 flags, struct file **out) 
     return *out ? 0 : -ENOMEM;
 }
 
+/* ---- poll ------------------------------------------------------------------------------ */
+
+static volatile u64 poll_generation;
+static struct waitqueue poll_wq;
+
+void vfs_poll_notify(void) {
+    __atomic_add_fetch(&poll_generation, 1, __ATOMIC_ACQ_REL);
+    waitqueue_wake_all(&poll_wq);
+}
+
+u64 vfs_poll_generation(void) { return __atomic_load_n(&poll_generation, __ATOMIC_ACQUIRE); }
+
+struct waitqueue *vfs_poll_queue(void) { return &poll_wq; }
+
+u32 file_poll(struct file *f) {
+    u32 acc = f->flags & O_ACCMODE;
+    u32 all = (acc != O_WRONLY ? POLLIN : 0) | (acc != O_RDONLY ? POLLOUT : 0);
+    return f->vn->ops->poll ? f->vn->ops->poll(f->vn, f->flags) : all;
+}
+
+/* A file with shared mappings: its mapped pages hold the newest data (see opaline/uvm.h). */
+i64 vnode_read_at(struct vnode *v, u64 offset, void *buf, u64 len) {
+    if (!v->ops->read) return -EINVAL;
+    if (v->memobj) memobj_sync(v->memobj);   /* what the mappings wrote goes to the file first */
+    return v->ops->read(v, offset, buf, len);
+}
+
+i64 vnode_write_at(struct vnode *v, u64 offset, const void *buf, u64 len) {
+    if (!v->ops->write) return -EINVAL;
+    i64 r = v->ops->write(v, offset, buf, len);
+    if (r > 0 && v->memobj) memobj_written(v->memobj, offset, buf, (u64)r);   /* the mappings see it */
+    return r;
+}
+
 i64 file_read(struct file *f, void *buf, u64 len) {
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (!f->vn->ops->read) return -EINVAL;
-    i64 r = f->vn->ops->read(f->vn, f->offset, buf, len);
+    i64 r = vnode_read_at(f->vn, f->offset, buf, len);
     if (r > 0 && f->vn->type == VN_FILE) f->offset += (u64)r;
     return r;
 }
@@ -297,20 +395,23 @@ i64 file_write(struct file *f, const void *buf, u64 len) {
         struct vnode_stat st;
         if (f->vn->ops->stat(f->vn, &st) == 0) f->offset = st.size;
     }
-    i64 r = f->vn->ops->write(f->vn, f->offset, buf, len);
+    i64 r = vnode_write_at(f->vn, f->offset, buf, len);
     if (r > 0 && f->vn->type == VN_FILE) f->offset += (u64)r;
     return r;
 }
 
 /* ---- path operations ---------------------------------------------------------------- */
 
-int vfs_mkdir(const char *path, struct vnode *cwd) {
+int vfs_mkdir(const char *path, struct vnode *cwd, u32 mode) {
     struct vnode *parent, *v;
     char name[NAME_MAX + 1];
     u32 len;
     int r = vfs_lookup_parent(path, cwd, &parent, name, &len);
     if (r < 0) return r;
-    r = parent->ops->create ? parent->ops->create(parent, name, len, VN_DIR, &v) : -EPERM;
+    struct vnode_attr attr;
+    r = may(parent, MAY_WRITE | MAY_EXEC, false);
+    if (r == 0) r = new_attr(parent, VN_DIR, mode, &attr);
+    if (r == 0) r = parent->ops->create ? parent->ops->create(parent, name, len, VN_DIR, &attr, &v) : -EPERM;
     vnode_put(parent);
     if (r == 0) vnode_put(v);
     return r;
@@ -322,6 +423,12 @@ int vfs_remove(const char *path, struct vnode *cwd, bool is_dir) {
     u32 len;
     int r = vfs_lookup_parent(path, cwd, &parent, name, &len);
     if (r < 0) return r;
+    r = may(parent, MAY_WRITE | MAY_EXEC, false);
+    if (r == 0) r = sticky_ok(parent, name, len);
+    if (r < 0) {
+        vnode_put(parent);
+        return r;
+    }
     struct vnode *target;
     if (parent->ops->lookup(parent, name, len, &target) == 0) {
         bool busy = target->mounted != NULL || target == root;
@@ -348,6 +455,8 @@ int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd) {
         return r;
     }
     if (od->fs != nd->fs) r = -EXDEV;
+    else if ((r = may(od, MAY_WRITE | MAY_EXEC, false)) < 0 || (r = may(nd, MAY_WRITE | MAY_EXEC, false)) < 0) {}
+    else if ((r = sticky_ok(od, on, ol)) < 0 || (r = sticky_ok(nd, nn, nl)) < 0) {}
     else r = od->ops->rename ? od->ops->rename(od, on, ol, nd, nn, nl) : -EPERM;
     vnode_put(od);
     vnode_put(nd);
@@ -359,6 +468,15 @@ int vfs_stat(const char *path, struct vnode *cwd, struct vnode_stat *out) {
     int r = vfs_lookup(path, cwd, &v);
     if (r < 0) return r;
     r = v->ops->stat(v, out);
+    vnode_put(v);
+    return r;
+}
+
+int vfs_access(const char *path, struct vnode *cwd, int want, bool real_ids) {
+    struct vnode *v;
+    int r = vfs_lookup(path, cwd, &v);
+    if (r < 0) return r;
+    r = want ? may(v, want, real_ids) : 0;
     vnode_put(v);
     return r;
 }
