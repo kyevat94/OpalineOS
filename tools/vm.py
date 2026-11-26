@@ -215,7 +215,9 @@ class QemuSession:
             '"': "shift-apostrophe", "_": "shift-minus", ":": "shift-semicolon", "=": "equal",
             "$": "shift-4", "?": "shift-slash", "\t": "tab", "\b": "backspace"}
 
-    def __init__(self, image, log_name="serial-session.log", port=45455):
+    def __init__(self, image, log_name="serial-session.log", port=None):
+        # OPALINE_MONITOR_PORT lets several checkouts run their QEMU tests at the same time
+        port = port or int(os.environ.get("OPALINE_MONITOR_PORT", "45455"))
         self.log = os.path.join(BUILD, log_name)
         self.port = port
         self.proc = qemu_boot(image, self.log, extra=["-monitor", f"tcp:127.0.0.1:{port},server,nowait"])
