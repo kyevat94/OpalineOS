@@ -104,6 +104,9 @@ struct vnode_ops {
     int (*sync)(struct vnode *v);
     void (*close)(struct vnode *v, u32 open_flags);   /* an open file of this vnode was closed */
     void (*release)(struct vnode *v);                  /* the last reference is gone */
+    /* if set, vnode_put calls it instead of dropping the reference itself (efs3: the last drop
+       happens under the file system's lock, so a lookup can never find a vnode on its way out) */
+    void (*put)(struct vnode *v);
     /* poll(): the events that are true now (an open file with these flags). Without it: always
        readable and writable. A vnode with poll calls vfs_poll_notify() when they may change. */
     u32 (*poll)(struct vnode *v, u32 open_flags);

@@ -633,11 +633,9 @@ static bool remove_fn(struct dirent_raw *r, u32 block, u32 offset, void *p) {
     u8 *data = bread(c->fs, block);
     if (!data) return true;
     r = (struct dirent_raw *)(data + offset);
-    if (c->have_prev && c->prev_block == block) {   /* merge into the previous record */
+    if (c->have_prev && c->prev_block == block)   /* merge into the previous record */
         ((struct dirent_raw *)(data + c->prev_offset))->rec_len += r->rec_len;
-    } else {
-        r->ino = 0;
-    }
+    r->ino = 0;   /* a merged header stays behind as slack: it must not look alive */
     bwrite(c->fs, block, data);
     return true;
 }
@@ -697,10 +695,19 @@ static void destroy_inode(struct efs3 *fs, u32 ino, struct efs3_inode *in) {
     free_inode(fs, ino);
 }
 
-static void efs3_release(struct vnode *v) {
+/*
+ * Drops a reference. The drop to zero happens only under fs->lock, in the same critical section
+ * that takes the vnode out of the cache: get_vnode (also under the lock) therefore never finds a
+ * vnode with no references, the vnode is freed exactly once, and is_open() sees every vnode still
+ * in the cache as open. Other drops need no lock: they never reach zero.
+ */
+static void efs3_put(struct vnode *v) {
     struct efs3 *fs = v->fs;
+    int n = __atomic_load_n(&v->refs, __ATOMIC_ACQUIRE);
+    while (n > 1)
+        if (__atomic_compare_exchange_n(&v->refs, &n, n - 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     mutex_lock(&fs->lock);
-    if (__atomic_load_n(&v->refs, __ATOMIC_ACQUIRE) > 0) {   /* looked up again meanwhile */
+    if (__atomic_sub_fetch(&v->refs, 1, __ATOMIC_ACQ_REL) > 0) {   /* referenced again meanwhile */
         mutex_unlock(&fs->lock);
         return;
     }
@@ -943,11 +950,19 @@ static int do_rename(struct efs3 *fs, struct vnode *od, const char *on, u32 ol, 
         struct efs3_inode target;
         if (!inode_get(fs, t.ino, &target)) return -EIO;
         bool target_dir = (target.mode & S_IFMT) == S_IFDIR;
-        if (src_dir || target_dir) return src_dir && target_dir ? -EEXIST : target_dir ? -EISDIR : -ENOTDIR;
-        r = dir_remove(fs, &ndir, nn, nl);   /* replace the existing file */
+        if (src_dir != target_dir) return target_dir ? -EISDIR : -ENOTDIR;
+        if (target_dir) {   /* a directory may replace an empty one (as in Linux) */
+            r = dir_is_empty(fs, &target);
+            if (r <= 0) return r ? r : -ENOTEMPTY;
+        }
+        r = dir_remove(fs, &ndir, nn, nl);   /* replace the existing file or empty directory */
         if (r < 0) return r;
-        unlink_inode(fs, t.ino, &target, false);
+        unlink_inode(fs, t.ino, &target, target_dir);
         if (!inode_get(fs, (u32)nd->ino, &ndir)) return -EIO;
+        if (target_dir) {   /* its ".." no longer counts for the new parent */
+            ndir.links--;
+            if (!inode_put(fs, (u32)nd->ino, &ndir)) return -EIO;
+        }
     }
     r = dir_add(fs, (u32)nd->ino, &ndir, nn, nl, s.ino, file_type(src.mode));
     if (r < 0) return r;
@@ -994,12 +1009,25 @@ static int do_readdir(struct efs3 *fs, struct vnode *dir, u64 *cookie, struct di
     struct efs3_inode d;
     if (!inode_get(fs, (u32)dir->ino, &d)) return -EIO;
     u64 pos = *cookie;
+    bool resync = true;
     while (pos < d.size) {
         u64 fb = pos / BLOCK_SIZE;
         u32 off = (u32)(pos % BLOCK_SIZE);
         u32 b = bmap(fs, &d, fb, false);
         u8 *data = b ? bread(fs, b) : NULL;
         if (!data) return -EIO;
+        if (resync) {   /* the cookie may point into a record that absorbed a removed one: */
+            u32 at = 0;   /* start at the first record boundary from it on */
+            while (at < off) {
+                u16 len = ((struct dirent_raw *)(data + at))->rec_len;
+                if (len < 8 || len % 4 || at + len > BLOCK_SIZE) return -EIO;
+                at += len;
+            }
+            resync = false;
+            pos += at - off;
+            if (at == BLOCK_SIZE) continue;
+            off = at;
+        }
         struct dirent_raw *r = (struct dirent_raw *)(data + off);
         if (r->rec_len < 8 || r->rec_len % 4 || off + r->rec_len > BLOCK_SIZE) return -EIO;
         pos += r->rec_len;
@@ -1173,7 +1201,7 @@ static const struct vnode_ops efs3_ops = {
     .readlink = efs3_readlink,
     .link = efs3_link,
     .sync = efs3_sync,
-    .release = efs3_release,
+    .put = efs3_put,
 };
 
 int efs3_mount(struct block_device *dev, struct vnode **root) {

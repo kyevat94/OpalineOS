@@ -109,7 +109,9 @@ static u32 pipe_poll(struct vnode *v, u32 flags) {
     struct pipe *p = v->priv;
     if ((flags & O_ACCMODE) == O_RDONLY)
         return (p->len ? POLLIN : 0) | (p->writers == 0 ? POLLHUP : 0);   /* EOF reads as POLLHUP */
-    return (p->readers == 0 ? POLLERR : 0) | (PIPE_SIZE - p->len >= 1 ? POLLOUT : 0);
+    /* writable only if a PIPE_BUF write would not block (as in Linux): a write of up to 4 KiB goes
+       whole or not at all, and the ring is one PIPE_BUF, so that means empty */
+    return (p->readers == 0 ? POLLERR : 0) | (PIPE_SIZE - p->len >= PIPE_SIZE ? POLLOUT : 0);
 }
 
 static void pipe_release(struct vnode *v) {
