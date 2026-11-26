@@ -184,6 +184,10 @@ static u8 fpu_initial[512] ALIGNED(16);
 
 void thread_reset_fpu(void) { fxrstor(fpu_initial); }
 
+static u32 mxcsr_mask;
+
+u32 fpu_mxcsr_mask(void) { return mxcsr_mask; }
+
 struct thread *thread_create(const char *name, thread_fn fn, void *arg) {
     return thread_create_in(&kernel_process, name, fn, arg);
 }
@@ -324,6 +328,8 @@ void sched_init(void) {
     u32 mxcsr = 0x1F80;
     __asm__ volatile("fninit\n\tldmxcsr %0" : : "m"(mxcsr));
     fxsave(fpu_initial);
+    memcpy(&mxcsr_mask, fpu_initial + 28, 4);
+    if (!mxcsr_mask) mxcsr_mask = 0xFFBF;   /* CPUs that leave it 0 support the default set */
 
     kernel_process.page_table = read_cr3();
     kernel_process.main_thread = &boot_thread;

@@ -56,6 +56,7 @@ static inline void cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
     __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
 }
 
+static inline void write_cr0(u64 v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }
 static inline void write_cr3(u64 v) { __asm__ volatile("mov %0, %%cr3" : : "r"(v) : "memory"); }
 static inline void write_cr4(u64 v) { __asm__ volatile("mov %0, %%cr4" : : "r"(v) : "memory"); }
 static inline void invlpg(u64 addr) { __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory"); }
@@ -76,5 +77,6 @@ static inline void fxrstor(const void *area) { __asm__ volatile("fxrstor64 (%0)"
 #define EFER_SCE (1ULL << 0)
 #define EFER_NXE (1ULL << 11)
 #define CR4_PGE  (1ULL << 7)
+#define CR0_WP   (1ULL << 16)
 
 #endif

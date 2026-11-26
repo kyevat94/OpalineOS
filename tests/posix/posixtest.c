@@ -13,7 +13,10 @@
  * users and permissions (as an ordinary user, set-user-id programs) and job
  * control (stop/continue, process groups, restarted system calls); since
  * stage SE2, symbolic and hard links; and, since stage SE3, the terminal
- * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK.
+ * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK;
+ * and, since stage SE4, signals and CPU state (hostile signal frames, the NT
+ * flag, si_addr, copy-on-write under kernel writes, which calls SA_RESTART
+ * restarts, kill(-1), sigaltstack).
  * "posixtest rawkeys" and "posixtest env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
@@ -22,6 +25,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -993,6 +997,303 @@ static int raw_keys(void) {
     return 0;
 }
 
+/* ---- stage SE4: signals and CPU state -------------------------------------------------------- */
+
+/* Waits up to `ms` for the child, sending it `sig` every 10 ms meanwhile (0: none).
+ * 0 if it had to be killed because it did not end. */
+static int wait_poking(pid_t pid, int sig, int ms, int *status) {
+    struct timespec ms5 = {0, 5 * 1000000};
+    for (int i = 0; i < ms / 5; i++) {
+        if (sig && i % 2 == 0) kill(pid, sig);
+        if (waitpid(pid, status, WNOHANG) == pid) return 1;
+        nanosleep(&ms5, NULL);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, status, 0);
+    return 0;
+}
+
+static int exited_with(int status, int code) { return WIFEXITED(status) && WEXITSTATUS(status) == code; }
+
+static void on_mxcsr(int sig, siginfo_t *info, void *ctx) {
+    (void)sig, (void)info;
+    ucontext_t *uc = ctx;
+    uc->uc_mcontext.fpregs->mxcsr = 0x10000 | 0x1F80;   /* bit 16 is reserved on every CPU */
+    uc->uc_mcontext.fpregs->mxcr_mask = 0xFFFFFFFF;    /* and the frame claims it is not */
+}
+
+static volatile sig_atomic_t nt_count;
+static void on_nt(int sig, siginfo_t *info, void *ctx) {
+    (void)sig, (void)info;
+    nt_count++;
+    ((ucontext_t *)ctx)->uc_mcontext.gregs[REG_EFL] |= 0x4000;   /* NT in the frame to return to */
+}
+
+static unsigned long read_rflags(void) {
+    unsigned long f;
+    __asm__ volatile("pushfq\n\tpopq %0" : "=r"(f));
+    return f;
+}
+
+static int nt_child(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = on_nt;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa, NULL);
+    __asm__ volatile("pushfq\n\torq $0x4000, (%%rsp)\n\tpopfq" ::: "cc", "memory");   /* NT=1 */
+    raise(SIGUSR1);   /* system calls with NT=1, and one leaves through IRETQ (the handler) */
+    int ok = nt_count == 1 && !(read_rflags() & 0x4000);
+    raise(SIGUSR1);
+    ok = ok && nt_count == 2 && !(read_rflags() & 0x4000);   /* sigreturn drops NT, as Linux does */
+    return ok ? 0 : 1;
+}
+
+static char *cow_buf;
+static int cow_pipe[2];
+static void *cow_reader(void *arg) {
+    (void)arg;
+    return (void *)(intptr_t)read(cow_pipe[0], cow_buf, 8);
+}
+
+static volatile sig_atomic_t restart_hits;
+static void on_restart(int sig) { restart_hits += sig == SIGUSR1; }
+static void on_usr2_exit(int sig) { _exit(sig == SIGUSR2 ? 42 : 1); }
+
+/* A call that waits for a signal or a time fails with EINTR after a SA_RESTART handler. */
+static int no_restart_child(int kind) {
+    if (kind == 0) {
+        signal(SIGUSR1, on_restart);   /* musl's signal() sets SA_RESTART */
+    } else {
+        struct sigaction sa = {0};
+        sa.sa_handler = on_restart;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGUSR1, &sa, NULL);
+    }
+    sigset_t none;
+    sigemptyset(&none);
+    struct timespec five = {5, 0}, rem = {0, 0};
+    fd_set rd;
+    FD_ZERO(&rd);
+    int r;
+    switch (kind) {
+    case 0: r = pause(); break;
+    case 1: r = sigsuspend(&none); break;
+    case 2: r = nanosleep(&five, &rem); break;
+    case 3: r = poll(NULL, 0, -1); break;
+    default: r = select(0, &rd, NULL, NULL, NULL); break;
+    }
+    if (r != -1 || errno != EINTR || !restart_hits) return 1;
+    if (kind == 2 && !(rem.tv_sec < 5 && (rem.tv_sec > 0 || rem.tv_nsec > 0))) return 2;   /* the time left */
+    return 0;
+}
+
+static stack_t alt_seen;
+static int alt_change;
+static void on_alt(int sig) {
+    (void)sig;
+    sigaltstack(NULL, &alt_seen);
+    stack_t other = {.ss_sp = alt_seen.ss_sp, .ss_size = alt_seen.ss_size, .ss_flags = 0};
+    alt_change = sigaltstack(&other, NULL) == -1 && errno == EPERM;
+}
+
+static void test_signals_cpu(void) {
+    printf("signals and CPU state:\n");
+    int status;
+
+    /* rt_sigreturn: MXCSR is checked against the CPU's mask, not the one in the frame */
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct sigaction sa = {0};
+        sa.sa_sigaction = on_mxcsr;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGUSR1, &sa, NULL);
+        raise(SIGUSR1);
+        unsigned m;
+        __asm__ volatile("stmxcsr %0" : "=m"(m));
+        _exit(m == 0x1F80 ? 0 : 1);
+    }
+    waitpid(pid, &status, 0);
+    CHECK(exited_with(status, 0), "a reserved MXCSR bit in a signal frame is dropped (the kernel survives)");
+
+    /* NT (nested task) never reaches the kernel's IRETQ */
+    pid = fork();
+    if (pid == 0) _exit(nt_child());
+    waitpid(pid, &status, 0);
+    CHECK(exited_with(status, 0), "NT set by a program or in a signal frame does not break IRETQ");
+
+    /* si_addr comes from the fault itself, even when another process faults meanwhile */
+    long page = sysconf(_SC_PAGESIZE);
+    char *none = mmap(NULL, 16 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pid_t busy = fork();
+    if (busy == 0) {
+        for (;;) {   /* page faults all the time */
+            char *m = mmap(NULL, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            for (int i = 0; m != MAP_FAILED && i < 64; i++) m[i * page] = 1;
+            if (m != MAP_FAILED) munmap(m, 64 * page);
+        }
+    }
+    struct sigaction sa = {0}, old_segv;
+    sa.sa_sigaction = on_segv;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, &old_segv);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int n = 0, wrong = 0;
+    for (;; n++) {
+        if (n % 32 == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 > 600) break;
+        }
+        char *p = none + (n % 16) * page + n % 64;
+        segv_addr = NULL;
+        if (!faults(p, n & 1) || segv_addr != p) wrong++;
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    kill(busy, SIGKILL);
+    waitpid(busy, &status, 0);
+    munmap(none, 16 * page);
+    CHECK(n > 100 && wrong == 0, "si_addr is right while another process takes page faults");
+    if (wrong) printf("       (%d of %d faults reported another address)\n", wrong, n);
+
+    /* a read() blocked across fork(): its data goes to the caller's copy only (CR0.WP) */
+    cow_buf = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(cow_buf, "original", 8);
+    int sync[2];
+    pipe(cow_pipe);
+    pipe(sync);
+    pthread_t th;
+    pthread_create(&th, NULL, cow_reader, NULL);
+    struct timespec ms30 = {0, 30 * 1000000};
+    nanosleep(&ms30, NULL);   /* let it block in read() */
+    pid = fork();
+    if (pid == 0) {
+        char c;
+        read(sync[0], &c, 1);
+        _exit(memcmp(cow_buf, "original", 8) ? 1 : 0);
+    }
+    write(cow_pipe[1], "changed!", 8);
+    void *got = NULL;
+    pthread_join(th, &got);
+    write(sync[1], "x", 1);
+    waitpid(pid, &status, 0);
+    CHECK((intptr_t)got == 8 && !memcmp(cow_buf, "changed!", 8), "a read() blocked across fork() fills the buffer");
+    CHECK(exited_with(status, 0), "the forked child's copy of that buffer is untouched (copy-on-write)");
+    close(cow_pipe[0]), close(cow_pipe[1]), close(sync[0]), close(sync[1]);
+    munmap(cow_buf, page);
+
+    /* SA_RESTART does not restart the waits for a signal or a time */
+    static const char *const names[5] = {"pause()", "sigsuspend()", "nanosleep()", "poll()", "select()"};
+    for (int kind = 0; kind < 5; kind++) {
+        pid = fork();
+        if (pid == 0) _exit(no_restart_child(kind));
+        char what[96];
+        snprintf(what, sizeof what, "%s fails with EINTR after a SA_RESTART handler", names[kind]);
+        CHECK(wait_poking(pid, SIGUSR1, 3000, &status) && exited_with(status, 0), what);
+    }
+    /* but a read() still starts again */
+    int rp[2];
+    pipe(rp);
+    pid = fork();
+    if (pid == 0) {
+        struct sigaction ra = {0};
+        ra.sa_handler = on_restart;
+        ra.sa_flags = SA_RESTART;
+        sigaction(SIGUSR1, &ra, NULL);
+        close(rp[1]);
+        char buf[4] = {0};
+        _exit(read(rp[0], buf, 2) == 2 && !memcmp(buf, "hi", 2) && restart_hits ? 0 : 1);
+    }
+    close(rp[0]);
+    for (int i = 0; i < 5; i++) {
+        struct timespec ms10 = {0, 10 * 1000000};
+        nanosleep(&ms10, NULL);
+        kill(pid, SIGUSR1);
+    }
+    nanosleep(&ms30, NULL);
+    write(rp[1], "hi", 2);
+    close(rp[1]);
+    CHECK(wait_poking(pid, 0, 3000, &status) && exited_with(status, 0), "a read() with a SA_RESTART handler starts again");
+
+    /* sigsuspend ended by a stop: the mask it restores lets a pending signal in at once */
+    int ready[2];
+    pipe(ready);
+    pid = fork();
+    if (pid == 0) {
+        signal(SIGUSR2, on_usr2_exit);
+        sigset_t m;
+        sigemptyset(&m);
+        sigaddset(&m, SIGUSR2);
+        write(ready[1], "r", 1);
+        sigsuspend(&m);   /* SIGUSR2 waits blocked; the stop ends the wait */
+        _exit(1);
+    }
+    char c;
+    read(ready[0], &c, 1);
+    nanosleep(&ms30, NULL);
+    kill(pid, SIGUSR2);
+    kill(pid, SIGSTOP);
+    waitpid(pid, &status, WUNTRACED);
+    kill(pid, SIGCONT);
+    CHECK(wait_poking(pid, 0, 2000, &status) && exited_with(status, 42),
+          "after sigsuspend the restored mask delivers a pending signal at once");
+    close(ready[0]), close(ready[1]);
+    struct timespec zero = {0, 0};
+    struct { const void *mask; size_t size; } bad = {(const void *)8, 8};
+    CHECK(syscall(SYS_ppoll, NULL, 0, &zero, (void *)8, 8) == -1 && errno == EFAULT, "ppoll with a bad mask pointer: EFAULT");
+    CHECK(syscall(SYS_pselect6, 0, NULL, NULL, NULL, &zero, &bad) == -1 && errno == EFAULT,
+          "pselect6 with a bad mask pointer: EFAULT");
+    sigset_t empty;
+    sigemptyset(&empty);
+    CHECK(syscall(SYS_ppoll, NULL, 0, &zero, &empty, 4) == -1 && errno == EINVAL, "ppoll with a wrong mask size: EINVAL");
+
+    /* kill(-1): every process the caller may signal, but not the caller */
+    int pp[2];
+    pipe(pp);
+    pid = fork();
+    if (pid == 0) {
+        uid_t uid = 20000 + (uid_t)(getpid() % 10000);   /* a user nobody else runs as */
+        setgroups(0, NULL);
+        if (setgid(uid) || setuid(uid)) _exit(200);
+        pid_t victim = fork();
+        if (victim == 0) {
+            for (;;) pause();
+        }
+        write(pp[1], &victim, sizeof victim);
+        struct timespec ms20 = {0, 20 * 1000000};
+        nanosleep(&ms20, NULL);
+        if (kill(-1, 0) != 0) _exit(2);
+        if (kill(-1, SIGTERM) != 0) _exit(3);
+        int st;
+        if (waitpid(victim, &st, 0) != victim || !WIFSIGNALED(st) || WTERMSIG(st) != SIGTERM) _exit(4);
+        _exit(0);
+    }
+    pid_t victim = 0;
+    read(pp[0], &victim, sizeof victim);
+    int done = wait_poking(pid, 0, 3000, &status);
+    CHECK(done && exited_with(status, 0), "kill(-1) signals the caller's other processes, not itself");
+    if (victim > 0) kill(victim, SIGKILL);   /* only left if the check failed */
+    close(pp[0]), close(pp[1]);
+
+    /* sigaltstack */
+    stack_t s = {.ss_sp = malloc(SIGSTKSZ), .ss_size = SIGSTKSZ, .ss_flags = 0}, q;
+    void *mine = s.ss_sp;
+    CHECK(sigaltstack(&s, &s) == 0 && (s.ss_flags & SS_DISABLE) && sigaltstack(NULL, &q) == 0 && q.ss_sp == mine &&
+              !(q.ss_flags & SS_DISABLE),
+          "sigaltstack(&s, &s) installs s and returns the old one");
+    stack_t on = {.ss_sp = mine, .ss_size = SIGSTKSZ, .ss_flags = SS_ONSTACK};
+    CHECK(syscall(SYS_sigaltstack, &on, NULL) == 0, "sigaltstack accepts ss_flags SS_ONSTACK");
+    struct sigaction aa = {0};
+    aa.sa_handler = on_alt;
+    aa.sa_flags = SA_ONSTACK;
+    sigaction(SIGUSR1, &aa, NULL);
+    raise(SIGUSR1);
+    CHECK(alt_seen.ss_flags == SS_ONSTACK && alt_change, "on the alternate stack: SS_ONSTACK, and changing it gives EPERM");
+    signal(SIGUSR1, SIG_DFL);
+    stack_t off = {.ss_flags = SS_DISABLE};
+    sigaltstack(&off, NULL);
+    free(mine);
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1032,6 +1333,7 @@ int main(int argc, char **argv) {
     test_links();
     test_terminal();
     test_select();
+    test_signals_cpu();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

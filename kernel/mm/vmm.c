@@ -148,6 +148,8 @@ static void setup_cpu_features(void) {
         wbinvd();
     }
     if (d & (1u << 13)) write_cr4(read_cr4() | CR4_PGE);   /* global pages */
+    /* the kernel faults on read-only pages too: a copy-on-write page it writes gets copied first */
+    write_cr0(read_cr0() | CR0_WP);
 }
 
 void vmm_init(const struct boot_info *bi) {

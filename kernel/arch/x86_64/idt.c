@@ -85,9 +85,12 @@ void interrupt_dispatch(struct interrupt_frame *f) {
     if (f->vector < 32 && (f->cs & 3) == 3) {
         /* user memory not there yet: bring it in (demand paging) */
         if (f->vector == 14) {
-            struct process *p = thread_current()->process;
+            struct thread *t = thread_current();
+            struct process *p = t->process;
+            /* before STI: a switch to another thread that faults would change CR2 */
+            t->fault_addr = read_cr2();
             __asm__ volatile("sti");
-            bool ok = p->mm && mm_fault(p->mm, read_cr2(), fault_access(f->error));
+            bool ok = p->mm && mm_fault(p->mm, t->fault_addr, fault_access(f->error));
             __asm__ volatile("cli");
             if (!ok) process_fault(f);
         } else {
