@@ -36,13 +36,34 @@
   --bounce: cubic-bezier(.34, 1.56, .64, 1);
   --fast: 120ms;
   --bar-h: 38px;
+  --glow1: rgba(255, 251, 245, .55); --glow2: rgba(201, 162, 107, .10);   /* wallpaper light */
+  --knob-on: #F7F2EA; --skel-hi: #F6F0E7; --scrim: rgba(238, 230, 218, .62); --thumb: rgba(var(--sh), .6);
+}
+/* Dark theme: the same relief on graphite. The light edge is a faintly lighter grey, the shadow is
+   black; the accent is a brighter teal so it reads on the dark surface. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #222327; --surface: #25262A; --inset: #1E1F22;
+  --hl: 66, 68, 74; --sh: 0, 0, 0;
+  --hla: .55; --sha: .62;
+  --accent: #23897D; --accent-strong: #1B6F65; --accent-rgb: 35, 137, 125; --on-accent: #F4F7F6;
+  --text: #E6E4E0; --text2: #A29F99; --text3: #6D6A65;
+  --success: #3FA97C; --warning: #D7A24E; --error: #D6584E; --info: #4E93C8;
+  --border: rgba(255, 255, 255, .06);
+  --hc: 0 0 0 var(--hcw) rgba(255, 255, 255, .3);
+  --glow1: rgba(78, 96, 140, .10); --glow2: rgba(35, 137, 125, .05);
+  --knob-on: #2B2C31; --skel-hi: #2F3135; --scrim: rgba(16, 17, 19, .62); --thumb: rgba(255, 255, 255, .12);
+}
+/* switching theme: colors and shadows glide for a moment instead of jumping */
+html.theming *, html.theming *::before, html.theming *::after {
+  transition: background-color 450ms var(--ease), color 450ms var(--ease), box-shadow 450ms var(--ease), border-color 450ms var(--ease) !important;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body {
   background: var(--bg);
-  background-image: radial-gradient(120% 90% at 30% 20%, rgba(255, 251, 245, .55), transparent 60%),
-                    radial-gradient(90% 80% at 90% 100%, rgba(201, 162, 107, .10), transparent 60%);
+  background-image: radial-gradient(120% 90% at 30% 20%, var(--glow1), transparent 60%),
+                    radial-gradient(90% 80% at 90% 100%, var(--glow2), transparent 60%);
   color: var(--text); font: 14px/1.4 Inter, system-ui, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased; user-select: none;
 }
@@ -94,13 +115,13 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .grow { flex: 1; }
 .scroll { overflow: auto; }
 .scroll::-webkit-scrollbar { width: 10px; height: 10px; }
-.scroll::-webkit-scrollbar-thumb { background: rgba(var(--sh), .6); border-radius: 10px; border: 3px solid var(--bg); }
+.scroll::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 10px; border: 3px solid var(--bg); }
 
 /* switch, checkbox, radio, slider */
 .switch { width: 50px; height: 28px; border-radius: 99px; background: var(--inset); box-shadow: var(--in1); position: relative; cursor: pointer; transition: background 200ms var(--ease); flex: none; }
 .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--surface); box-shadow: var(--e1); transition: transform 280ms var(--bounce), background 200ms; }
 .switch.on { background: var(--accent); box-shadow: var(--in-acc); }
-.switch.on::after { transform: translateX(22px); background: #F7F2EA; box-shadow: var(--knob-on-acc); }
+.switch.on::after { transform: translateX(22px); background: var(--knob-on); box-shadow: var(--knob-on-acc); }
 .check { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
 .check .box { width: 22px; height: 22px; border-radius: 7px; background: var(--surface); box-shadow: var(--e1); display: grid; place-items: center; transition: all 160ms var(--ease); color: transparent; }
 .check.on .box { background: var(--accent); box-shadow: var(--in-acc); color: #fff; }
@@ -169,6 +190,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .qs.on .ic { background: var(--accent); color: #fff; box-shadow: var(--in-acc); }
 .qs b { display: block; font-size: 13px; font-weight: 600; }
 .qs small { font-size: 11px; color: var(--text2); }
+.qs.wide { grid-column: span 2; }
 .notif { display: flex; gap: 10px; padding: 12px; border-radius: 14px; box-shadow: var(--e1); margin-top: 10px; align-items: flex-start; }
 .notif .ic { width: 30px; height: 30px; border-radius: 10px; display: grid; place-items: center; background: var(--surface); box-shadow: var(--e1); color: var(--accent); flex: none; }
 .notif p { margin: 2px 0 0; font-size: 12px; color: var(--text2); }
@@ -227,7 +249,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .spinner { width: 30px; height: 30px; position: relative; }
 .spinner i { position: absolute; left: 13px; top: 1px; width: 4px; height: 8px; border-radius: 2px; background: var(--accent); transform-origin: 2px 14px; animation: spin 1s linear infinite; opacity: .15; }
 @keyframes spin { 0% { opacity: 1; } 100% { opacity: .15; } }
-.skel { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--inset), #F6F0E7, var(--inset)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; box-shadow: var(--in1); }
+.skel { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--inset), var(--skel-hi), var(--inset)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; box-shadow: var(--in1); }
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 .pager { display: flex; gap: 6px; align-items: center; }
 .pg { width: 32px; height: 32px; border-radius: 10px; font-weight: 600; font-size: 13px; color: var(--text2); transition: box-shadow var(--fast) var(--ease), color var(--fast), background var(--fast); }
@@ -253,7 +275,7 @@ tr.sel td { color: var(--accent); }
 .toast { pointer-events: auto; min-width: 260px; max-width: 340px; display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 14px; background: var(--surface); box-shadow: var(--e5); font-size: 13px; }
 .toast .ic { width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; color: #fff; flex: none; }
 .toast b { font-weight: 600; }
-#scrim { position: fixed; inset: 0; background: rgba(238, 230, 218, .62); z-index: 9900; display: none; }
+#scrim { position: fixed; inset: 0; background: var(--scrim); z-index: 9900; display: none; }
 .dialog { position: fixed; z-index: 9950; left: 50%; top: 50%; width: 340px; margin: -150px 0 0 -170px; padding: 24px; border-radius: 22px; background: var(--surface); box-shadow: var(--e5); text-align: center; display: none; }
 .dialog .big { width: 64px; height: 64px; margin: 4px auto 14px; border-radius: 20px; display: grid; place-items: center; box-shadow: var(--in1); color: var(--warning); }
 .dialog p { color: var(--text2); margin: 8px 0 20px; }
@@ -334,6 +356,7 @@ tr.sel td { color: var(--accent); }
     <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15zM10 20.5a2.2 2.2 0 0 0 4 0"/></symbol>
     <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7.5l10 9-5 4.5V3l5 4.5-10 9"/></symbol>
     <symbol id="i-plane" viewBox="0 0 24 24"><path d="M12 3c.9 0 1.5.8 1.5 1.8v5l7 4v2l-7-2v4l2 1.5v1.7L12 20l-3.5 1v-1.7l2-1.5v-4l-7 2v-2l7-4v-5C10.5 3.8 11.1 3 12 3z"/></symbol>
+    <symbol id="i-theme" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
     <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8.5M6.6 6.6a8 8 0 1 0 10.8 0"/></symbol>
@@ -436,6 +459,7 @@ const STR = {
     files: "Files", terminal: "Terminal", settings: "Settings", monitor: "System Monitor", editor: "Editor",
     components: "Components", about: "About OpalineOS",
     wifi: "Wi-Fi", bluetooth: "Bluetooth", airplane: "Airplane mode", night: "Night mode", on: "On", off: "Off",
+    darkMode: "Dark Mode", lightMode: "Light Mode", nowLight: "Light theme now", nowDark: "Dark theme now",
     connected: "Connected", home: "Home", documents: "Documents", music: "Music", pictures: "Pictures",
     downloads: "Downloads", projects: "Projects", emptyFolder: "This folder is empty", items: "{n} items",
     appearance: "Appearance", depth: "Depth of the relief", depthSub: "0 is flat, 1 is the theme, 1.5 is deeper",
@@ -469,6 +493,7 @@ const STR = {
     files: "Arquivos", terminal: "Terminal", settings: "Configurações", monitor: "Monitor do Sistema", editor: "Editor",
     components: "Componentes", about: "Sobre o OpalineOS",
     wifi: "Wi-Fi", bluetooth: "Bluetooth", airplane: "Modo avião", night: "Modo noturno", on: "Ligado", off: "Desligado",
+    darkMode: "Modo escuro", lightMode: "Modo claro", nowLight: "Tema claro agora", nowDark: "Tema escuro agora",
     connected: "Conectado", home: "Início", documents: "Documentos", music: "Música", pictures: "Imagens",
     downloads: "Downloads", projects: "Projetos", emptyFolder: "Esta pasta está vazia", items: "{n} itens",
     appearance: "Aparência", depth: "Profundidade do relevo", depthSub: "0 é plano, 1 é o tema, 1,5 é mais fundo",
@@ -880,8 +905,8 @@ APPS.terminal = { icon: "terminal", w: 640, h: 400, build(body, w) {
 } };
 
 /* ---- System Monitor ---- */
-APPS.monitor = { icon: "monitor", w: 700, h: 470, build(body, w) {
-  body.innerHTML = `<div class="mon-grid"><div class="card" style="padding:12px"><div class="label" data-i18n="cpu">${t("cpu")}</div>
+APPS.monitor = { icon: "monitor", w: 720, h: 640, build(body, w) {
+  body.innerHTML = `<div class="mon-grid" style="flex:none"><div class="card" style="padding:12px"><div class="label" data-i18n="cpu">${t("cpu")}</div>
       <div class="ring"><svg viewBox="0 0 150 150"><circle cx="75" cy="75" r="62" fill="none" stroke="rgba(var(--sh),.25)" stroke-width="10"/>
       <circle class="arc" cx="75" cy="75" r="62" fill="none" stroke="var(--accent)" stroke-width="10" stroke-linecap="round" stroke-dasharray="389.6" stroke-dashoffset="389.6" style="transition:stroke-dashoffset 700ms cubic-bezier(.2,.8,.2,1)"/></svg>
       <div class="inner"><div><div class="val">0%</div><div class="caption" data-i18n="usage">${t("usage")}</div></div></div></div></div>
@@ -891,7 +916,7 @@ APPS.monitor = { icon: "monitor", w: 700, h: 470, build(body, w) {
       <div class="row" style="gap:14px"><div class="card grow" style="padding:12px 14px"><div class="row"><span class="label grow" data-i18n="memory">${t("memory")}</span><b class="mem">0%</b></div><div class="progress" style="margin-top:10px"><div class="memb"></div></div></div>
       <div class="card grow" style="padding:12px 14px"><div class="row"><span class="label grow" data-i18n="disk">${t("disk")}</span><b>38%</b></div><div class="progress" style="margin-top:10px"><div style="width:38%"></div></div></div></div></div></div>
     <div class="section-title" style="margin-top:16px" data-i18n="processes">${t("processes")}</div>
-    <div class="panel scroll" style="flex:1;min-height:0;padding:4px 8px"><table><thead><tr><th data-s="name" data-i18n="name">${t("name")}</th><th data-s="pid">PID</th><th data-s="cpu" data-i18n="cpu">CPU</th><th data-s="mem" data-i18n="memory">${t("memory")}</th><th data-i18n="status">${t("status")}</th></tr></thead><tbody></tbody></table></div>`;
+    <div class="panel scroll" style="flex:1;min-height:150px;padding:4px 8px"><table><thead><tr><th data-s="name" data-i18n="name">${t("name")}</th><th data-s="pid">PID</th><th data-s="cpu" data-i18n="cpu">CPU</th><th data-s="mem" data-i18n="memory">${t("memory")}</th><th data-i18n="status">${t("status")}</th></tr></thead><tbody></tbody></table></div>`;
   const canvas = $("canvas", body), ctx = canvas.getContext("2d"), hist = Array(60).fill(0);
   const procs = [["kernel", 0], ["sh", 31], ["compositor", 12], ["files", 44], ["terminal", 45], ["monitor", 46], ["posixtest", 52], ["python3", 58]]
     .map(([name, pid]) => ({ name, pid, cpu: 0, mem: Math.round(2 + Math.random() * 60) }));
@@ -954,13 +979,10 @@ APPS.settings = { icon: "settings", w: 720, h: 540, build(body) {
         <div class="set-row"><div class="t"><b data-i18n="contrast">${t("contrast")}</b><small data-i18n="contrastSub">${t("contrastSub")}</small></div><div class="hc"></div></div>`;
       makeSlider($(".depth", pane), { value: +getComputedStyle(document.documentElement).getPropertyValue("--depth") || 1, min: 0, max: 1.5, step: .05,
         fmt: v => v.toFixed(2), onChange: v => root.setProperty("--depth", v) });
-      const accents = [["#1E5D59", "#164744", "30, 93, 89"], ["#9A5B3C", "#7D4930", "154, 91, 60"], ["#5B4E86", "#483D6C", "91, 78, 134"], ["#3D5A73", "#2F475B", "61, 90, 115"], ["#7A6A2E", "#5F5323", "122, 106, 46"]];
-      const cur = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim().toUpperCase();
-      $(".sw", pane).innerHTML = accents.map(([c]) => `<button class="swatch ${c === cur ? "on" : ""}" data-c="${c}" style="background:${c};color:${c}"></button>`).join("");
+      $(".sw", pane).innerHTML = ACCENTS.map((a, i) => { const c = a[theme()][0]; return `<button class="swatch ${i === accentIdx ? "on" : ""}" data-i="${i}" style="background:${c};color:${c}"></button>`; }).join("");
       $(".sw", pane).onclick = e => {
         const b = e.target.closest(".swatch"); if (!b) return;
-        const a = accents.find(x => x[0] === b.dataset.c);
-        root.setProperty("--accent", a[0]); root.setProperty("--accent-strong", a[1]); root.setProperty("--accent-rgb", a[2]);
+        accentIdx = +b.dataset.i; applyAccent();
         $(".sw", pane).querySelectorAll(".swatch").forEach(s => s.classList.toggle("on", s === b));
       };
       const lx = getComputedStyle(document.documentElement).getPropertyValue("--lx").trim() || "1";
@@ -989,7 +1011,7 @@ APPS.settings = { icon: "settings", w: 720, h: 540, build(body) {
       pane.innerHTML = `<div class="section-title" data-i18n="about">${t("about")}</div>
         <div class="card" style="display:flex;gap:18px;align-items:center"><div class="avatar" style="width:72px;height:72px;border-radius:22px;color:var(--accent)">${icon("logo", "s24")}</div>
         <div><h2>OpalineOS</h2><div class="caption" data-i18n="aboutText">${t("aboutText")}</div></div></div>
-        <div class="set-row" style="margin-top:16px"><div class="t"><b data-i18n="kernel">${t("kernel")}</b></div><span class="caption">0.6.1-se1 · x86-64 · UEFI</span></div>
+        <div class="set-row" style="margin-top:16px"><div class="t"><b data-i18n="kernel">${t("kernel")}</b></div><span class="caption">0.6.3-se3 · x86-64 · UEFI</span></div>
         <div class="set-row"><div class="t"><b>C library</b></div><span class="caption">musl 1.2.6</span></div>
         <div class="set-row"><div class="t"><b data-i18n="toolkit">${t("toolkit")}</b></div><span class="caption">opaline-relief (spec v0.3)</span></div>`;
     },
@@ -1126,18 +1148,49 @@ $("#search").oninput = e => {
 };
 $("#search").onkeydown = e => { if (e.key === "Enter") { const first = document.querySelector(".app-tile:not(.hidden)"); if (first) openApp(first.dataset.app); } };
 
-const QS = [["wifi", "wifi", true], ["bluetooth", "bt", false], ["airplane", "plane", false], ["night", "moon", false]];
+/* Light and dark theme. Each accent color has a version for each theme (the dark one is brighter). */
+const ACCENTS = [
+  { light: ["#1E5D59", "#164744", "30, 93, 89"], dark: ["#23897D", "#1B6F65", "35, 137, 125"] },
+  { light: ["#9A5B3C", "#7D4930", "154, 91, 60"], dark: ["#C27A55", "#A86545", "194, 122, 85"] },
+  { light: ["#5B4E86", "#483D6C", "91, 78, 134"], dark: ["#8A79C6", "#7262AC", "138, 121, 198"] },
+  { light: ["#3D5A73", "#2F475B", "61, 90, 115"], dark: ["#5E8BB0", "#4C7495", "94, 139, 176"] },
+  { light: ["#7A6A2E", "#5F5323", "122, 106, 46"], dark: ["#AD984C", "#8F7D3C", "173, 152, 76"] },
+];
+let accentIdx = 0;
+function theme() { return document.documentElement.dataset.theme === "dark" ? "dark" : "light"; }
+function applyAccent() {
+  const a = ACCENTS[accentIdx][theme()], st = document.documentElement.style;
+  st.setProperty("--accent", a[0]); st.setProperty("--accent-strong", a[1]); st.setProperty("--accent-rgb", a[2]);
+}
+function setTheme(name) {
+  const r = document.documentElement;
+  if (mode() !== "none") {
+    r.classList.add("theming");
+    clearTimeout(setTheme.timer); setTheme.timer = setTimeout(() => r.classList.remove("theming"), 500);
+  }
+  if (name === "dark") r.dataset.theme = "dark"; else delete r.dataset.theme;
+  applyAccent();
+  try { localStorage.setItem("opaline-theme", name); } catch (e) { /* private window: not remembered */ }
+}
+
+const QS = [["wifi", "wifi", true], ["bluetooth", "bt", false], ["airplane", "plane", false], ["night", "moon", false], ["theme", "theme", false]];
 function drawQS() {
-  $("#qs").innerHTML = QS.map(([k, ic, on], i) => `<button class="qs ${on ? "on" : ""}" data-i="${i}"><div class="ic">${icon(ic, "s16")}</div><div><b>${t(k)}</b><small>${on ? (k === "wifi" ? t("connected") : t("on")) : t("off")}</small></div></button>`).join("");
+  const dark = theme() === "dark";
+  $("#qs").innerHTML = QS.map(([k, ic, on], i) => k === "theme"
+    ? `<button class="qs wide" data-i="${i}"><div class="ic">${icon(ic, "s16")}</div><div><b>${t(dark ? "lightMode" : "darkMode")}</b><small>${t(dark ? "nowDark" : "nowLight")}</small></div></button>`
+    : `<button class="qs ${on ? "on" : ""}" data-i="${i}"><div class="ic">${icon(ic, "s16")}</div><div><b>${t(k)}</b><small>${on ? (k === "wifi" ? t("connected") : t("on")) : t("off")}</small></div></button>`).join("");
 }
 $("#qs").onclick = e => {
   const b = e.target.closest(".qs"); if (!b) return;
-  const q = QS[+b.dataset.i]; q[2] = !q[2];
+  const q = QS[+b.dataset.i];
+  if (q[0] === "theme") setTheme(theme() === "dark" ? "light" : "dark");
+  else q[2] = !q[2];
   if (q[0] === "night") $("#night").style.opacity = q[2] ? .16 : 0;
   drawQS();
   const nb = $(`#qs [data-i="${b.dataset.i}"] .ic`);
   if (mode() !== "none") nb.animate(springFrames(p => ({ transform: `scale(${.8 + .2 * p})` })), { duration: springMs() });
 };
+try { if (localStorage.getItem("opaline-theme") === "dark") setTheme("dark"); } catch (e) { /* no storage: light */ }
 drawQS(); langListeners.push(drawQS);
 makeSlider($("#bright"), { value: 1, min: .3, max: 1, onChange: v => $("#dim").style.opacity = (1 - v) * .8 });
 makeSlider($("#vol"), { value: .6 });

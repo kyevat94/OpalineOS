@@ -312,8 +312,21 @@ Os nomes dos tokens são em inglês, como toda a API.
 | `success` / `warning` / `error` / `info` | `#2E7D5B` / `#B7832F` / `#B3423A` / `#2E6F9E` | badges, toasts, alertas, gráficos |
 | `chart.cpu` / `chart.memory` / `chart.disk` | `#1E5D59` / `#C9A26B` / `#8C6E9E` | séries do monitor do sistema |
 
-O **tema escuro** segue a mesma regra de relevo com uma superfície escura e realces discretos; os
-valores ficam para a E9 (questão aberta no `opaline-relief.md`).
+O **tema escuro** segue a mesma regra de relevo sobre grafite: o realce é um cinza só um pouco mais
+claro que a superfície e a sombra é preta; o destaque fica mais claro para ler bem no fundo escuro.
+Valores do mockup (2026-11-26), ajustáveis na E9:
+
+| Token | Escuro |
+|---|---|
+| `background.base` / `surface.base` / `surface.inset` | `#222327` / `#25262A` / `#1E1F22` |
+| `relief.light` / `relief.dark` | `rgb(66, 68, 74)` α 0,55 / `rgb(0, 0, 0)` α 0,62 |
+| `accent` / `accent.strong` / `on_accent` | `#23897D` / `#1B6F65` / `#F4F7F6` |
+| `text.primary` / `text.secondary` / `text.disabled` | `#E6E4E0` / `#A29F99` / `#6D6A65` |
+| `success` / `warning` / `error` / `info` | `#3FA97C` / `#D7A24E` / `#D6584E` / `#4E93C8` |
+
+Cada cor de destaque escolhida em Configurações tem uma versão para cada tema. A troca de tema é
+um botão **Dark Mode / Light Mode** nos atalhos rápidos da central de notificações; cores e sombras
+fazem uma transição curta (450 ms) em vez de pular.
 
 **Elevação** (`elevation`, deslocamento/desfoque das duas sombras em px; o realce vai para o lado da
 luz e a sombra para o outro)
@@ -360,7 +373,7 @@ flutuante e em relevo, que faz o papel da barra de tarefas:
   programa abre e some quando ele fecha. O do programa ativo fica afundado, com um traço de destaque.
   Clicar alterna entre focar, minimizar e restaurar; minimizar "entra" no botão e restaurar sai dele;
 - à direita, os indicadores (rede, som, bateria), as notificações e o relógio, que abrem a central de
-  notificações: atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno), brilho, volume e a lista
+  notificações: atalhos rápidos (Wi-Fi, Bluetooth, modo avião, modo noturno, tema claro/escuro), brilho, volume e a lista
   de avisos.
 
 Janelas maximizadas ocupam a tela abaixo da barra. Os avisos (toasts) aparecem no canto superior
@@ -1048,6 +1061,7 @@ OpalineOS/
 | 2026-11-21 | **Layout da área de trabalho**: sem docks nem barras laterais ou inferiores; uma barra fina no topo é a barra de tarefas (botão Apps, um botão por programa aberto, indicadores, notificações e relógio). Prévia interativa aprovada: `docs/mockup/opaline-desktop.html` (movimentos, funções e design). Elementos coloridos afundados usam uma sombra interna própria (escura, quase sem realce), para não parecerem brilhantes. No toolkit, `ctx.dock_icon` virou `ctx.task_button` e `to_dock` virou `to_bar` |
 | 2026-11-21 | **SE2 concluída**: EFS3 versão 2 com **journal** de metadados em modo ordenado (uma transação por operação, commit com checksum, reaplicado na montagem, órfãos liberados), links **simbólicos** (seguidos pelo VFS, até 40) e **físicos**, `getcwd` com o caminho real. Teste de queda de energia em 10 pontos de uma carga de 1178 escritas: fsck limpo em todos |
 | 2026-11-21 | **SE3 concluída**: termios no terminal (canônico e cru, `VMIN`/`VTIME`, Enter manda `\r` + `ICRNL`), `select`/`pselect6` sobre o laço do `poll`, `O_NONBLOCK` real em pipes e no terminal; **shell novo em C sobre a musl** (`programs/sh`, estático) com `fork`/`execve`, ambiente herdado, `$VAR`/`$?`, `export`/`unset`/`env`, `ln`, termios restaurado após cada programa. O shell da E5 (`user/sh`) saiu |
+| 2026-11-26 | **Tema escuro** no mockup, a partir de uma referência do usuário: o mesmo relevo sobre grafite (`#25262A`), destaque teal mais claro (`#23897D`), botão **Dark Mode / Light Mode** nos atalhos rápidos; tokens na seção 6.1 |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema
