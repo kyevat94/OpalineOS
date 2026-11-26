@@ -42,6 +42,7 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <grp.h>
+#include <poll.h>
 #define FUTEX_WAIT 0   /* linux/futex.h; musl has no kernel headers */
 #define FUTEX_WAKE 1
 #include <termios.h>
@@ -897,13 +898,17 @@ static void test_select(void) {
     FD_SET(p[0], &rd);
     CHECK(select(p[0] + 1, &rd, NULL, NULL, &tv) == 0 && !FD_ISSET(p[0], &rd), "select: empty pipe not readable");
     write(p[1], "x", 1);
+    int q[2];   /* writable means a 4 KiB write would not block (SE4): an empty pipe */
+    pipe(q);
     FD_ZERO(&rd);
     FD_SET(p[0], &rd);
     FD_ZERO(&wr);
-    FD_SET(p[1], &wr);
-    int maxfd = p[0] > p[1] ? p[0] : p[1];
-    CHECK(select(maxfd + 1, &rd, &wr, NULL, NULL) == 2 && FD_ISSET(p[0], &rd) && FD_ISSET(p[1], &wr),
+    FD_SET(q[1], &wr);
+    int maxfd = p[0] > q[1] ? p[0] : q[1];
+    CHECK(select(maxfd + 1, &rd, &wr, NULL, NULL) == 2 && FD_ISSET(p[0], &rd) && FD_ISSET(q[1], &wr),
           "select: readable and writable (2 bits set)");
+    close(q[0]);
+    close(q[1]);
     char c;
     read(p[0], &c, 1);
     FD_ZERO(&rd);
@@ -969,6 +974,120 @@ static void test_select(void) {
     close(p[1]);
 }
 
+/* ---- file system details (SE4) ------------------------------------------------------------- */
+
+struct dent64 {
+    uint64_t ino;
+    int64_t off;
+    unsigned short reclen;
+    unsigned char type;
+    char name[];
+};
+
+static void test_fs_details(void) {
+    printf("file system details:\n");
+    int p[2];
+    static char page[4096];
+    pipe(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    write(p[1], "x", 1);
+    struct pollfd pf = {p[1], POLLOUT, 0};
+    int pr = poll(&pf, 1, 0);
+    errno = 0;
+    CHECK(!(pr == 1 && (pf.revents & POLLOUT)) || write(p[1], page, sizeof page) == (ssize_t)sizeof page,
+          "poll: POLLOUT only if a 4 KiB O_NONBLOCK write does not get EAGAIN");
+    while (read(p[0], page, sizeof page) > 0) {}
+    pf.revents = 0;
+    CHECK(poll(&pf, 1, 0) == 1 && (pf.revents & POLLOUT), "poll: an empty pipe is writable");
+    close(p[0]);
+    close(p[1]);
+
+    /* open with O_CREAT and links */
+    struct stat st;
+    CHECK(mkdir("/tmp/fs4", 0755) == 0, "mkdir /tmp/fs4");
+    symlink("/tmp/fs4/target", "/tmp/fs4/l");
+    int fd = open("/tmp/fs4/l", O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && stat("/tmp/fs4/target", &st) == 0 && S_ISREG(st.st_mode), "O_CREAT through a dangling link creates its target");
+    if (fd >= 0) close(fd);
+    errno = 0;
+    CHECK(open("/tmp/fs4/l", O_WRONLY | O_CREAT | O_EXCL, 0644) < 0 && errno == EEXIST, "O_CREAT|O_EXCL on a link: EEXIST");
+    symlink("/tmp/fs4/nothing", "/tmp/fs4/l2");
+    errno = 0;
+    CHECK(open("/tmp/fs4/l2", O_WRONLY | O_CREAT | O_EXCL, 0644) < 0 && errno == EEXIST && access("/tmp/fs4/nothing", F_OK) < 0,
+          "O_CREAT|O_EXCL on a dangling link: EEXIST, nothing created");
+
+    /* a trailing slash: the name must be a directory, and a link there is followed */
+    errno = 0;
+    CHECK(open("/tmp/fs4/new/", O_WRONLY | O_CREAT, 0644) < 0 && errno == EISDIR && access("/tmp/fs4/new", F_OK) < 0,
+          "open(\"new/\", O_CREAT): EISDIR, nothing created");
+    errno = 0;
+    CHECK(stat("/tmp/fs4/target/", &st) < 0 && errno == ENOTDIR, "stat(\"file/\"): ENOTDIR");
+    errno = 0;
+    CHECK(open("/tmp/fs4/target/", O_RDONLY) < 0 && errno == ENOTDIR, "open(\"file/\"): ENOTDIR");
+    CHECK(mkdir("/tmp/fs4/d/", 0755) == 0 && stat("/tmp/fs4/d", &st) == 0 && S_ISDIR(st.st_mode), "mkdir(\"dir/\") works");
+    symlink("d", "/tmp/fs4/dl");
+    CHECK(lstat("/tmp/fs4/dl/", &st) == 0 && S_ISDIR(st.st_mode), "lstat(\"link/\") follows the link");
+
+    /* readdir while names go away: a removed entry is never returned */
+    mkdir("/tmp/fs4/many", 0755);
+    char path[64];
+    for (int i = 0; i < 40; i++) {
+        snprintf(path, sizeof path, "/tmp/fs4/many/file%02d", i);
+        close(open(path, O_WRONLY | O_CREAT, 0644));
+    }
+    int seen[41] = {0}, gone[41] = {0}, bad = 0;
+    int dfd = open("/tmp/fs4/many", O_RDONLY | O_DIRECTORY);
+    char dbuf[40];   /* one entry per call */
+    long n;
+    while (dfd >= 0 && (n = syscall(SYS_getdents64, dfd, dbuf, sizeof dbuf)) > 0)
+        for (long o = 0; o < n; o += ((struct dent64 *)(dbuf + o))->reclen) {
+            const char *name = ((struct dent64 *)(dbuf + o))->name;
+            if (strncmp(name, "file", 4)) continue;
+            int k = atoi(name + 4);
+            if (k < 0 || k >= 40 || gone[k] || seen[k]++) {
+                bad++;
+                continue;
+            }
+            for (int j = k; j <= k + 1 && j < 40; j++) {   /* this one, and the next before it is read */
+                snprintf(path, sizeof path, "/tmp/fs4/many/file%02d", j);
+                if (!gone[j] && unlink(path) == 0) gone[j] = 1;
+            }
+        }
+    if (dfd >= 0) close(dfd);
+    int all = 1;
+    for (int i = 0; i < 40; i++)
+        if (!gone[i]) all = 0;
+    CHECK(dfd >= 0 && !bad && all, "readdir while unlinking: no name twice, none after its unlink");
+    CHECK(rmdir("/tmp/fs4/many") == 0, "the directory is empty afterwards");
+
+    /* rename of directories */
+    struct stat before, after, b, dotdot;
+    mkdir("/tmp/fs4/a", 0755);
+    mkdir("/tmp/fs4/b", 0755);
+    close(open("/tmp/fs4/a/inside", O_WRONLY | O_CREAT, 0644));
+    stat("/tmp/fs4", &before);
+    CHECK(rename("/tmp/fs4/a", "/tmp/fs4/b") == 0 && access("/tmp/fs4/a", F_OK) < 0 && access("/tmp/fs4/b/inside", F_OK) == 0,
+          "rename a directory over an empty one");
+    CHECK(stat("/tmp/fs4", &after) == 0 && after.st_nlink == before.st_nlink - 1, "the parent has one link less");
+    mkdir("/tmp/fs4/c", 0755);
+    errno = 0;
+    CHECK(rename("/tmp/fs4/c", "/tmp/fs4/b") < 0 && errno == ENOTEMPTY, "onto a non-empty directory: ENOTEMPTY");
+    errno = 0;
+    CHECK(rename("/tmp/fs4/c", "/tmp/fs4/target") < 0 && errno == ENOTDIR, "a directory onto a file: ENOTDIR");
+    errno = 0;
+    CHECK(rename("/tmp/fs4/target", "/tmp/fs4/c") < 0 && errno == EISDIR, "a file onto a directory: EISDIR");
+    mkdir("/tmp/fs4/b/e", 0755);
+    stat("/tmp/fs4", &before);
+    CHECK(rename("/tmp/fs4/c", "/tmp/fs4/b/e") == 0 && stat("/tmp/fs4", &after) == 0 && after.st_nlink == before.st_nlink - 1 &&
+              stat("/tmp/fs4/b", &b) == 0 && b.st_nlink == 3 && stat("/tmp/fs4/b/e/..", &dotdot) == 0 && dotdot.st_ino == b.st_ino,
+          "over an empty directory in another parent: link counts and \"..\"");
+    const char *files[] = {"/tmp/fs4/target", "/tmp/fs4/l", "/tmp/fs4/l2", "/tmp/fs4/dl", "/tmp/fs4/b/inside"};
+    for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) unlink(files[i]);
+    CHECK(rmdir("/tmp/fs4/b/e") == 0 && rmdir("/tmp/fs4/b") == 0 && rmdir("/tmp/fs4/d") == 0 && rmdir("/tmp/fs4") == 0,
+          "file system details cleaned up");
+}
+
 /* "posixtest rawkeys": raw mode, one line per key until q (x: exit without restoring the terminal). */
 static int raw_keys(void) {
     struct termios orig, t;
@@ -1032,6 +1151,7 @@ int main(int argc, char **argv) {
     test_links();
     test_terminal();
     test_select();
+    test_fs_details();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

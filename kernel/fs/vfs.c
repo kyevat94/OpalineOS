@@ -16,6 +16,10 @@ void vnode_ref(struct vnode *v) { __atomic_add_fetch(&v->refs, 1, __ATOMIC_ACQ_R
 
 void vnode_put(struct vnode *v) {
     if (!v) return;
+    if (v->ops->put) {
+        v->ops->put(v);
+        return;
+    }
     if (__atomic_sub_fetch(&v->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (v->ops->release) v->ops->release(v);
 }
@@ -210,11 +214,18 @@ static int step(struct vnode *cur, const char *name, u32 len, struct vnode **nex
 /*
  * Walks `path` from `cwd`, following symbolic links (a link's target replaces it in the
  * path: relative targets start from the link's directory). The last component is followed
- * only with `follow_last`. With `want_parent`, stops before the last component, returns its
- * directory and copies the name (raw) into `last` (NAME_MAX + 1 bytes).
+ * only with W_FOLLOW, or if a slash comes after it (then it must also be a directory, as in
+ * Linux). With W_PARENT, stops before the last component, returns its directory and copies
+ * the name (raw) into `last` (NAME_MAX + 1 bytes). W_CREATE (with W_PARENT, for open with
+ * O_CREAT) returns 0 and the file if the last component exists (a link to it followed with
+ * W_FOLLOW, so a dangling link names the file to create), else 1 and its directory and name.
  */
-static int walk(const char *path, struct vnode *cwd, bool want_parent, bool follow_last, struct vnode **out,
-                char *last, u32 *last_len) {
+#define W_PARENT 1
+#define W_FOLLOW 2
+#define W_CREATE 4
+
+static int walk(const char *path, struct vnode *cwd, int flags, struct vnode **out, char *last, u32 *last_len) {
+    bool want_parent = flags & W_PARENT, create = flags & W_CREATE;
     if (!root) return -ENOENT;
     if (!path[0]) return -ENOENT;
     char *buf = NULL;   /* the path once a link was expanded */
@@ -234,26 +245,34 @@ static int walk(const char *path, struct vnode *cwd, bool want_parent, bool foll
             r = -ENAMETOOLONG;
             goto fail;
         }
-        bool final = !*rest;
-        if (want_parent && final) {
-            memcpy(last, start, len);
-            last[len] = 0;
-            *last_len = len;
-            *out = cur;
-            kfree(buf);
-            return 0;
+        bool final = !*rest, dir_slash = final && *p == '/';   /* "name/": must be a directory */
+        if (create && dir_slash) {   /* O_CREAT cannot make a directory */
+            r = -EISDIR;
+            goto fail;
         }
         struct vnode *next;
-        r = step(cur, start, len, &next);
+        if (want_parent && final) {
+            r = create ? step(cur, start, len, &next) : -ENOENT;
+            if (r == -ENOENT) {
+                memcpy(last, start, len);
+                last[len] = 0;
+                *last_len = len;
+                *out = cur;
+                kfree(buf);
+                return create ? 1 : 0;
+            }
+        } else {
+            r = step(cur, start, len, &next);
+        }
         if (r < 0) goto fail;
-        if (next->type == VN_SYMLINK && (!final || follow_last)) {
+        if (next->type == VN_SYMLINK && (!final || dir_slash || (flags & W_FOLLOW))) {
             char *target = kmalloc(PATH_MAX), *nb = kmalloc(PATH_MAX);
             int n = !target || !nb ? -ENOMEM : ++links > SYMLINK_MAX ? -ELOOP
                   : next->ops->readlink ? next->ops->readlink(next, target, PATH_MAX - 1) : -EINVAL;
             vnode_put(next);
-            u64 rlen = strlen(rest);
+            u64 rlen = strlen(p);   /* from the slash on: a trailing slash stays */
             if (n == 0) n = -ENOENT;
-            if (n > 0 && (u64)n + 1 + rlen >= PATH_MAX) n = -ENAMETOOLONG;
+            if (n > 0 && (u64)n + rlen >= PATH_MAX) n = -ENAMETOOLONG;
             if (n < 0) {
                 kfree(target);
                 kfree(nb);
@@ -261,13 +280,8 @@ static int walk(const char *path, struct vnode *cwd, bool want_parent, bool foll
                 goto fail;
             }
             memcpy(nb, target, (u64)n);   /* the target, then what was left of the path */
-            u64 at = (u64)n;
-            if (rlen) {
-                nb[at++] = '/';
-                memcpy(nb + at, rest, rlen);
-                at += rlen;
-            }
-            nb[at] = 0;
+            memcpy(nb + n, p, rlen);
+            nb[(u64)n + rlen] = 0;
             kfree(target);
             kfree(buf);
             buf = nb;
@@ -279,10 +293,15 @@ static int walk(const char *path, struct vnode *cwd, bool want_parent, bool foll
             }
             continue;   /* a relative target starts from the link's directory, which is cur */
         }
+        if (dir_slash && next->type != VN_DIR) {
+            vnode_put(next);
+            r = -ENOTDIR;
+            goto fail;
+        }
         vnode_put(cur);
         cur = next;
     }
-    if (want_parent) {   /* "/" or "dir/": there is no final name */
+    if (want_parent && !create) {   /* "/": there is no final name */
         r = -EINVAL;
         goto fail;
     }
@@ -296,17 +315,17 @@ fail:
 }
 
 int vfs_lookup(const char *path, struct vnode *cwd, struct vnode **out) {
-    return walk(path, cwd, false, true, out, NULL, NULL);
+    return walk(path, cwd, W_FOLLOW, out, NULL, NULL);
 }
 
 int vfs_lookup_nofollow(const char *path, struct vnode *cwd, struct vnode **out) {
-    return walk(path, cwd, false, false, out, NULL, NULL);
+    return walk(path, cwd, 0, out, NULL, NULL);
 }
 
 int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len) {
     char raw[NAME_MAX + 1];
     u32 raw_len;
-    int r = walk(path, cwd, true, true, parent, raw, &raw_len);
+    int r = walk(path, cwd, W_PARENT | W_FOLLOW, parent, raw, &raw_len);
     if (r < 0) return r;
     if (is_dot(raw, raw_len)) {
         vnode_put(*parent);
@@ -348,33 +367,45 @@ void file_put(struct file *f) {
     kfree(f);
 }
 
+/* open() with O_CREAT: the existing file, or a new one. As in Linux, a dangling link names the
+   file to create, and with O_EXCL (or O_NOFOLLOW) a link is not followed: it exists. */
+static int open_create(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct vnode **out, bool *created) {
+    int walk_flags = W_PARENT | W_CREATE | (flags & (O_EXCL | O_NOFOLLOW) ? 0 : W_FOLLOW);
+    for (int tries = 0;; tries++) {
+        struct vnode *parent;
+        char raw[NAME_MAX + 1], name[NAME_MAX + 1];
+        u32 raw_len;
+        int r = walk(path, cwd, walk_flags, &parent, raw, &raw_len);
+        if (r < 0) return r;
+        if (r == 0) {   /* it exists */
+            if (flags & O_EXCL) {
+                vnode_put(parent);
+                return -EEXIST;
+            }
+            *out = parent;
+            return 0;
+        }
+        int len = vfs_normalize_name(raw, raw_len, name);
+        struct vnode_attr attr;
+        r = len < 0 ? len : may(parent, MAY_WRITE | MAY_EXEC, false);
+        if (r == 0) r = new_attr(parent, VN_FILE, mode, &attr);
+        if (r == 0) r = parent->ops->create ? parent->ops->create(parent, name, (u32)len, VN_FILE, &attr, out) : -EPERM;
+        vnode_put(parent);
+        if (r == -EEXIST && !(flags & O_EXCL) && tries < 3) continue;   /* created meanwhile */
+        *created = r == 0;
+        return r;
+    }
+}
+
 int vfs_open(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct file **out) {
     struct vnode *v;
-    int r = (flags & O_NOFOLLOW) ? vfs_lookup_nofollow(path, cwd, &v) : vfs_lookup(path, cwd, &v);
-    if (r == 0 && v->type == VN_SYMLINK) {   /* only with O_NOFOLLOW: a link cannot be opened */
+    bool created = false;
+    int r = (flags & O_CREAT) ? open_create(path, cwd, flags, mode, &v, &created)
+          : (flags & O_NOFOLLOW) ? vfs_lookup_nofollow(path, cwd, &v) : vfs_lookup(path, cwd, &v);
+    if (r < 0) return r;
+    if (v->type == VN_SYMLINK) {   /* only with O_NOFOLLOW: a link cannot be opened */
         vnode_put(v);
         return -ELOOP;
-    }
-    bool created = false;
-    if (r == -ENOENT && (flags & O_CREAT)) {
-        struct vnode *parent;
-        char name[NAME_MAX + 1];
-        u32 len;
-        r = vfs_lookup_parent(path, cwd, &parent, name, &len);
-        if (r < 0) return r;
-        struct vnode_attr attr;
-        r = may(parent, MAY_WRITE | MAY_EXEC, false);
-        if (r == 0) r = new_attr(parent, VN_FILE, mode, &attr);
-        if (r == 0) r = parent->ops->create ? parent->ops->create(parent, name, len, VN_FILE, &attr, &v) : -EPERM;
-        created = r == 0;
-        vnode_put(parent);
-        if (r == -EEXIST && !(flags & O_EXCL)) r = vfs_lookup(path, cwd, &v);   /* created meanwhile */
-        if (r < 0) return r;
-    } else if (r < 0) {
-        return r;
-    } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
-        vnode_put(v);
-        return -EEXIST;
     }
     u32 acc = flags & O_ACCMODE;
     if (v->type == VN_DIR && acc != O_RDONLY) {
@@ -509,6 +540,15 @@ int vfs_remove(const char *path, struct vnode *cwd, bool is_dir) {
     return r;
 }
 
+/* A mount point or the root cannot be replaced. */
+static int not_busy(struct vnode *dir, const char *name, u32 len) {
+    struct vnode *t;
+    if (dir->ops->lookup(dir, name, len, &t) < 0) return 0;
+    bool busy = t->mounted != NULL || t == root;
+    vnode_put(t);
+    return busy ? -EBUSY : 0;
+}
+
 int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd) {
     struct vnode *od, *nd;
     char on[NAME_MAX + 1], nn[NAME_MAX + 1];
@@ -523,7 +563,8 @@ int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd) {
     if (od->fs != nd->fs) r = -EXDEV;
     else if ((r = may(od, MAY_WRITE | MAY_EXEC, false)) < 0 || (r = may(nd, MAY_WRITE | MAY_EXEC, false)) < 0) {}
     else if ((r = sticky_ok(od, on, ol)) < 0 || (r = sticky_ok(nd, nn, nl)) < 0) {}
-    else r = od->ops->rename ? od->ops->rename(od, on, ol, nd, nn, nl) : -EPERM;
+    else if ((r = not_busy(nd, nn, nl)) < 0) {}   /* a directory may now replace an empty one */
+    else r =od->ops->rename ? od->ops->rename(od, on, ol, nd, nn, nl) : -EPERM;
     vnode_put(od);
     vnode_put(nd);
     return r;

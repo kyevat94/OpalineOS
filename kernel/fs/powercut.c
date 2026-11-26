@@ -44,6 +44,13 @@ void powercut_test(u64 cut_after) {
     vfs_rename("/home/pc/a.txt", "/home/pc/b.txt", NULL);
     vfs_mkdir("/home/pc/sub", NULL, 0755);
     write_file("/home/pc/sub/c.txt", 9000, 3, false, NULL);
+    vfs_mkdir("/home/pc/d1", NULL, 0755);
+    vfs_mkdir("/home/pc/d1/inner", NULL, 0755);
+    write_file("/home/pc/d1/inner/x.txt", 2000, 4, false, NULL);
+    vfs_mkdir("/home/pc/d2", NULL, 0755);
+    vfs_rename("/home/pc/d1/inner", "/home/pc/d2/inner", NULL);   /* another parent: "..", two link counts */
+    vfs_mkdir("/home/pc/empty", NULL, 0755);
+    vfs_rename("/home/pc/d2/inner", "/home/pc/empty", NULL);      /* over an empty directory */
     struct file *f;
     if (vfs_open("/home/pc/big.bin", NULL, O_WRONLY, 0, &f) == 0) {
         f->vn->ops->truncate(f->vn, 10000);   /* frees most of its blocks */
