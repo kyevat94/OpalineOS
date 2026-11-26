@@ -1473,6 +1473,8 @@ static void test_signals_cpu(void) {
     stack_t off = {.ss_flags = SS_DISABLE};
     sigaltstack(&off, NULL);
     free(mine);
+}
+
 /* ---- stage SE4: memory limits --------------------------------------------------------------- */
 
 static void test_memory_limits(void) {
