@@ -186,17 +186,22 @@ struct thread_setup {
     u64 tid, fs_base, sigmask, clear_child_tid;
 };
 
-/* Creates a thread of p that starts in user mode with the registers in f. */
-static struct thread *new_user_thread(struct process *p, const struct interrupt_frame *f, const struct thread_setup *s) {
+/*
+ * Creates a thread of p that starts in user mode with the registers in f: 0, -ENOMEM, or -EAGAIN
+ * while p is ending or another thread's execve ends the others (it would not know of this one).
+ */
+static int new_user_thread(struct process *p, const struct interrupt_frame *f, const struct thread_setup *s,
+                           struct thread **out) {
     struct interrupt_frame *copy = kmalloc(sizeof *copy);
-    if (!copy) return NULL;
+    if (!copy) return -ENOMEM;
     *copy = *f;
-    u64 flags = irq_save();   /* everything is set before the thread can run */
-    struct thread *t = thread_create_in(p, p->name, user_thread_entry, copy);
+    u64 flags = irq_save();   /* everything is set before the thread can run (execve's checks included) */
+    struct thread *t = p->exiting || p->exec_thread ? NULL : thread_create_in(p, p->name, user_thread_entry, copy);
     if (!t) {
+        int err = p->exiting || p->exec_thread ? -EAGAIN : -ENOMEM;
         irq_restore(flags);
         kfree(copy);
-        return NULL;
+        return err;
     }
     t->joinable = false;      /* the idle thread frees it once it ended */
     t->on_free = user_thread_free;
@@ -211,7 +216,8 @@ static struct thread *new_user_thread(struct process *p, const struct interrupt_
     p->live_threads++;
     p->refs++;
     irq_restore(flags);
-    return t;
+    *out = t;
+    return 0;
 }
 
 /* ---- loading a program --------------------------------------------------------------- */
@@ -299,20 +305,23 @@ static int build_stack(struct mm *mm, const char *path, const char *const *argv,
  */
 static int exec_image(struct mm *mm, const char *path, struct vnode *cwd, const char *const *argv,
                       const char *const *envp, struct cred *cred, u64 *entry, u64 *sp) {
-    struct vnode_stat st;
-    int err = vfs_stat(path, cwd, &st);
+    /* one lookup: the file checked is the file loaded, even if the path changes meanwhile */
+    struct vnode *v;
+    int err = vfs_lookup(path, cwd, &v);
     if (err < 0) return err;
-    if ((st.mode & S_IFMT) != S_IFREG) return -EACCES;
-    err = vfs_access(path, cwd, MAY_EXEC, false);
+    struct vnode_stat st;
+    err = v->ops->stat(v, &st);
+    if (err == 0 && (st.mode & S_IFMT) != S_IFREG) err = -EACCES;
+    if (err == 0) err = vfs_permission(v, MAY_EXEC);
+    void *elf;
+    u64 size;
+    if (err == 0) err = vfs_read_vnode(v, &elf, &size);
+    vnode_put(v);
     if (err < 0) return err;
     if (st.mode & S_ISUID) cred->euid = st.uid;
     if (st.mode & S_ISGID) cred->egid = st.gid;
     cred->suid = cred->euid;
     cred->sgid = cred->egid;
-    void *elf;
-    u64 size;
-    err = vfs_read_file(path, cwd, &elf, &size);
-    if (err < 0) return err;
     struct elf_info info;
     const char *why;
     bool ok = elf_load(mm, elf, size, PIE_BASE, &info, &why);
@@ -345,7 +354,7 @@ static int exec_image(struct mm *mm, const char *path, struct vnode *cwd, const 
     }
     mm->brk_start = mm->brk = ALIGN_UP(info.end, PAGE_SIZE);
     i64 r = mm_map(mm, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, NULL, 0);
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, NULL, 0, true);
     if (r < 0) return (int)r;
     return build_stack(mm, path, argv, envp ? envp : default_env, &info, interp_base, cred, sp);
 }
@@ -390,8 +399,7 @@ struct process *process_spawn_path(const char *path, const char *const *argv, st
     if (!parent || ((flags & SPAWN_FOREGROUND) && p->ctty && p->sid == tty_session()))
         tty_set_foreground(p->sid, p->pgid);
     struct thread_setup s = {.tid = p->pid};
-    p->main_thread = new_user_thread(p, &f, &s);
-    if (!p->main_thread) {
+    if (new_user_thread(p, &f, &s, &p->main_thread) < 0) {
         list_remove(p);
         mm_put(mm);
         close_files(p);
@@ -499,8 +507,9 @@ i64 process_clone(struct interrupt_frame *f, u64 flags, u64 stack, u64 parent_ti
         s.tid = new_id();
         if ((flags & CLONE_PARENT_SETTID) && !put_user_u32(parent_tid, (u32)s.tid)) return -EFAULT;
         if ((flags & CLONE_CHILD_SETTID) && !put_user_u32(child_tid, (u32)s.tid)) return -EFAULT;
-        struct thread *nt = new_user_thread(p, &child, &s);
-        return nt ? (i64)s.tid : -ENOMEM;
+        struct thread *nt;
+        int err = new_user_thread(p, &child, &s, &nt);
+        return err < 0 ? err : (i64)s.tid;
     }
 
     /* a new process: fork (copied memory) or vfork/posix_spawn (CLONE_VM: shared memory) */
@@ -532,8 +541,7 @@ i64 process_clone(struct interrupt_frame *f, u64 flags, u64 stack, u64 parent_ti
     }
     list_add(c);
     if (flags & CLONE_VFORK) c->refs++;   /* kept until the wait below ends */
-    c->main_thread = new_user_thread(c, &child, &s);
-    if (!c->main_thread) {
+    if (new_user_thread(c, &child, &s, &c->main_thread) < 0) {
         list_remove(c);
         mm_put(c->mm);
         close_files(c);

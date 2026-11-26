@@ -107,7 +107,7 @@ bool elf_load(struct mm *mm, const void *elf, size_t size, u64 base, struct elf_
             if (mm_protect(mm, lo, prev_end - lo, prev_prot | prot) < 0) goto nomem;
             lo = prev_end;
         }
-        if (lo < hi && mm_map(mm, lo, hi - lo, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, NULL, 0) < 0) goto nomem;
+        if (lo < hi && mm_map(mm, lo, hi - lo, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, NULL, 0, true) < 0) goto nomem;
         if (ph->filesz && !mm_write(mm, start, file + ph->offset, ph->filesz)) goto nomem;
         if (!info->phdr && eh->phoff >= ph->offset && eh->phoff - ph->offset < ph->filesz)
             info->phdr = start + (eh->phoff - ph->offset);
