@@ -124,7 +124,8 @@ struct thread {
     bool iret_return;         /* the user registers were rewritten: return through IRETQ */
     bool exit_pending;        /* another thread's execve: end at the next return to user mode */
     bool restart_syscall;     /* a stop interrupted it: an EINTR system call starts again */
-    bool io_nonblock;         /* the file being read or written has O_NONBLOCK: -EAGAIN, never wait */
+    u64 fault_addr;           /* CR2 of its last user page fault (read before interrupts come back on) */
+    bool io_nonblock;        /* the file being read or written has O_NONBLOCK: -EAGAIN, never wait */
     void *start_frame;        /* new user thread: the registers it starts with (kmalloc'd) */
 };
 
@@ -179,6 +180,8 @@ struct thread *sched_all_threads(void);
 void sched_free_dead(void);
 /* Loads the initial FPU/SSE state into the registers (a new program starts clean). */
 void thread_reset_fpu(void);
+/* The MXCSR bits this CPU supports (MXCSR_MASK from fxsave, read once in sched_init). */
+u32 fpu_mxcsr_mask(void);
 
 /* Sleeping lock: the waiting thread blocks instead of spinning (may be held across disk I/O). */
 struct mutex {

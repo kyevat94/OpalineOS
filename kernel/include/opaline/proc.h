@@ -81,6 +81,8 @@ bool process_group_exists(u64 pgid, u64 sid);
 /* Sends sig to every process of the group; with `check`, only to those the caller may signal.
    0, -ESRCH (no such group) or -EPERM (none allowed). */
 int process_signal_group(u64 pgid, int sig, bool check);
+/* kill(-1): every process the caller may signal, except pid 1 and the caller itself. */
+int process_signal_all(struct process *caller, int sig);
 /* A child stopped or continued (p->report says which): wakes its parent's wait4, sends SIGCHLD. */
 void process_notify_parent(struct process *p);
 
@@ -110,7 +112,9 @@ void signals_exec_reset(struct process *p);
 i64 sys_rt_sigaction(u64 sig, u64 act, u64 oact, u64 size);
 i64 sys_rt_sigprocmask(u64 how, u64 set, u64 oset, u64 size);
 i64 sys_rt_sigreturn(struct interrupt_frame *f);
-i64 sys_sigaltstack(u64 ss, u64 old);
+i64 sys_sigaltstack(u64 ss, u64 old, u64 sp);
+/* May an -EINTR system call start again after a SA_RESTART handler? (kernel/proc/syscalls.c) */
+bool syscall_restartable(u64 nr);
 i64 sys_rt_sigpending(u64 set, u64 size);
 i64 sys_rt_sigsuspend(u64 set, u64 size);
 i64 signal_suspend(u64 mask);   /* waits for a signal with `mask` blocked; -EINTR */

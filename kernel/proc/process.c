@@ -797,3 +797,30 @@ int process_signal_group(u64 pgid, int sig, bool check) {
     }
     return !found ? -ESRCH : !sent ? -EPERM : 0;
 }
+
+int process_signal_all(struct process *caller, int sig) {
+    /* as Linux: every process but pid 1 and the caller; those it may not signal are skipped silently */
+    struct process *targets[64];
+    int n = 0, found = 0;
+    const struct cred *me = cred_current();
+    u64 f = spin_lock(&list_lock);
+    for (struct process *p = all_processes; p; p = p->all_next) {
+        if (p->state != PROCESS_ALIVE || !p->user || p->pid == 1 || p == caller) continue;
+        found++;
+        if (!cred_may_signal(me, &p->cred)) continue;
+        if (n < 64) {
+            p->refs++;
+            targets[n++] = p;
+        }
+    }
+    spin_unlock(&list_lock, f);
+    int r = 0;
+    for (int i = 0; i < n; i++) {
+        if (sig) {
+            int e = signal_send_process(targets[i], sig);
+            if (e) r = e;
+        }
+        process_put(targets[i]);
+    }
+    return found ? r : -ESRCH;
+}

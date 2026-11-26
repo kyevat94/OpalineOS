@@ -567,7 +567,8 @@ static i64 mask_begin(u64 sigmask, u64 size, u64 *old) {
     struct thread *t = thread_current();
     *old = t->sigmask;
     if (!sigmask) return 0;
-    if (size != 8 || !user_ok(sigmask, 8, false)) return -EINVAL;
+    if (size != 8) return -EINVAL;
+    if (!user_ok(sigmask, 8, false)) return -EFAULT;
     t->sigmask = *(const u64 *)sigmask & ~((1ULL << 8) | (1ULL << 18));   /* never SIGKILL/SIGSTOP */
     /* a signal already pending that the new mask lets in must end the wait at once */
     if ((t->sigpending | t->process->sigpending) & ~t->sigmask) t->intr = true;
@@ -751,7 +752,8 @@ static i64 sys_kill(i64 pid, u64 sig) {
     if (sig >= NSIG) return -EINVAL;
     if (pid == 0) return process_signal_group(self()->pgid, (int)sig, true);   /* the caller's group */
     if (pid < -1) return process_signal_group((u64)-pid, (int)sig, true);
-    struct process *p = pid == -1 ? self() : process_by_pid((u64)pid);   /* -1 ("everyone"): only itself for now */
+    if (pid == -1) return process_signal_all(self(), (int)sig);
+    struct process *p = process_by_pid((u64)pid);
     if (!p) return -ESRCH;
     if (!may_signal(p)) return -EPERM;
     return sig ? signal_send_process(p, (int)sig) : 0;
@@ -1039,6 +1041,18 @@ static i64 sys_groups(bool set, u64 size, u64 list) {
     return 0;
 }
 
+/* After a handler ran, Linux never restarts the calls that wait for a signal or for a time
+ * (ERESTARTNOHAND, and nanosleep's restart block): they fail with EINTR even with SA_RESTART. */
+bool syscall_restartable(u64 nr) {
+    switch (nr) {
+    case SYS_pause: case SYS_rt_sigsuspend: case SYS_poll: case SYS_ppoll: case SYS_select:
+    case SYS_pselect6: case SYS_nanosleep: case SYS_clock_nanosleep:
+        return false;
+    default:
+        return true;
+    }
+}
+
 /* May the caller send a signal to p? Root, or the same user (real or effective vs real or saved). */
 static bool may_signal(struct process *p) { return cred_may_signal(cred_current(), &p->cred); }
 
@@ -1179,7 +1193,7 @@ int syscall_dispatch(struct interrupt_frame *f) {
     case SYS_rt_sigreturn:  r = sys_rt_sigreturn(f); break;
     case SYS_rt_sigpending: r = sys_rt_sigpending(a, b); break;
     case SYS_rt_sigsuspend: r = sys_rt_sigsuspend(a, b); break;
-    case SYS_sigaltstack:   r = sys_sigaltstack(a, b); break;
+    case SYS_sigaltstack:   r = sys_sigaltstack(a, b, f->rsp); break;
     case SYS_pause:         r = signal_suspend(t->sigmask); break;
     case SYS_kill:          r = sys_kill((i64)a, b); break;
     case SYS_tkill:         r = sys_tgkill(0, (i64)a, b); break;

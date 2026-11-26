@@ -21,8 +21,9 @@ void syscall_init(void) {
        here, and a user SS with RPL 0 makes the next IRETQ back to user mode fault. */
     wrmsr(MSR_STAR, ((u64)(GDT_KERNEL_DATA | 3) << 48) | ((u64)GDT_KERNEL_CODE << 32));
     wrmsr(MSR_LSTAR, (u64)syscall_entry);
-    /* cleared on entry: TF (0x100), IF (0x200), DF (0x400), AC (0x40000) */
-    wrmsr(MSR_FMASK, 0x40700);
+    /* cleared on entry: TF (0x100), IF (0x200), DF (0x400), NT (0x4000), AC (0x40000).
+       NT=1 in the kernel would make its next IRETQ fault (no task returns in 64-bit mode). */
+    wrmsr(MSR_FMASK, 0x44700);
     wrmsr(MSR_GS_BASE, 0);
     wrmsr(MSR_KERNEL_GS_BASE, (u64)&cpu0);
 }

@@ -206,21 +206,22 @@ static bool setup_frame(struct interrupt_frame *f, int sig, const struct sigacti
     mc->cs = 0x23;
     mc->ss = 0x1B;
     if (f->vector == SYSCALL_VECTOR) {
-        /* an interrupted system call with SA_RESTART runs again once the handler returns */
-        if ((i64)f->rax == -EINTR && (act->flags & SA_RESTART)) {
+        /* an interrupted system call with SA_RESTART runs again once the handler returns
+           (not the waits for a signal or a time, which Linux never restarts after a handler) */
+        if ((i64)f->rax == -EINTR && (act->flags & SA_RESTART) && syscall_restartable(f->error)) {
             mc->rax = f->error;   /* syscall_dispatch keeps the number there */
             mc->rip -= 2;         /* back to the SYSCALL instruction */
         }
     } else {
         mc->err = f->error;
         mc->trapno = f->vector;
-        if (f->vector == 14) mc->cr2 = read_cr2();
+        if (f->vector == 14) mc->cr2 = t->fault_addr;
     }
     mc->oldmask = t->restore_sigmask ? t->saved_sigmask : t->sigmask;
     mc->fpstate = fpstate;
     fr->uc.uc_sigmask = t->restore_sigmask ? t->saved_sigmask : t->sigmask;
     fr->info.si_signo = sig;
-    if (f->vector == 14 || f->vector == 13) fr->info.fields[0] = f->vector == 14 ? read_cr2() : 0;   /* si_addr */
+    if (f->vector == 14 || f->vector == 13) fr->info.fields[0] = f->vector == 14 ? t->fault_addr : 0;   /* si_addr */
 
     f->rdi = (u64)sig;
     f->rsi = (u64)&fr->info;
@@ -260,6 +261,8 @@ void user_return(struct interrupt_frame *f) {
             if (t->restore_sigmask) {   /* sigsuspend ended without a handler */
                 t->sigmask = t->saved_sigmask;
                 t->restore_sigmask = false;
+                irq_restore(fl);
+                continue;   /* the old mask may let in a signal that is pending */
             }
             t->intr = false;   /* nothing left that should interrupt a wait */
             irq_restore(fl);
@@ -321,7 +324,7 @@ void process_fault(struct interrupt_frame *f) {
     console_set_color(COLOR_WARNING);
     kprintf("Process \"%s\" (pid %lu) crashed: %s at RIP=%p", p->name, p->pid, exception_name(f->vector),
             (void *)f->rip);
-    if (f->vector == 14) kprintf(", address %p", (void *)read_cr2());
+    if (f->vector == 14) kprintf(", address %p", (void *)t->fault_addr);
     kprintf("\n  The process was stopped (exit code %d). The system continues.\n", 128 + sig);
     console_set_color(COLOR_TEXT);
     process_kill(p, sig);
@@ -427,15 +430,15 @@ i64 sys_rt_sigreturn(struct interrupt_frame *f) {
         }
         u8 fx[512] ALIGNED(16);
         memcpy(fx, (const void *)mc->fpstate, 512);
-        u32 mask = *(u32 *)(fx + 28);   /* MXCSR_MASK */
-        *(u32 *)(fx + 24) &= mask ? mask : 0xFFBF;   /* reserved MXCSR bits would fault */
+        /* reserved MXCSR bits would fault: keep only those this CPU has (not the frame's MXCSR_MASK) */
+        *(u32 *)(fx + 24) &= fpu_mxcsr_mask();
         fxrstor(fx);
     }
     f->r8 = mc->r8, f->r9 = mc->r9, f->r10 = mc->r10, f->r11 = mc->r11;
     f->r12 = mc->r12, f->r13 = mc->r13, f->r14 = mc->r14, f->r15 = mc->r15;
     f->rdi = mc->rdi, f->rsi = mc->rsi, f->rbp = mc->rbp, f->rbx = mc->rbx;
     f->rdx = mc->rdx, f->rax = mc->rax, f->rcx = mc->rcx, f->rsp = mc->rsp, f->rip = mc->rip;
-    const u64 user_flags = 0x254DD5;   /* CF PF AF ZF SF TF DF OF AC ID RF */
+    const u64 user_flags = 0x250DD5;   /* CF PF AF ZF SF TF DF OF AC ID RF (not NT: IRETQ would fault) */
     f->rflags = (mc->eflags & user_flags) | 0x202;
     f->cs = 0x23;
     f->ss = 0x1B;
@@ -445,25 +448,31 @@ i64 sys_rt_sigreturn(struct interrupt_frame *f) {
     return (i64)f->rax;   /* syscall_dispatch stores the result in rax: keep the restored value */
 }
 
-i64 sys_sigaltstack(u64 ss, u64 old) {
+i64 sys_sigaltstack(u64 ss, u64 old, u64 sp) {   /* sp: the caller's stack pointer */
     struct thread *t = self_thread();
     struct stack_k {
         u64 sp;
         i32 flags, pad;
         u64 size;
     };
+    /* the new stack is read before the old one is written: ss and old may be the same */
+    struct stack_k n = {0};
+    if (ss) {
+        if (!user_ok(ss, sizeof(struct stack_k), false)) return -EFAULT;
+        n = *(const struct stack_k *)ss;
+        if (n.flags == SS_ONSTACK) n.flags = 0;   /* accepted and ignored, as on Linux */
+        if (n.flags & ~SS_DISABLE) return -EINVAL;
+    }
     if (old) {
         if (!user_ok(old, sizeof(struct stack_k), true)) return -EFAULT;
         struct stack_k *o = (struct stack_k *)old;
         o->sp = t->altstack_sp;
         o->size = t->altstack_size;
-        o->flags = !t->altstack_size ? SS_DISABLE : 0;
+        o->flags = !t->altstack_size ? SS_DISABLE : on_altstack(t, sp) ? SS_ONSTACK : 0;
         o->pad = 0;
     }
     if (ss) {
-        if (!user_ok(ss, sizeof(struct stack_k), false)) return -EFAULT;
-        struct stack_k n = *(const struct stack_k *)ss;
-        if (n.flags & ~SS_DISABLE) return -EINVAL;
+        if (on_altstack(t, sp)) return -EPERM;   /* the stack in use cannot change */
         if (n.flags & SS_DISABLE) {
             t->altstack_sp = t->altstack_size = 0;
             t->altstack_flags = SS_DISABLE;
