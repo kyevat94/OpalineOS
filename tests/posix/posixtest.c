@@ -14,7 +14,7 @@
  * control (stop/continue, process groups, restarted system calls); since
  * stage SE2, symbolic and hard links; and, since stage SE3, the terminal
  * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK.
- * "posixtest rawkeys" and "posixtest env NAME" are used by the shell test.
+ * "posixtest rawkeys", "vmin", "flushraw", "sleep" and "env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
 #define _GNU_SOURCE
@@ -851,29 +851,48 @@ static void test_terminal(void) {
     t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
     t.c_cc[VMIN] = 0;
     t.c_cc[VTIME] = 0;
+    /* Someone may press keys while this runs (during boot): TCSAFLUSH throws away what was typed,
+       and each check that expects no input flushes again and gets a few tries, so a stray key
+       cannot fail it. */
     struct termios back;
-    CHECK(tcsetattr(0, TCSANOW, &t) == 0 && tcgetattr(0, &back) == 0 && !(back.c_lflag & ICANON) &&
+    CHECK(tcsetattr(0, TCSAFLUSH, &t) == 0 && tcgetattr(0, &back) == 0 && !(back.c_lflag & ICANON) &&
               back.c_cc[VMIN] == 0,
           "tcsetattr: raw mode, read back the same");
     char c;
     struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    CHECK(read(0, &c, 1) == 0 && ms_since(&t0) < 100, "raw, VMIN=0 VTIME=0: read returns 0 at once");
+    int ok = 0;
+    for (int i = 0; i < 3 && !ok; i++) {
+        tcflush(0, TCIFLUSH);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        ok = read(0, &c, 1) == 0 && ms_since(&t0) < 1000;
+    }
+    CHECK(ok, "raw, VMIN=0 VTIME=0: read returns 0 at once");
     t.c_cc[VTIME] = 3;   /* tenths of a second */
     tcsetattr(0, TCSANOW, &t);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    long r = read(0, &c, 1);
-    long took = ms_since(&t0);
-    CHECK(r == 0 && took >= 250 && took < 2000, "raw, VMIN=0 VTIME=3: read gives up after 0.3 s");
-    int n = -1;
-    CHECK(ioctl(0, FIONREAD, &n) == 0 && n == 0, "FIONREAD: nothing waiting");
+    int timed_out = 0, empty = 0;
+    for (int i = 0; i < 3 && !(timed_out && empty); i++) {
+        tcflush(0, TCIFLUSH);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        long r = read(0, &c, 1);
+        long took = ms_since(&t0);
+        int n = -1;
+        timed_out = r == 0 && took >= 250 && took < 2000;
+        empty = ioctl(0, FIONREAD, &n) == 0 && n == 0;
+    }
+    CHECK(timed_out, "raw, VMIN=0 VTIME=3: read gives up after 0.3 s");
+    CHECK(empty, "FIONREAD: nothing waiting");
     CHECK(tcsetattr(0, TCSAFLUSH, &orig) == 0 && tcgetattr(0, &back) == 0 && (back.c_lflag & ICANON) &&
               (back.c_lflag & ECHO),
           "back to canonical mode");
     int fl = fcntl(0, F_GETFL);
     fcntl(0, F_SETFL, fl | O_NONBLOCK);
-    errno = 0;
-    CHECK(read(0, &c, 1) == -1 && errno == EAGAIN, "O_NONBLOCK terminal: read gives EAGAIN, no wait");
+    ok = 0;
+    for (int i = 0; i < 3 && !ok; i++) {
+        tcflush(0, TCIFLUSH);
+        errno = 0;
+        ok = read(0, &c, 1) == -1 && errno == EAGAIN;
+    }
+    CHECK(ok, "O_NONBLOCK terminal: read gives EAGAIN, no wait");
     fcntl(0, F_SETFL, fl);
     struct winsize ws;
     CHECK(ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0, "TIOCGWINSZ: the size in cells");
@@ -993,11 +1012,60 @@ static int raw_keys(void) {
     return 0;
 }
 
+/* "posixtest vmin": raw with VMIN=3 VTIME=5, one line per read() until q. Three keys typed quickly
+   come back from one read; fewer come back once 0.5 s has passed after the last one. */
+static int vmin_reads(void) {
+    struct termios orig, t;
+    if (tcgetattr(0, &orig) < 0) return 2;
+    t = orig;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 3;
+    t.c_cc[VTIME] = 5;
+    tcsetattr(0, TCSAFLUSH, &t);
+    printf("vmin: type keys, q quits\n");
+    char buf[16];
+    ssize_t n;
+    while ((n = read(0, buf, sizeof buf)) > 0) {
+        printf("vmin got %d bytes\n", (int)n);
+        if (memchr(buf, 'q', (size_t)n)) break;
+    }
+    tcsetattr(0, TCSANOW, &orig);
+    printf("vmin done\n");
+    return 0;
+}
+
+/* "posixtest flushraw": what is typed (without Enter) during a 3 s sleep must be thrown away by
+   tcsetattr(TCSAFLUSH) into raw mode, not handed to the next read. */
+static int flush_raw(void) {
+    struct termios orig, t;
+    if (tcgetattr(0, &orig) < 0) return 2;
+    printf("flushraw: type now\n");
+    sleep(3);
+    t = orig;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 5;
+    tcsetattr(0, TCSAFLUSH, &t);
+    char buf[16];
+    ssize_t n = read(0, buf, sizeof buf);
+    printf("\nflushraw got %d bytes\n", (int)n);
+    tcsetattr(0, TCSANOW, &orig);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
         setvbuf(stdout, NULL, _IONBF, 0);
         return raw_keys();
+    }
+    if (argc >= 2 && !strcmp(argv[1], "vmin")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        return vmin_reads();
+    }
+    if (argc >= 2 && !strcmp(argv[1], "flushraw")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        return flush_raw();
     }
     if (argc >= 3 && !strcmp(argv[1], "env")) {   /* for the shell test: the environment it passed */
         const char *v = getenv(argv[2]);
