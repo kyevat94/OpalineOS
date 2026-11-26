@@ -378,6 +378,9 @@ static bool input_byte(char c) {
 void tty_input(const char *s, u32 n) {
     bool wake = false;
     u64 f = console_lock();
+    /* Esc alone (not the start of an arrow key's sequence) means nothing to the line editor, which
+       would take it for the start of a sequence and swallow the next key; raw readers get it */
+    if (n == 1 && s[0] == 0x1B && (tty.tio.lflag & (ICANON | ECHO)) == (ICANON | ECHO)) n = 0;
     for (u32 i = 0; i < n; i++) wake |= input_byte(s[i]);
     int sig = tty.pending_signal;
     tty.pending_signal = 0;
@@ -399,20 +402,25 @@ static int background_check(int sig) {
     return -EINTR;   /* the call starts again once the job is continued in the foreground */
 }
 
-/* Raw mode: VMIN and VTIME (tenths of a second) decide when read() returns. */
+/* Raw mode: VMIN and VTIME (tenths of a second) decide when read() returns, as POSIX says:
+     VMIN=0 VTIME=0  at once, with whatever is there;
+     VMIN=0 VTIME>0  as soon as a byte is there, or with 0 once VTIME has passed;
+     VMIN>0 VTIME=0  once VMIN bytes are there;
+     VMIN>0 VTIME>0  once VMIN bytes are there, or when VTIME passed after the last byte arrived
+                     (the timer starts with the first byte, so the first wait has no limit). */
 static i64 read_raw(char *buf, u64 len) {
     u64 vmin = tty.tio.cc[VMIN], vtime = tty.tio.cc[VTIME] * 100ULL;
     u64 want = MIN(len, vmin ? vmin : 1);
     u64 f = irq_save();
-    u64 deadline = vtime ? time_ms() + vtime : 0;
     bool nb = thread_current()->io_nonblock;
     if (nb && tty.ready_len == 0) {
         irq_restore(f);
         return -EAGAIN;
     }
+    u32 seen = tty.ready_len;   /* bytes there when the inter-byte timer last started */
+    u64 deadline = vtime && (!vmin || seen) ? time_ms() + vtime : 0;
     while (tty.ready_len < want && !nb) {
         if (!vmin && !vtime) break;                       /* poll: whatever is there */
-        if (vtime && tty.ready_len && vmin) break;        /* something arrived and the timer ran: enough */
         u64 now = time_ms();
         if (deadline && now >= deadline) break;
         int r = waitqueue_wait_timeout(&tty.readers, deadline ? deadline - now : 0);
@@ -420,7 +428,10 @@ static i64 read_raw(char *buf, u64 len) {
             irq_restore(f);
             return -EINTR;
         }
-        if (vtime && vmin) deadline = time_ms() + vtime;  /* VTIME is the gap between bytes */
+        if (vmin && vtime && tty.ready_len != seen) {     /* a byte arrived: the timer starts again */
+            seen = tty.ready_len;
+            deadline = seen ? time_ms() + vtime : 0;
+        }
     }
     u64 n = 0;
     while (n < len && tty.ready_len > 0) {
@@ -495,8 +506,10 @@ static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
         tty.fg = (u64)pgid;
         return 0;
     }
-    case 0x540E:   /* TIOCSCTTY: a session leader takes the terminal */
+    case 0x540E:   /* TIOCSCTTY: a session leader takes the terminal if no other session has it;
+                      root may take it from another session with arg 1 (as in Linux) */
         if (p->sid != p->pid) return -EPERM;
+        if (tty.sid && tty.sid != p->sid && !(p->cred.euid == 0 && arg == 1)) return -EPERM;
         p->ctty = true;
         tty.sid = p->sid;
         tty.fg = p->pgid;
@@ -516,11 +529,11 @@ static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
         u64 f = console_lock();
         bool was_canonical = tty.tio.lflag & ICANON;
         memcpy(&tty.tio, (const void *)arg, sizeof tty.tio);
-        if (request == 0x5404) {
+        if (request == 0x5404) {   /* the half-typed line is pending input too: it goes as well */
             tty.ready_len = 0;
             tty.eof_pending = 0;
-        }
-        if (was_canonical && !(tty.tio.lflag & ICANON) && tty.len) {   /* a half-typed line goes to the reader */
+            reset_line();
+        } else if (was_canonical && !(tty.tio.lflag & ICANON) && tty.len) {   /* a half-typed line goes to the reader */
             push_ready(tty.line, tty.len);
             reset_line();
         }
@@ -533,6 +546,7 @@ static int tty_ioctl(struct vnode *v, u64 request, u64 arg) {
         if (arg == 0 || arg == 2) {
             u64 f = console_lock();
             tty.ready_len = 0;
+            tty.eof_pending = 0;
             reset_line();
             console_unlock(f);
         }
@@ -570,7 +584,8 @@ static int tty_stat(struct vnode *v, struct vnode_stat *st) {
 
 static u32 tty_poll(struct vnode *v, u32 flags) {
     (void)v, (void)flags;
-    return (tty.ready_len || tty.eof_pending ? POLLIN : 0) | POLLOUT;
+    bool eof = (tty.tio.lflag & ICANON) && tty.eof_pending;   /* raw reads do not see Ctrl+D */
+    return (tty.ready_len || eof ? POLLIN : 0) | POLLOUT;
 }
 
 static const struct vnode_ops tty_ops = {

@@ -296,14 +296,24 @@ class QemuSession:
 CONSOLE_MARGIN, CELL_W, CELL_H = 16, 9, 18
 
 
-def same_cells(screen, row_a, row_b, cells):
-    """True if the first `cells` character cells of two console rows have identical pixels."""
+def same_cells(screen, row_a, row_b, cells, cursor=None):
+    """True if the first `cells` character cells of two console rows have identical pixels.
+    Cell `cursor` of row_a may also be the inverse of row_b's (the blinking block cursor is drawn
+    by inverting its cell: kernel/console.c)."""
     w, _, px = screen
     for dy in range(CELL_H):
         ya, yb = CONSOLE_MARGIN + row_a * CELL_H + dy, CONSOLE_MARGIN + row_b * CELL_H + dy
         xa = (ya * w + CONSOLE_MARGIN) * 3
         xb = (yb * w + CONSOLE_MARGIN) * 3
-        if px[xa:xa + cells * CELL_W * 3] != px[xb:xb + cells * CELL_W * 3]:
+        if cursor is None:
+            if px[xa:xa + cells * CELL_W * 3] != px[xb:xb + cells * CELL_W * 3]:
+                return False
+            continue
+        c0, c1 = cursor * CELL_W * 3, (cursor + 1) * CELL_W * 3
+        if px[xa:xa + c0] != px[xb:xb + c0] or px[xa + c1:xa + cells * CELL_W * 3] != px[xb + c1:xb + cells * CELL_W * 3]:
+            return False
+        a, b = px[xa + c0:xa + c1], px[xb + c0:xb + c1]
+        if a != b and a != bytes(255 - v for v in b):
             return False
     return True
 
@@ -327,7 +337,9 @@ def shell_test():
         # Line editing: each sequence below must leave the line looking exactly like "cat nota.txt"
         # typed plainly (compared pixel by pixel with the same command two lines up: the screen
         # has scrolled, so the line being edited is the last one) and must then run that command.
-        # <end> first moves the cursor out of the compared cells.
+        # Every sequence ends with the cursor at the end of the line; the cells after it (4 more)
+        # are compared too, so text left over from a longer line shows, and the cursor's cell may
+        # be inverted.
         edits = [
             ("Tab then Backspace in the middle of a word", "cat no\t\bta.txt"),
             ("Left arrows then Backspace", "cat notaa.txt<left><left><left><left>\b<end>"),
@@ -342,7 +354,7 @@ def shell_test():
             time.sleep(0.8)
             screen = s.pixels()
             rows = (screen[1] - 2 * CONSOLE_MARGIN) // CELL_H
-            if not same_cells(screen, rows - 1, rows - 3, typed):
+            if not same_cells(screen, rows - 1, rows - 3, typed + 5, cursor=typed):
                 problems.append(f"{what}: the edited line differs on screen from \"cat nota.txt\"")
             mark = len(s.text())
             s.type("\n")
@@ -350,6 +362,10 @@ def shell_test():
                 problems.append(f"{what}: the edited line did not run \"cat nota.txt\"")
 
         steps = [
+            # Ctrl+C at the prompt throws the line away and gives a fresh prompt (the line must
+            # not run: the next command shows only its own output)
+            ("echo nao<ctrl-c>", "^C\r\nopaline:/home$ "),
+            ("echo sim\n", "\r\nsim\r\n"),
             ("mkdir pasta\n", "opaline:/home$ "),
             ("ln -s nota.txt link.txt\n", "opaline:/home$ "),
             ("ls -l\n", "link.txt -> nota.txt"),
@@ -378,7 +394,15 @@ def shell_test():
             ("posixtest rawkeys\n", "press keys, q quits"),
             ("a", "key 97"),
             ("b", "key 98"),
+            ("<esc>", "key 27"),
             ("q", "rawkeys done"),
+            # VMIN=3 VTIME=5: three keys typed quickly come back from one read()
+            ("posixtest vmin\n", "type keys, q quits"),
+            ("abc", "vmin got 3 bytes"),
+            ("q", "vmin done"),
+            # what was typed before tcsetattr(TCSAFLUSH) into raw mode is thrown away
+            ("posixtest flushraw\n", "flushraw: type now"),
+            ("xyz", "flushraw got 0 bytes"),
             # a program that leaves the terminal raw: the shell puts it back
             ("posixtest rawkeys\n", "press keys, q quits"),
             ("x", "rawkeys: leaving raw"),

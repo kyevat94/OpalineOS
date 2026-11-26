@@ -448,7 +448,8 @@ static int run_line(const char *line) {
     int saved = -1, out = -1;
     if (argc >= 3 && (!strcmp(argv[argc - 2], ">") || !strcmp(argv[argc - 2], ">>"))) {
         int append = argv[argc - 2][1] == '>';
-        out = open(argv[argc - 1], O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0666);
+        /* both descriptors are closed on execve: the program sees only its standard output */
+        out = open(argv[argc - 1], O_WRONLY | O_CREAT | O_CLOEXEC | (append ? O_APPEND : O_TRUNC), 0666);
         if (out < 0) {
             err("sh", argv[argc - 1], errno);
             last_status = 1;
@@ -457,7 +458,7 @@ static int run_line(const char *line) {
         argc -= 2;
         argv[argc] = NULL;
         fflush(stdout);
-        saved = dup(1);
+        saved = fcntl(1, F_DUPFD_CLOEXEC, 10);
         dup2(out, 1);
     }
     if (argc) last_status = execute(argc, argv);
@@ -469,6 +470,8 @@ static int run_line(const char *line) {
     }
     return 0;
 }
+
+static void on_interrupt(int sig) { (void)sig; }
 
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "-c")) {
@@ -487,18 +490,35 @@ int main(int argc, char **argv) {
     /* the shell itself is not stopped or ended from the keyboard; its programs are (they start
        with the default actions again) */
     for (unsigned i = 0; i < sizeof job_signals / sizeof job_signals[0]; i++) signal(job_signals[i], SIG_IGN);
+    /* except that Ctrl+C at the prompt must interrupt the read (no SA_RESTART), so that the loop
+       below prints a fresh prompt; the terminal has already thrown the line away */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_interrupt;
+    sigaction(SIGINT, &sa, NULL);
     if (chdir("/home") == 0) setenv("PWD", "/home", 1);
     have_tio = tcgetattr(0, &shell_tio) == 0;
 
     static char line[SH_LINE];
+    int prompt = 1;
     for (;;) {
-        char cwd[1024];
-        if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "?");
-        printf("opaline:%s$ ", cwd);
-        fflush(stdout);
+        if (prompt) {
+            char cwd[1024];
+            if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "?");
+            printf("opaline:%s$ ", cwd);
+            fflush(stdout);
+        }
+        prompt = 1;
         ssize_t n = read(0, line, sizeof line - 1);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
+        if (n < 0 && errno == EINTR) continue;   /* Ctrl+C: a fresh prompt */
+        if (n < 0) {
+            /* EIO: the shell is not the terminal's foreground job (a program took the terminal
+               and left it). Take it back and read again; only Ctrl+D ends the shell. */
+            tcsetpgrp(0, getpgrp());
+            usleep(100000);   /* no busy loop if the error stays */
+            prompt = 0;
+            continue;
+        }
+        if (n == 0) {
             printf("\n");
             return 0;   /* Ctrl+D */
         }
