@@ -79,6 +79,7 @@ struct vma {
     struct vnode *file;       /* private file mapping (NULL: anonymous) */
     struct memobj *obj;       /* shared mapping (NULL: private) */
     u64 offset;               /* file / object offset of `start` */
+    bool may_write;           /* mprotect may add PROT_WRITE (false: shared mapping of a read-only file) */
     struct vma *next;         /* sorted by address */
 };
 
@@ -97,8 +98,9 @@ struct mm *mm_fork(struct mm *src);         /* private pages copy-on-write, shar
 void mm_get(struct mm *mm);
 void mm_put(struct mm *mm);                 /* frees it with the last reference (must not be active) */
 
-/* mmap/munmap/mprotect/brk/mremap/msync. Return a negative errno on failure. */
-i64 mm_map(struct mm *mm, u64 addr, u64 len, u32 prot, u32 flags, struct vnode *file, u64 offset);
+/* mmap/munmap/mprotect/brk/mremap/msync. Return a negative errno on failure. mm_map's may_write:
+   for a shared file mapping, whether the file is open for writing (else ignored). */
+i64 mm_map(struct mm *mm, u64 addr, u64 len, u32 prot, u32 flags, struct vnode *file, u64 offset, bool may_write);
 int mm_unmap(struct mm *mm, u64 addr, u64 len);
 int mm_protect(struct mm *mm, u64 addr, u64 len, u32 prot);
 u64 mm_brk(struct mm *mm, u64 addr);
@@ -121,5 +123,8 @@ void mm_futex_key(struct mm *mm, u64 addr, bool private_op, void **space, u64 *o
 /* The page cache side of shared file mappings (used by the VFS). */
 void memobj_sync(struct memobj *obj);       /* writes the pages back to the file */
 void memobj_written(struct memobj *obj, u64 offset, const void *data, u64 len);   /* write() went to the file */
+/* The file's page cache with a reference (NULL: no shared mapping); memobj_put releases it. */
+struct memobj *vnode_memobj_get(struct vnode *v);
+void memobj_put(struct memobj *obj);        /* the last reference syncs and frees it */
 
 #endif

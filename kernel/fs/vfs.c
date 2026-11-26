@@ -427,14 +427,22 @@ u32 file_poll(struct file *f) {
 /* A file with shared mappings: its mapped pages hold the newest data (see opaline/uvm.h). */
 i64 vnode_read_at(struct vnode *v, u64 offset, void *buf, u64 len) {
     if (!v->ops->read) return -EINVAL;
-    if (v->memobj) memobj_sync(v->memobj);   /* what the mappings wrote goes to the file first */
+    struct memobj *obj = vnode_memobj_get(v);   /* referenced: the last munmap may free it meanwhile */
+    if (obj) {
+        memobj_sync(obj);   /* what the mappings wrote goes to the file first */
+        memobj_put(obj);
+    }
     return v->ops->read(v, offset, buf, len);
 }
 
 i64 vnode_write_at(struct vnode *v, u64 offset, const void *buf, u64 len) {
     if (!v->ops->write) return -EINVAL;
     i64 r = v->ops->write(v, offset, buf, len);
-    if (r > 0 && v->memobj) memobj_written(v->memobj, offset, buf, (u64)r);   /* the mappings see it */
+    struct memobj *obj = r > 0 ? vnode_memobj_get(v) : NULL;
+    if (obj) {
+        memobj_written(obj, offset, buf, (u64)r);   /* the mappings see it */
+        memobj_put(obj);
+    }
     return r;
 }
 
@@ -667,20 +675,20 @@ int vfs_read_file(const char *path, struct vnode *cwd, void **data, u64 *size) {
     struct vnode *v;
     int r = vfs_lookup(path, cwd, &v);
     if (r < 0) return r;
+    r = vfs_read_vnode(v, data, size);
+    vnode_put(v);
+    return r;
+}
+
+int vfs_read_vnode(struct vnode *v, void **data, u64 *size) {
     struct vnode_stat st;
+    int r;
     if (v->type != VN_FILE) r = v->type == VN_DIR ? -EISDIR : -EINVAL;
     else r = v->ops->stat(v, &st);
-    if (r < 0) {
-        vnode_put(v);
-        return r;
-    }
+    if (r < 0) return r;
     void *buf = kmalloc(st.size ? st.size : 1);
-    if (!buf) {
-        vnode_put(v);
-        return -ENOMEM;
-    }
+    if (!buf) return -ENOMEM;
     i64 n = v->ops->read(v, 0, buf, st.size);
-    vnode_put(v);
     if (n < 0 || (u64)n != st.size) {
         kfree(buf);
         return n < 0 ? (int)n : -EIO;

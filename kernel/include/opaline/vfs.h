@@ -183,6 +183,7 @@ int vfs_setattr(struct vnode *v, const struct vnode_attr *attr);
 
 /* Reads a whole file into a kmalloc'd buffer (for the program loader). */
 int vfs_read_file(const char *path, struct vnode *cwd, void **data, u64 *size);
+int vfs_read_vnode(struct vnode *v, void **data, u64 *size);   /* the same for a file already looked up */
 
 /* File systems and devices */
 struct block_device;

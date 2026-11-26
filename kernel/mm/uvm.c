@@ -106,7 +106,7 @@ void memobj_written(struct memobj *obj, u64 offset, const void *data, u64 len) {
     mutex_unlock(&obj->lock);
 }
 
-static void memobj_put(struct memobj *obj) {
+void memobj_put(struct memobj *obj) {
     if (obj->file) mutex_lock(&files_lock);   /* nobody may find it while it goes */
     bool last = __atomic_sub_fetch(&obj->refs, 1, __ATOMIC_ACQ_REL) == 0;
     if (last && obj->file) obj->file->memobj = NULL;
@@ -118,6 +118,15 @@ static void memobj_put(struct memobj *obj) {
     vnode_put(obj->file);
     kfree(obj->pages);
     kfree(obj);
+}
+
+struct memobj *vnode_memobj_get(struct vnode *v) {
+    if (!__atomic_load_n(&v->memobj, __ATOMIC_ACQUIRE)) return NULL;   /* no shared mapping: skip the lock */
+    mutex_lock(&files_lock);   /* memobj_put clears the link under it before the object goes */
+    struct memobj *obj = v->memobj;
+    if (obj) __atomic_add_fetch(&obj->refs, 1, __ATOMIC_ACQ_REL);
+    mutex_unlock(&files_lock);
+    return obj;
 }
 
 /* ---- areas ------------------------------------------------------------------------------ */
@@ -202,7 +211,7 @@ static u64 ensure_page(struct mm *mm, struct vma *v, u64 page, bool write) {
     if (v->obj) {
         mutex_lock(&v->obj->lock);
         phys = memobj_page(v->obj, (v->offset + (page - v->start)) / PAGE_SIZE);
-        if (phys) pmm_page_ref(phys);   /* the page-table entry's reference */
+        if (phys && !pmm_page_ref(phys)) phys = 0;   /* the page-table entry's reference (fails if mapped too often) */
         mutex_unlock(&v->obj->lock);
         if (!phys) return 0;
     } else {
@@ -272,7 +281,10 @@ struct mm *mm_fork(struct mm *src) {
             u64 pte, phys = vmm_translate_in(src->page_table, a, &pte);
             if (phys == VMM_NOT_MAPPED) continue;
             phys = ALIGN_DOWN(phys, PAGE_SIZE);
-            pmm_page_ref(phys);
+            if (!pmm_page_ref(phys)) {   /* shared too often already */
+                ok = false;
+                break;
+            }
             if (!vmm_map_in(mm->page_table, a, phys, flags)) {
                 pmm_page_put(phys);
                 ok = false;
@@ -331,7 +343,7 @@ static int unmap_locked(struct mm *mm, u64 start, u64 end) {
     return 0;
 }
 
-i64 mm_map(struct mm *mm, u64 addr, u64 len, u32 prot, u32 flags, struct vnode *file, u64 offset) {
+i64 mm_map(struct mm *mm, u64 addr, u64 len, u32 prot, u32 flags, struct vnode *file, u64 offset, bool may_write) {
     if (!len || len > USER_TOP) return -EINVAL;
     if (offset % PAGE_SIZE) return -EINVAL;
     u32 type = flags & MAP_SHARED_VALIDATE;
@@ -347,6 +359,7 @@ i64 mm_map(struct mm *mm, u64 addr, u64 len, u32 prot, u32 flags, struct vnode *
     v->prot = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
     v->kind = VMA_NORMAL;
     v->offset = offset;
+    v->may_write = !shared || !file || may_write;
     if (shared) {
         v->obj = file ? file_memobj(file) : memobj_new(NULL);
         if (!v->obj) {
@@ -413,6 +426,12 @@ int mm_protect(struct mm *mm, u64 addr, u64 len, u32 prot) {
         mutex_unlock(&mm->lock);
         return -ENOMEM;
     }
+    /* a shared file area may only become writable if its file was opened for writing */
+    for (struct vma *v = mm->vmas; v && v->start < end; v = v->next)
+        if (v->end > addr && (prot & PROT_WRITE) && !v->may_write) {
+            mutex_unlock(&mm->lock);
+            return -EACCES;
+        }
     int r = 0;
     for (struct vma *v = mm->vmas; v && v->start < end; v = v->next) {
         if (v->end <= addr) continue;
@@ -446,31 +465,45 @@ u64 mm_brk(struct mm *mm, u64 addr) {
     u64 result = mm->brk;
     if (addr >= mm->brk_start && addr < MMAP_TOP) {
         u64 old_end = ALIGN_UP(mm->brk, PAGE_SIZE), new_end = ALIGN_UP(addr, PAGE_SIZE);
-        struct vma *heap = NULL;
-        for (struct vma *v = mm->vmas; v; v = v->next)
-            if (v->kind == VMA_HEAP) heap = v;
         bool ok = true;
+        /* The heap may be in pieces (mprotect splits it); every piece is VMA_HEAP. Areas mapped over
+           the old heap range (MAP_FIXED) are not: brk never touches them. */
         if (new_end > old_end) {
+            struct vma *heap = old_end > mm->brk_start ? find_vma(mm, old_end - 1) : NULL;   /* ends at the break */
+            if (heap && heap->kind != VMA_HEAP) heap = NULL;
             ok = range_free(mm, old_end, new_end);
             if (ok && heap) {
                 heap->end = new_end;
-            } else if (ok) {
+            } else if (ok) {   /* no heap below the break (none yet, or unmapped): a new piece from there */
                 heap = kcalloc(1, sizeof *heap);
                 ok = heap != NULL;
                 if (ok) {
-                    heap->start = mm->brk_start;
+                    heap->start = old_end;
                     heap->end = new_end;
                     heap->prot = PROT_READ | PROT_WRITE;
                     heap->kind = VMA_HEAP;
+                    heap->may_write = true;
                     insert_vma(mm, heap);
                 }
             }
-        } else if (new_end < old_end && heap) {
-            release_pages(mm, new_end, old_end);
-            heap->end = new_end;
-            if (heap->end == heap->start) {
-                unlink_vma(mm, heap);
-                kfree(heap);
+        } else if (new_end < old_end) {   /* the heap pieces above the new break go */
+            for (struct vma **p = &mm->vmas; *p && (*p)->start < old_end;) {
+                struct vma *v = *p;
+                if (v->end <= new_end || v->kind != VMA_HEAP) {
+                    p = &v->next;
+                    continue;
+                }
+                if (v->start < new_end) {   /* keep the part below (the first piece: nothing changed yet) */
+                    if (!split_vma(v, new_end)) {
+                        ok = false;
+                        break;
+                    }
+                    p = &v->next;
+                    continue;
+                }
+                release_pages(mm, v->start, v->end);
+                *p = v->next;
+                free_vma(v);
             }
         }
         if (ok) result = mm->brk = addr;

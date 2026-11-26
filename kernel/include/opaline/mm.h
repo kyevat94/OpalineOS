@@ -34,8 +34,9 @@ u64 pmm_alloc_page(void);              /* physical address, 0 if out of memory (
 u64 pmm_alloc_pages(size_t count);     /* physically contiguous run */
 void pmm_free_page(u64 phys);
 void pmm_free_pages(u64 phys, size_t count);
-/* Reference counts (user pages that may be shared): a new page has 1; put frees it at 0. */
-void pmm_page_ref(u64 phys);
+/* Reference counts (user pages that may be shared): a new page has 1; put frees it at 0.
+   pmm_page_ref fails (false) only when the count is at its maximum. */
+bool pmm_page_ref(u64 phys);
 void pmm_page_put(u64 phys);
 u32 pmm_page_refs(u64 phys);
 

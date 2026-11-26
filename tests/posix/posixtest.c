@@ -13,7 +13,8 @@
  * users and permissions (as an ordinary user, set-user-id programs) and job
  * control (stop/continue, process groups, restarted system calls); since
  * stage SE2, symbolic and hard links; and, since stage SE3, the terminal
- * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK.
+ * settings (termios: canonical and raw mode), select/pselect and O_NONBLOCK;
+ * and, since stage SE4, limits of shared and brk memory.
  * "posixtest rawkeys" and "posixtest env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
@@ -993,6 +994,66 @@ static int raw_keys(void) {
     return 0;
 }
 
+/* ---- stage SE4: memory limits --------------------------------------------------------------- */
+
+static void test_memory_limits(void) {
+    printf("memory limits:\n");
+    const long page = 4096;
+
+    /* a shared mapping of a file opened read-only can never become writable; a private one can */
+    int fd = open("/tmp/readonly.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char text[4096];
+    memset(text, 'r', sizeof text);
+    write(fd, text, sizeof text);
+    close(fd);
+    fd = open("/tmp/readonly.bin", O_RDONLY);
+    char *m = mmap(NULL, page, PROT_READ, MAP_SHARED, fd, 0);
+    errno = 0;
+    CHECK(m != MAP_FAILED && mprotect(m, page, PROT_READ | PROT_WRITE) == -1 && errno == EACCES,
+          "mprotect cannot make a shared mapping of a read-only file writable");
+    if (m != MAP_FAILED) munmap(m, page);
+    char *pm = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(pm != MAP_FAILED && mprotect(pm, page, PROT_READ | PROT_WRITE) == 0 && (pm[0] = 'w') == 'w',
+          "a private mapping of the same file can (copy-on-write)");
+    char back = 0;
+    CHECK(pread(fd, &back, 1, 0) == 1 && back == 'r', "the file keeps its contents");
+    if (pm != MAP_FAILED) munmap(pm, page);
+
+    /* one file page mapped more than 65535 times (the old 16-bit page reference count) */
+    enum { MAPS = 66000 };
+    char *area = mmap(NULL, MAPS * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   /* find room */
+    int mapped = 0;
+    if (area != MAP_FAILED) {
+        munmap(area, MAPS * page);
+        /* from the top down, so each new area is the lowest: the kernel finds it at once */
+        for (int i = MAPS - 1; i >= 0; i--, mapped++) {
+            volatile char *at = mmap(area + i * page, page, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
+            if (at == MAP_FAILED || at[0] != 'r') break;
+        }
+        munmap(area, MAPS * page);
+    }
+    CHECK(mapped == MAPS, "one file page mapped and touched 66000 times");
+    close(fd);
+    unlink("/tmp/readonly.bin");
+
+    /* brk: grow, mprotect the middle, shrink below it, grow again */
+    char *cur = (char *)syscall(SYS_brk, 0);
+    char *start = (char *)(((uintptr_t)cur + page - 1) & ~(uintptr_t)(page - 1));
+    int grown = (char *)syscall(SYS_brk, start + 16 * page) == start + 16 * page;
+    if (grown) memset(start, 'h', 16 * page);
+    int prot = grown && mprotect(start + 8 * page, 2 * page, PROT_READ) == 0;
+    int shrunk = (char *)syscall(SYS_brk, start + 4 * page) == start + 4 * page;
+    int regrown = (char *)syscall(SYS_brk, start + 16 * page) == start + 16 * page;
+    int usable = 0;
+    if (regrown) {
+        memset(start + 4 * page, 'g', 12 * page);   /* the read-only middle went with the shrink */
+        usable = start[4 * page - 1] == 'h' && start[9 * page] == 'g';
+    }
+    syscall(SYS_brk, cur);   /* back to where malloc left it */
+    CHECK(grown && prot && shrunk, "brk grows, its middle can be mprotected, brk shrinks below that");
+    CHECK(regrown && usable, "brk grows again afterwards and the memory is usable");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1032,6 +1093,7 @@ int main(int argc, char **argv) {
     test_links();
     test_terminal();
     test_select();
+    test_memory_limits();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

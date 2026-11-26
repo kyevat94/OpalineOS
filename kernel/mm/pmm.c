@@ -11,7 +11,8 @@
  * Pages of user memory can be shared (copy-on-write after fork, shared
  * mappings), so every page also has a reference count: pmm_alloc_page()
  * returns it with one reference, pmm_page_ref() adds one and pmm_page_put()
- * frees the page when the last one goes.
+ * frees the page when the last one goes. The counts are 32-bit (4 bytes per
+ * page, 0.1% of memory); a page that would overflow refuses the new reference.
  */
 #include <opaline/console.h>
 #include <opaline/mm.h>
@@ -24,7 +25,7 @@
 static spinlock_t lock = SPINLOCK_INIT;
 
 static u64 *bitmap;          /* HHDM pointer */
-static u16 *refs;            /* reference count per page (HHDM pointer), right after the bitmap */
+static u32 *refs;            /* reference count per page (HHDM pointer), right after the bitmap */
 static u64 page_count;       /* pages covered by the bitmap */
 static u64 total_pages, free_pages;
 static u64 search_hint;      /* word index where the next search starts */
@@ -44,7 +45,7 @@ void pmm_init(const struct boot_info *bi) {
         if (managed(r[i].type)) top = MAX(top, r[i].base + r[i].length);
     page_count = top / PAGE_SIZE;
     u64 bitmap_only = ALIGN_UP((page_count + 63) / 64 * 8, 8);
-    u64 bitmap_bytes = ALIGN_UP(bitmap_only + page_count * sizeof(u16), PAGE_SIZE);   /* + the counts */
+    u64 bitmap_bytes = ALIGN_UP(bitmap_only + page_count * sizeof(u32), PAGE_SIZE);   /* + the counts */
 
     /* the bitmap and the counts go into the first usable region (above 1 MiB) that can hold them */
     u64 bitmap_phys = 0;
@@ -58,8 +59,8 @@ void pmm_init(const struct boot_info *bi) {
 
     bitmap = phys_to_virt(bitmap_phys);
     memset(bitmap, 0xFF, bitmap_only);   /* everything used until proven free */
-    refs = (u16 *)((u8 *)bitmap + bitmap_only);
-    memset(refs, 0, page_count * sizeof(u16));
+    refs = (u32 *)((u8 *)bitmap + bitmap_only);
+    memset(refs, 0, page_count * sizeof(u32));
 
     for (u64 i = 0; i < n; i++) {
         if (!managed(r[i].type)) continue;
@@ -151,12 +152,13 @@ static u64 checked_page(u64 phys, const char *what) {
     return p;
 }
 
-void pmm_page_ref(u64 phys) {
+bool pmm_page_ref(u64 phys) {
     u64 flags = spin_lock(&lock);
     u64 p = checked_page(phys, "pmm_page_ref");
-    if (refs[p] == 0xFFFF) panic("pmm: page %p has too many references", (void *)phys);
-    refs[p]++;
+    bool ok = refs[p] != 0xFFFFFFFFu;   /* user space can share a page this often: it fails, never wraps */
+    if (ok) refs[p]++;
     spin_unlock(&lock, flags);
+    return ok;
 }
 
 void pmm_page_put(u64 phys) {

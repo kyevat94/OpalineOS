@@ -400,7 +400,11 @@ static i64 sys_ftruncate(u64 fd, i64 size) {
 static i64 sys_fsync(u64 fd) {
     struct file *f = get_file(fd);
     if (!f) return -EBADF;
-    if (f->vn->memobj) memobj_sync(f->vn->memobj);   /* shared mappings first */
+    struct memobj *obj = vnode_memobj_get(f->vn);   /* shared mappings first */
+    if (obj) {
+        memobj_sync(obj);
+        memobj_put(obj);
+    }
     return f->vn->ops->sync ? f->vn->ops->sync(f->vn) : 0;
 }
 
@@ -778,6 +782,7 @@ static i64 sys_reboot(u64 magic1, u64 magic2, u64 cmd) {
 
 static i64 sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, i64 fd, u64 off) {
     struct vnode *file = NULL;
+    bool may_write = false;
     if (!(flags & MAP_ANONYMOUS)) {
         struct file *f = get_file((u64)fd);
         if (!f) return -EBADF;
@@ -786,8 +791,9 @@ static i64 sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, i64 fd, u64 off) {
         bool shared = (flags & MAP_SHARED_VALIDATE) != MAP_PRIVATE;
         if (shared && (prot & PROT_WRITE) && (f->flags & O_ACCMODE) != O_RDWR) return -EACCES;
         file = f->vn;
+        may_write = (f->flags & O_ACCMODE) == O_RDWR;
     }
-    return mm_map(self()->mm, addr, len, (u32)prot, (u32)flags, file, off);
+    return mm_map(self()->mm, addr, len, (u32)prot, (u32)flags, file, off, may_write);
 }
 
 /* ---- time --------------------------------------------------------------------------------- */
