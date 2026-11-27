@@ -32,6 +32,11 @@ void console_set_color(u32 fg);
 void console_write(const char *utf8, size_t n);
 u64 console_lock(void);
 void console_unlock(u64 flags);
+/* Dry run (console lock held): from console_dry_begin() on, console_write only moves the cursor,
+   nothing reaches the screen or COM1, so a caller can measure what text will do before writing it
+   all at once; console_dry_end() puts the cursor back where console_dry_begin() found it. */
+void console_dry_begin(void);
+void console_dry_end(void);
 /* Starts the thread that blinks the cursor (needs the scheduler). */
 void console_start_cursor_blink(void);
 

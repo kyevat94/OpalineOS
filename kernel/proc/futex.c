@@ -9,6 +9,7 @@
  * processes sharing that memory wait on the same futex.
  */
 #include <opaline/errno.h>
+#include <opaline/mm.h>
 #include <opaline/proc.h>
 #include <opaline/spinlock.h>
 #include <opaline/uvm.h>
@@ -58,10 +59,31 @@ static int wake_key(void *mm, u64 addr, int count) {
     return n;
 }
 
-/* timeout: relative (FUTEX_WAIT) or absolute (FUTEX_WAIT_BITSET); NULL waits for ever. */
 int futex_wake(struct mm *mm, u64 addr, int count) { return wake_key(mm, addr, count); }
 
-/* uaddr: the user address (to read); key: where waiters are filed */
+/* Disables interrupts and reads the futex word at uaddr. Comparing it and going to sleep must
+   happen with interrupts off (so no FUTEX_WAKE comes in between), but user memory must not be
+   touched with them off: another thread may have unmapped the page since mm_user_access, and the
+   fault would then sleep on mm->lock or panic. So the page table is looked at first: with
+   interrupts off, on one CPU, no thread can unmap the page, and a present page is read through
+   the direct map. A missing page is faulted in again (interrupts on) and the look repeated; once
+   it is no longer user memory, -EFAULT. Returns 0 with interrupts off (*flags for irq_restore). */
+static int lock_word(struct mm *mm, u64 uaddr, u32 *val, u64 *flags) {
+    for (;;) {
+        u64 f = irq_save();
+        u64 phys = vmm_translate_in(mm->page_table, uaddr, NULL);   /* the word never crosses a page */
+        if (phys != VMM_NOT_MAPPED) {
+            *val = *(volatile const u32 *)phys_to_virt(phys);
+            *flags = f;
+            return 0;
+        }
+        irq_restore(f);
+        if (!mm_user_access(mm, uaddr, 4, false)) return -EFAULT;
+    }
+}
+
+/* uaddr: the user address (to read); key: where waiters are filed.
+   timeout: relative (FUTEX_WAIT) or absolute (FUTEX_WAIT_BITSET); NULL waits for ever. */
 static i64 futex_wait(struct mm *mm, u64 uaddr, void *key, u64 addr, u32 val, u64 timeout, bool absolute) {
     u64 ms = 0;
     if (timeout) {
@@ -75,16 +97,21 @@ static i64 futex_wait(struct mm *mm, u64 uaddr, void *key, u64 addr, u32 val, u6
             want -= now;
         } else if (want == 0) {
             if (sec == 0 && nsec == 0) {
-                if (*(volatile u32 *)uaddr != val) return -EAGAIN;
-                return -ETIMEDOUT;
+                u32 now_val;
+                u64 f;
+                if (lock_word(mm, uaddr, &now_val, &f)) return -EFAULT;
+                irq_restore(f);
+                return now_val != val ? -EAGAIN : -ETIMEDOUT;
             }
             want = 1;
         }
         ms = want;
     }
     struct waiter w = {key, addr, thread_current(), false, NULL};
-    u64 f = irq_save();
-    if (*(volatile u32 *)uaddr != val) {
+    u32 now_val;
+    u64 f;
+    if (lock_word(mm, uaddr, &now_val, &f)) return -EFAULT;
+    if (now_val != val) {
         irq_restore(f);
         return -EAGAIN;
     }
@@ -96,17 +123,24 @@ static i64 futex_wait(struct mm *mm, u64 uaddr, void *key, u64 addr, u32 val, u6
     return w.woken ? 0 : r;
 }
 
-static i64 futex_requeue(void *mm, u64 uaddr, u64 addr, int wake, int move, void *mm2, u64 addr2, bool cmp,
-                         u32 val3) {
-    u64 f = irq_save();
-    if (cmp && *(volatile u32 *)uaddr != val3) {
-        irq_restore(f);
-        return -EAGAIN;
+/* uaddr: the user address (read for FUTEX_CMP_REQUEUE); key, addr: the waiters to wake or move */
+static i64 futex_requeue(struct mm *mm, u64 uaddr, void *key, u64 addr, int wake, int move, void *key2, u64 addr2,
+                         bool cmp, u32 val3) {
+    u64 f;
+    if (!cmp) {
+        f = irq_save();
+    } else {
+        u32 now_val;
+        if (lock_word(mm, uaddr, &now_val, &f)) return -EFAULT;
+        if (now_val != val3) {
+            irq_restore(f);
+            return -EAGAIN;
+        }
     }
     int n = 0, moved = 0;
     for (struct waiter **p = &waiters; *p;) {
         struct waiter *w = *p;
-        if (w->mm != mm || w->addr != addr) {
+        if (w->mm != key || w->addr != addr) {
             p = &w->next;
             continue;
         }
@@ -118,7 +152,7 @@ static i64 futex_requeue(void *mm, u64 uaddr, u64 addr, int wake, int move, void
             continue;
         }
         if (moved >= move) break;
-        w->mm = mm2;
+        w->mm = key2;
         w->addr = addr2;
         moved++;
         p = &w->next;
@@ -150,7 +184,7 @@ i64 sys_futex(u64 addr, u64 op, u64 val, u64 timeout, u64 addr2, u64 val3) {
         void *key2;
         u64 off2;
         mm_futex_key(mm, addr2, private_op, &key2, &off2);
-        return futex_requeue(key, addr, off, n, n2, key2, off2, cmd == FUTEX_CMP_REQUEUE, (u32)val3);
+        return futex_requeue(mm, addr, key, off, n, n2, key2, off2, cmd == FUTEX_CMP_REQUEUE, (u32)val3);
     }
     default: return -ENOSYS;
     }

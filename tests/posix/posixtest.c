@@ -1708,6 +1708,46 @@ static void test_kernel_core(void) {
     free(s.ss_sp);
 }
 
+/* ---- stage SE4: futex words on a page another thread unmaps ------------------------------ */
+
+static volatile uint32_t *futex_page;
+static volatile int futex_stop;
+static void *futex_unmap_waiter(void *arg) {
+    int *odd = arg;   /* results other than 0, EAGAIN, EFAULT, ETIMEDOUT, EINTR */
+    for (unsigned i = 0; !futex_stop; i++) {
+        struct timespec t = {0, i % 2 ? 1000000 : 0};   /* 1 ms, or only a look at the word */
+        long r = syscall(SYS_futex, futex_page, FUTEX_WAIT, 0, &t, NULL, 0);
+        if (r != 0 && errno != EAGAIN && errno != EFAULT && errno != ETIMEDOUT && errno != EINTR) (*odd)++;
+    }
+    return NULL;
+}
+
+static void test_futex_unmap(void) {
+    printf("futex and munmap:\n");
+    /* FUTEX_WAIT reads the word with interrupts off: a page unmapped meanwhile by another thread
+       must give EFAULT (or a fresh look), never a kernel fault */
+    futex_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *where = (void *)futex_page;
+    pthread_t t[3];
+    int odd[3] = {0};
+    futex_stop = 0;
+    for (int i = 0; i < 3; i++) pthread_create(&t[i], NULL, futex_unmap_waiter, &odd[i]);
+    int remapped = 0;
+    for (int round = 0; round < 300; round++) {
+        munmap(where, 4096);
+        sched_yield();
+        remapped += mmap(where, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == where;
+        syscall(SYS_futex, futex_page, FUTEX_WAKE, 3, NULL, NULL, 0);
+        sched_yield();
+    }
+    futex_stop = 1;
+    syscall(SYS_futex, futex_page, FUTEX_WAKE, 3, NULL, NULL, 0);
+    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+    munmap(where, 4096);
+    CHECK(remapped == 300 && !odd[0] && !odd[1] && !odd[2],
+          "FUTEX_WAIT on a page unmapped and mapped again by another thread: 0, EAGAIN, EFAULT or ETIMEDOUT");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1760,6 +1800,7 @@ int main(int argc, char **argv) {
     test_memory_limits();
     test_slashes_and_brk();
     test_kernel_core();
+    test_futex_unmap();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

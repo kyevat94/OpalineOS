@@ -201,6 +201,7 @@ u64 tty_session(void);
 void tty_session_ended(u64 sid);               /* its leader exited: the terminal is free again */
 void tty_input(const char *utf8, u32 len);     /* keyboard -> terminal */
 void tty_init(void);
+bool tty_selftest(void);                       /* echo cost check at boot (false: too slow) */
 void keyboard_init(void);
 
 #endif
