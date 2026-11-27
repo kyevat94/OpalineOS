@@ -79,6 +79,8 @@ u64 vmm_create_address_space(void);                        /* 0 if out of memory
 bool vmm_map_in(u64 page_table, u64 virt, u64 phys, u32 flags);
 u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte);  /* pte: raw entry, may be NULL */
 u64 vmm_unmap_in(u64 page_table, u64 virt);                /* the page's physical address, or VMM_NOT_MAPPED */
+/* First present page in [virt, end) (page aligned), else end; absent tables are skipped whole. */
+u64 vmm_next_mapped_in(u64 page_table, u64 virt, u64 end);
 /* Frees every user page and page table of the address space, then the PML4. */
 void vmm_destroy_address_space(u64 page_table);
 bool vmm_nx_enabled(void);

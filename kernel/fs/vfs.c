@@ -479,11 +479,14 @@ u32 file_poll(struct file *f) {
 i64 vnode_read_at(struct vnode *v, u64 offset, void *buf, u64 len) {
     if (!v->ops->read) return -EINVAL;
     struct memobj *obj = vnode_memobj_get(v);   /* referenced: the last munmap may free it meanwhile */
+    i64 r = v->ops->read(v, offset, buf, len);
     if (obj) {
-        memobj_sync(obj);   /* what the mappings wrote goes to the file first */
+        /* what the mappings wrote replaces the file data (syncing every page here would make each read
+           cost the whole cache) */
+        if (r > 0) memobj_read(obj, offset, buf, (u64)r);
         memobj_put(obj);
     }
-    return v->ops->read(v, offset, buf, len);
+    return r;
 }
 
 i64 vnode_write_at(struct vnode *v, u64 offset, const void *buf, u64 len) {
@@ -765,7 +768,7 @@ int vfs_read_vnode(struct vnode *v, void **data, u64 *size) {
     if (r < 0) return r;
     void *buf = kmalloc(st.size ? st.size : 1);
     if (!buf) return -ENOMEM;
-    i64 n = v->ops->read(v, 0, buf, st.size);
+    i64 n = vnode_read_at(v, 0, buf, st.size);   /* with what shared mappings wrote, as read() sees it */
     if (n < 0 || (u64)n != st.size) {
         kfree(buf);
         return n < 0 ? (int)n : -EIO;

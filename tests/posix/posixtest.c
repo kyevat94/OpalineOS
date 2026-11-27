@@ -19,7 +19,9 @@
  * restarts, kill(-1), sigaltstack), file system details (pipe POLLOUT,
  * O_CREAT through links, readdir while unlinking, directory renames, slashes),
  * limits of shared and brk memory, trailing slashes on names to create,
- * remove or rename (as in Linux) and brk over an mprotected heap top.
+ * remove or rename (as in Linux), brk over an mprotected heap top and the cost
+ * of huge untouched reservations and of reading a file that has a shared mapping
+ * (whose unsynced changes a new private mapping shows).
  * "posixtest rawkeys", "vmin", "flushraw", "sleep" and "env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
@@ -1708,6 +1710,90 @@ static void test_kernel_core(void) {
     free(s.ss_sp);
 }
 
+/* ---- stage SE4: memory performance ------------------------------------------------------- */
+
+static void test_memory_performance(void) {
+    printf("memory performance:\n");
+    struct timespec t0;
+    int status;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = on_segv;   /* for faults() */
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+
+    /* a reservation with one touched page: mprotect, fork and munmap skip its absent page tables
+       (they used to visit each of its 64M pages) */
+    const size_t huge = (size_t)256 << 30, mid = huge / 2;
+    char *r = mmap(NULL, huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    CHECK(r != MAP_FAILED, "mmap of a 256 GiB PROT_NONE reservation");
+    if (r != MAP_FAILED) {
+        CHECK(mprotect(r + mid, 4096, PROT_READ | PROT_WRITE) == 0 && (r[mid] = 7) == 7, "one page of it in use");
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int ok = mprotect(r, huge, PROT_READ) == 0;
+        long ms = ms_since(&t0);
+        printf("  (mprotect of 256 GiB: %ld ms)\n", ms);
+        CHECK(ok && ms < 1000 && r[mid] == 7 && faults(r + mid, 1), "mprotect of the reservation is fast and keeps the page");
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        pid_t pid = fork();
+        if (pid == 0) _exit(r[mid] == 7 ? 0 : 1);
+        ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        ms = ms_since(&t0);
+        printf("  (fork with it: %ld ms)\n", ms);
+        CHECK(ok && ms < 1000, "fork with the reservation is fast and the child sees the page");
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        ok = munmap(r, huge) == 0;
+        ms = ms_since(&t0);
+        printf("  (munmap of 256 GiB: %ld ms)\n", ms);
+        CHECK(ok && ms < 1000 && faults(r + mid, 0), "munmap of the reservation is fast and drops the page");
+    }
+    signal(SIGSEGV, SIG_DFL);
+
+    /* read() of a file with a writable shared mapping costs the pages read, not every cached page
+       (each read used to write all 4096 cached pages back first) */
+    enum { FILE_SIZE = 16 << 20, CHUNK = 4096, BUF = 64 << 10 };
+    int fd = open("/tmp/perf.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char *buf = malloc(BUF);
+    int wrote = fd >= 0 && buf;
+    for (long at = 0; wrote && at < FILE_SIZE; at += BUF) {
+        for (long i = 0; i < BUF; i++) buf[i] = (char)((at + i) / 4096);   /* each page holds its index */
+        wrote = write(fd, buf, BUF) == BUF;
+    }
+    CHECK(wrote, "write a 16 MiB file");
+    char *m = wrote ? mmap(NULL, FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    CHECK(m != MAP_FAILED, "a writable shared mapping of it");
+    if (m != MAP_FAILED) {
+        volatile char sum = 0;
+        for (long at = 0; at < FILE_SIZE; at += 4096) sum += m[at];   /* every page into the cache */
+        m[5 * 4096 + 9] = 'X';   /* a change only the mapping has, so far */
+        int same = lseek(fd, 0, SEEK_SET) == 0;
+        long at, ms = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (at = 0; same && at < FILE_SIZE && ms < 5000; at += CHUNK) {   /* gives up on a slow kernel */
+            same = read(fd, buf, CHUNK) == CHUNK && !memcmp(buf, m + at, CHUNK) && buf[CHUNK - 1] == (char)(at / 4096);
+            ms = ms_since(&t0);
+        }
+        printf("  (16 MiB read in 4 KiB chunks: %ld ms, %ld KiB)\n", ms, at / 1024);
+        CHECK(same && at == FILE_SIZE && ms < 5000, "reading it in 4 KiB chunks is fast and shows the mapping's change");
+        m[7 * 4096 + 2] = 'Z';   /* not synced: a new private mapping still shows it, as on Linux */
+        char *p = mmap(NULL, 8 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        CHECK(p != MAP_FAILED && p[7 * 4096 + 2] == 'Z' && p[5 * 4096 + 9] == 'X' && p[6 * 4096] == 6,
+              "a new private mapping shows the shared mapping's unsynced changes");
+        if (p != MAP_FAILED) munmap(p, 8 * 4096);
+        m[3 * 4096 + 1] = 'Y';
+        char c = 0;
+        CHECK(pread(fd, &c, 1, 3 * 4096 + 1) == 1 && c == 'Y', "read() sees a byte then changed through the mapping");
+        c = 0;
+        CHECK(msync(m, FILE_SIZE, MS_SYNC) == 0 && pread(fd, &c, 1, 3 * 4096 + 1) == 1 && c == 'Y', "and after msync");
+        munmap(m, FILE_SIZE);
+        char x = 0, y = 0;   /* no mapping left: this reads the file itself */
+        CHECK(pread(fd, &x, 1, 5 * 4096 + 9) == 1 && x == 'X' && pread(fd, &y, 1, 3 * 4096 + 1) == 1 && y == 'Y',
+              "after munmap the file holds both changes");
+    }
+    if (fd >= 0) close(fd);
+    unlink("/tmp/perf.bin");
+    free(buf);
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1760,6 +1846,7 @@ int main(int argc, char **argv) {
     test_memory_limits();
     test_slashes_and_brk();
     test_kernel_core();
+    test_memory_performance();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;
