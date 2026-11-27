@@ -29,7 +29,12 @@ VMDK = build.VMDK
 QEMU_DIRS = [r"C:\Program Files\qemu"]
 VBOX_DIRS = [r"C:\Program Files\Oracle\VirtualBox"]
 VM_NAME = "OpalineOS"
-TIMEOUT = 90          # seconds per test
+# Seconds a test may take until the kernel reports it finished. Every boot runs the whole
+# POSIX test (twice) before the shell or a test=... step: 30-40 s in QEMU and close to
+# 4 minutes in VirtualBox (measured). The limits leave 2.5-4 times that, for a busy host; a
+# test that ends (or panics) returns at once, only a hang waits this long.
+QEMU_TIMEOUT = 120
+VBOX_TIMEOUT = 600
 
 # (name, emulator, command line or None, text that must appear, text that must not appear)
 BOOT_OK = "TEST_OK boot complete"
@@ -135,9 +140,9 @@ def read_log(log):
         return f.read().decode("utf-8", errors="replace")
 
 
-def wait_for_done(log, alive):
+def wait_for_done(log, alive, timeout=QEMU_TIMEOUT):
     """Waits until the kernel reports it finished (or panicked), the machine stops, or time runs out."""
-    deadline = time.time() + TIMEOUT
+    deadline = time.time() + timeout
     while time.time() < deadline:
         text = read_log(log)
         if any(m in text for m in DONE_MARKERS):
@@ -329,7 +334,7 @@ def shell_test():
     build.make_image(path)
     s = QemuSession(path)
     try:
-        if not s.wait_for("opaline:/home$ ", timeout=TIMEOUT):
+        if not s.wait_for("opaline:/home$ ", timeout=QEMU_TIMEOUT):
             return False, s.text(), ["the shell prompt never appeared"]
         problems = []
         for keys, expect in [("echo ola mundo > nota.txt\n", "opaline:/home$ "), ("cat nota.txt\n", "ola mundo")]:
@@ -446,7 +451,7 @@ def persistence_test():
     for boot, expect in ((1, "persist: first boot of this disk"), (2, "persist: found from a previous boot (boot 1)")):
         s = QemuSession(path, log_name="serial-persist.log")
         try:
-            ok = s.wait_for(BOOT_OK, timeout=TIMEOUT)
+            ok = s.wait_for(BOOT_OK, timeout=QEMU_TIMEOUT)
             log = s.text()
         finally:
             s.close()
@@ -600,7 +605,7 @@ def vbox_test(cmdline):
         os.remove(log)
     vbox("startvm", VM_NAME, "--type", "headless")
     try:
-        text = wait_for_done(log, vbox_running)
+        text = wait_for_done(log, vbox_running, VBOX_TIMEOUT)
         if BOOT_OK not in text:
             return text, log
         # type "exit" + Enter into the shell: the VM must power itself off (ACPI)

@@ -74,11 +74,36 @@ static const char *self_path;
         }                                                    \
     } while (0)
 
+/* Removes `path` and, if it is a directory, everything in it (links are removed, not followed).
+   The tests below use fixed names under /tmp; a run that was cut off (a VM stopped in the
+   middle of a test) leaves them on the disk, so each test first removes what it is about to make. */
+static void remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path);
+        return;
+    }
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char sub[256];
+            snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
+            remove_tree(sub);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+
 /* ---- files ---------------------------------------------------------------------------- */
 
 static void test_files(void) {
     printf("files:\n");
     mkdir("/tmp", 0755);
+    remove_tree("/tmp/ptest");
     CHECK(mkdir("/tmp/ptest", 0755) == 0 || errno == EEXIST, "mkdir /tmp/ptest");
     FILE *f = fopen("/tmp/ptest/a.txt", "w");
     CHECK(f != NULL, "fopen for writing");
@@ -196,6 +221,7 @@ static void test_memory(void) {
     CHECK(faults((char *)16, 0), "a NULL-page access raises SIGSEGV");
 
     /* a file mapping */
+    remove_tree("/tmp/map.bin");
     int fd = open("/tmp/map.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
     char data[6000];
     for (int i = 0; i < (int)sizeof data; i++) data[i] = (char)(i * 7);
@@ -491,6 +517,7 @@ static void test_memory_sharing(void) {
     munmap((void *)shared, 4096);
 
     /* MAP_SHARED of a file: changes reach the file, and write() reaches the mapping */
+    remove_tree("/tmp/shared.bin");
     int fd = open("/tmp/shared.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
     char zero[8192] = {0};
     write(fd, zero, sizeof zero);
@@ -564,6 +591,7 @@ static void test_exec_threads_and_time(void) {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     CHECK(now.tv_sec > 1767225600, "the real clock is past 2026-01-01");
+    remove_tree("/tmp/times.txt");
     int fd = open("/tmp/times.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     write(fd, "x", 1);
     close(fd);
@@ -645,6 +673,10 @@ static int stime_check(void) {
 static void test_permissions(void) {
     printf("users and permissions:\n");
     CHECK(getuid() == 0 && geteuid() == 0, "the system starts as root");
+    remove_tree("/tmp/perm");
+    remove_tree("/tmp/mine.txt");
+    remove_tree("/tmp/rootfile");
+    remove_tree("/tmp/suid-posixtest");
     mkdir("/tmp/perm", 0755);
     int fd = open("/tmp/perm/secret", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     write(fd, "s", 1);
@@ -779,6 +811,7 @@ static void test_jobs(void) {
 
 static void test_links(void) {
     printf("links:\n");
+    remove_tree("/tmp/lk");
     mkdir("/tmp/lk", 0755);
     mkdir("/tmp/lk/real", 0755);
     int fd = open("/tmp/lk/real/target.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1033,6 +1066,7 @@ static void test_fs_details(void) {
 
     /* open with O_CREAT and links */
     struct stat st;
+    remove_tree("/tmp/fs4");
     CHECK(mkdir("/tmp/fs4", 0755) == 0, "mkdir /tmp/fs4");
     symlink("/tmp/fs4/target", "/tmp/fs4/l");
     int fd = open("/tmp/fs4/l", O_WRONLY | O_CREAT, 0644);
@@ -1485,6 +1519,7 @@ static void test_memory_limits(void) {
     const long page = 4096;
 
     /* a shared mapping of a file opened read-only can never become writable; a private one can */
+    remove_tree("/tmp/readonly.bin");
     int fd = open("/tmp/readonly.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
     char text[4096];
     memset(text, 'r', sizeof text);
@@ -1545,6 +1580,7 @@ static int err_of(int r) { return r < 0 ? errno : 0; }
 static void test_slashes_and_brk(void) {
     printf("slashes and brk:\n");
     struct stat st;
+    remove_tree("/tmp/sl");
     CHECK(mkdir("/tmp/sl", 0755) == 0, "mkdir /tmp/sl");
     close(open("/tmp/sl/f", O_WRONLY | O_CREAT, 0644));
     mkdir("/tmp/sl/d", 0755);
@@ -1859,10 +1895,13 @@ static void timer_checks(void) {
         struct itimerval t30 = {{0, 0}, {30, 0}};
         setitimer(ITIMER_REAL, &t30, NULL);
         execl(self_path, self_path, "itimer-child", (char *)NULL);
-        _exit(1);
+        printf("itimer-child: execl: errno %d\n", errno);
+        fflush(stdout);
+        _exit(4);
     }
     st = wait_child(c);
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 6, "execve keeps the interval timer (and exit stops it)");
+    snprintf(what, sizeof what, "execve keeps the interval timer (and exit stops it) (status 0x%x)", st);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 6, what);
 
     /* ITIMER_VIRTUAL counts user time only; ITIMER_PROF user and system time */
     struct itimerval v1 = {{0, 0}, {1, 0}};
@@ -1932,6 +1971,8 @@ static void test_fs_wave2(void) {
     printf("file systems (2):\n");
 
     /* unlink of a directory, "." and ".." included: EISDIR; rmdir(".") stays EINVAL */
+    remove_tree("/tmp/w2dir");
+    remove_tree("/tmp/w2big");
     mkdir("/tmp/w2dir", 0755);
     errno = 0;
     int r1 = unlink("/tmp/w2dir/.");
@@ -2029,7 +2070,18 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "spawn-child")) return 9;
     if (argc >= 2 && !strcmp(argv[1], "itimer-child")) {   /* the timer set before execve still runs */
         struct itimerval it;
-        return getitimer(ITIMER_REAL, &it) == 0 && it.it_value.tv_sec >= 25 && it.it_value.tv_sec < 30 ? 6 : 1;
+        if (getitimer(ITIMER_REAL, &it) != 0) {
+            printf("itimer-child: getitimer: errno %d\n", errno);
+            return 2;
+        }
+        /* Time is counted in 1 ms ticks and the time left is rounded up to a tick, so exactly 30 s is
+           right if no tick passed since setitimer (fork + execve can fit in one tick when the host
+           is busy). A timer execve dropped reads 0. */
+        long us = it.it_value.tv_sec * 1000000L + it.it_value.tv_usec;
+        if (us >= 25000000L && us <= 30000000L) return 6;
+        printf("itimer-child: %ld.%06ld s left, interval %ld.%06ld s\n", (long)it.it_value.tv_sec,
+               (long)it.it_value.tv_usec, (long)it.it_interval.tv_sec, (long)it.it_interval.tv_usec);
+        return 3;
     }
     if (argc >= 2 && !strcmp(argv[1], "suid-child")) return geteuid() == 0 && getuid() == 1000 && getauxval(AT_SECURE) ? 5 : 1;
     if (argc >= 2 && !strcmp(argv[1], "sleep")) {   /* for the shell test: Ctrl+C and Ctrl+Z */
