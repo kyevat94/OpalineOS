@@ -235,6 +235,7 @@ void kmain(struct boot_info *bi) {
     /* storage, files and the terminal */
     mount_root_file_system();
     tty_init();
+    tty_selftest();   /* prints FAILED if typing in a long line is too slow */
     keyboard_init();
 
     /* user mode */

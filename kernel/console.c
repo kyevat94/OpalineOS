@@ -46,6 +46,15 @@ static struct {
     u32 cursor_col, cursor_row;
 } con = {.fg = COLOR_TEXT, .bg = COLOR_BACKGROUND};
 
+/* Dry run (console_dry_begin/end): writes only move the cursor; where it was is kept here. */
+static struct {
+    bool on;
+    u32 col, row, utf8_cp, utf8_need;
+} dry;
+
+/* A panic always draws, even if it interrupted a dry run. */
+static bool dry_run(void) { return dry.on && !panic_in_progress(); }
+
 /* ---- lock ------------------------------------------------------------------------ */
 
 /* One writer at a time, so lines from different threads do not interleave.
@@ -166,6 +175,7 @@ static void newline(void) {
     con.col = 0;
     if (++con.row < con.rows) return;
     con.row = con.rows - 1;
+    if (dry_run()) return;
     fb_scroll_up(MARGIN, con.rows * font.cell_h, font.cell_h);
     fb_fill(MARGIN, MARGIN + con.row * font.cell_h, con.cols * font.cell_w, font.cell_h, con.bg);
 }
@@ -194,6 +204,10 @@ static void draw_codepoint(u32 cp) {
     }
     if (cp < 0x20) return;
     if (con.col >= con.cols) newline();
+    if (dry_run()) {
+        con.col++;
+        return;
+    }
     i64 idx = glyph_index(cp);
     const u8 *glyph = font.bitmaps + (u64)(idx < 0 ? font.replacement : (u32)idx) * font.glyph_size;
     fb_alpha_mask(MARGIN + con.col * font.cell_w, MARGIN + con.row * font.cell_h, font.cell_w, font.cell_h,
@@ -221,10 +235,32 @@ static void utf8_byte(u8 b) {
 
 /* Callers hold the console lock (kputs/kprintf take it). */
 void console_write(const char *s, size_t n) {
+    if (dry_run()) {
+        if (con.screen)
+            for (size_t i = 0; i < n; i++) utf8_byte((u8)s[i]);
+        return;
+    }
     serial_write(s, n);
     if (!con.screen) return;
     cursor_hide();
     for (size_t i = 0; i < n; i++) utf8_byte((u8)s[i]);
     cursor_show();
     last_write_ms = sched_ticks() ? time_ms() : 0;
+}
+
+void console_dry_begin(void) {
+    dry.col = con.col;
+    dry.row = con.row;
+    dry.utf8_cp = con.utf8_cp;
+    dry.utf8_need = con.utf8_need;
+    dry.on = true;
+}
+
+void console_dry_end(void) {
+    if (!dry.on) return;
+    dry.on = false;
+    con.col = dry.col;
+    con.row = dry.row;
+    con.utf8_cp = dry.utf8_cp;
+    con.utf8_need = dry.utf8_need;
 }

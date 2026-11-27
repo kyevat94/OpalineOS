@@ -96,26 +96,64 @@ void tty_session_ended(u64 sid) {
 
 /* ---- drawing (all with the console lock held) ------------------------------------------ */
 
+/* What a key press draws is collected in `out` and written in one go once the key is handled
+   (tty_input): the whole redraw of a long line is one console write, which hides and shows the
+   cursor once, instead of one write per cell. Meanwhile the console is in a dry run, so each
+   collected byte still moves its cursor as the real write will, and echo_byte can measure it. */
+#define OUT_MAX 8192
+static char out[OUT_MAX];
+static u32 out_len;
+
+static void draw_begin(void) { console_dry_begin(); }
+
+static void draw_end(void) {
+    console_dry_end();
+    if (out_len) console_write(out, out_len);
+    out_len = 0;
+}
+
+static void emit(const char *s, u32 n) {
+    while (n) {
+        if (out_len == OUT_MAX) {   /* only a very long redraw: write what is there, go on */
+            draw_end();
+            draw_begin();
+        }
+        u32 k = MIN(n, OUT_MAX - out_len);
+        memcpy(out + out_len, s, k);
+        console_write(s, k);   /* dry run: only the cursor moves */
+        out_len += k;
+        s += k;
+        n -= k;
+    }
+}
+
+static void emit_repeat(char c, u32 n) {
+    char run[64];
+    memset(run, c, sizeof run);
+    for (u32 k; n; n -= k) {
+        k = MIN(n, (u32)sizeof run);
+        emit(run, k);
+    }
+}
+
 /* Echoes byte i of the line and records how many cells the cursor moved. */
 static void echo_byte(u32 i) {
     if (!console_has_screen()) {   /* serial only: no columns to measure */
-        console_write(&tty.line[i], 1);
+        emit(&tty.line[i], 1);
         tty.cells[i] = 1;
         return;
     }
     u32 cols, rows, c0, r0, c1, r1;
     console_get_size(&cols, &rows);
     console_get_cursor(&c0, &r0);
-    console_write(&tty.line[i], 1);
+    emit(&tty.line[i], 1);
     console_get_cursor(&c1, &r1);
     u64 before = (u64)r0 * cols + c0, after = (u64)r1 * cols + c1;
     if (after < before) after += cols;   /* the screen scrolled up by one line */
     tty.cells[i] = (u8)MIN(after - before, 255);
 }
 
-static void back(u32 cells) {
-    for (u32 i = 0; i < cells; i++) console_write("\b", 1);
-}
+static void back(u32 cells) { emit_repeat('\b', cells); }
 
 static u32 cells_between(u32 from, u32 to) {
     u32 n = 0;
@@ -132,7 +170,7 @@ static void redraw_from(u32 from, u32 old_cells) {
         drawn += tty.cells[i];
     }
     if (old_cells > drawn) {
-        for (u32 i = 0; i < old_cells - drawn; i++) console_write(" ", 1);
+        emit_repeat(' ', old_cells - drawn);
         back(old_cells - drawn);
     }
     back(drawn);
@@ -286,7 +324,7 @@ static bool input_quiet(char c) {
         push_ready(tty.line, tty.len);
         push_ready("\n", 1);
         reset_line();
-        if (tty.tio.lflag & ECHONL) console_write("\n", 1);
+        if (tty.tio.lflag & ECHONL) emit("\n", 1);
         return true;
     }
     if (c == (char)tty.tio.cc[VERASE] || c == 0x08) {
@@ -321,7 +359,7 @@ static bool input_byte(char c) {
                 : c == (char)tty.tio.cc[VSUSP] ? SIGTSTP : 0;
         if (sig) {
             if (tty.tio.lflag & ICANON) move_end();
-            if (tty.tio.lflag & ECHO) console_write(sig == SIGINT ? "^C\n" : sig == SIGTSTP ? "^Z\n" : "^\\\n", 3);
+            if (tty.tio.lflag & ECHO) emit(sig == SIGINT ? "^C\n" : sig == SIGTSTP ? "^Z\n" : "^\\\n", 3);
             reset_line();
             tty.pending_signal = sig;
             return false;
@@ -329,7 +367,7 @@ static bool input_byte(char c) {
     }
     if (!(tty.tio.lflag & ICANON)) {   /* raw: every byte goes to the reader at once */
         push_ready(&c, 1);
-        if (tty.tio.lflag & ECHO) console_write(&c, 1);
+        if (tty.tio.lflag & ECHO) emit(&c, 1);
         return true;
     }
     if (!(tty.tio.lflag & ECHO)) return input_quiet(c);
@@ -358,7 +396,7 @@ static bool input_byte(char c) {
         push_ready(tty.line, tty.len);
         push_ready("\n", 1);
         reset_line();
-        console_write("\n", 1);
+        emit("\n", 1);
         return true;
     case 0x08:
     case 0x7F:
@@ -387,7 +425,9 @@ void tty_input(const char *s, u32 n) {
     /* Esc alone (not the start of an arrow key's sequence) means nothing to the line editor, which
        would take it for the start of a sequence and swallow the next key; raw readers get it */
     if (n == 1 && s[0] == 0x1B && (tty.tio.lflag & (ICANON | ECHO)) == (ICANON | ECHO)) n = 0;
+    draw_begin();
     for (u32 i = 0; i < n; i++) wake |= input_byte(s[i]);
+    draw_end();
     int sig = tty.pending_signal;
     tty.pending_signal = 0;
     console_unlock(f);
@@ -626,4 +666,53 @@ void tty_init(void) {
     memset(&tty, 0, sizeof tty);
     tty.browse = 0;
     tty.tio = termios_default;
+}
+
+/* ---- self-test ---------------------------------------------------------------------------- */
+
+static inline u64 rdtsc(void) {   /* the timer stops with interrupts off: the TSC does not */
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+/* Typing at the start of a long line redraws all of it, with interrupts off (console lock): that
+   must cost about what writing those bytes in one go costs, not a console write per cell (which
+   hid and showed the cursor and went to COM1 cell by cell). Run at boot, before the keyboard
+   starts; the line is thrown away with Ctrl+C. Times are the fastest of several tries (the
+   least disturbed by the host). Returns false if a key costs too much. */
+bool tty_selftest(void) {
+    enum { LONG = 1000, KEYS = 6, LIMIT_PCT = 135 };
+    for (u32 i = 0; i < LONG; i++) tty_input("x", 1);
+    tty_input("\x1b[H", 3);
+    u64 key = ~0ULL;
+    for (u32 i = 0; i < KEYS; i++) {
+        u64 t0 = rdtsc();
+        tty_input("y", 1);
+        key = MIN(key, rdtsc() - t0);
+    }
+    /* the reference: what one key at that place sends, the line from the cursor and back again */
+    char *ref = kmalloc(2 * LINE_MAX);
+    u64 plain = ~0ULL;
+    u32 n = 0;
+    if (ref) {
+        u64 f = console_lock();
+        for (u32 i = tty.pos; i < tty.len; i++) ref[n++] = tty.line[i];
+        for (u32 i = 0, back_cells = cells_between(tty.pos, tty.len); i < back_cells && n < 2 * LINE_MAX; i++)
+            ref[n++] = '\b';
+        console_unlock(f);
+        for (u32 i = 0; i < KEYS; i++) {
+            f = console_lock();
+            u64 t0 = rdtsc();
+            console_write(ref, n);
+            plain = MIN(plain, rdtsc() - t0);
+            console_unlock(f);
+        }
+        kfree(ref);
+    }
+    tty_input("\x03", 1);   /* Ctrl+C: no foreground group yet, so it only discards the line */
+    bool ok = ref && key * 100 <= plain * LIMIT_PCT;
+    kprintf("tty: a key at the start of a %u-byte line: %lu cycles; writing the %u bytes it redraws: %lu%s\n",
+            LONG + KEYS, key, n, plain, ok ? "" : " -- FAILED (over 135%)");
+    return ok;
 }
