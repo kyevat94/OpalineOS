@@ -81,6 +81,10 @@ TESTS = [
     ("divide-error", "qemu", "test=divide",
      ["PANIC: Divide error (#DE)", PANIC_END],
      [BOOT_OK]),
+    # SE4: one key typed at the start of a long line costs about one write of what it redraws
+    ("tty-echo", "qemu", "test=tty",
+     ["tty: a key at the start of a 1006-byte line", BOOT_OK],
+     ["FAILED", "PANIC"]),
     ("boot", "vbox", None,
      ["Hello, OpalineOS!", "Olá, mundo! Ação", "Memory self-test passed", "TEST_OK E2 memory",
       "Threads A and B alternating without yielding: ABAB", "Scheduler self-test passed",

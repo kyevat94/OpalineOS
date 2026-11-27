@@ -235,7 +235,8 @@ void kmain(struct boot_info *bi) {
     /* storage, files and the terminal */
     mount_root_file_system();
     tty_init();
-    tty_selftest();   /* prints FAILED if typing in a long line is too slow */
+    /* only on request: it types a 1000-character line on the screen */
+    if (has_word(bi->cmdline, "test=tty")) tty_selftest();   /* prints FAILED if typing in a long line is too slow */
     keyboard_init();
 
     /* user mode */
