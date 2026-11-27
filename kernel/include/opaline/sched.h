@@ -49,6 +49,12 @@ struct sigaction_k {
 
 enum process_state { PROCESS_ALIVE, PROCESS_ZOMBIE };
 
+/* An interval timer (setitimer), in timer ticks. ITIMER_REAL: `value` is the tick it expires at;
+   ITIMER_VIRTUAL and ITIMER_PROF: the ticks left. 0 = not running. */
+struct itimer {
+    u64 value, interval;
+};
+
 struct process {
     u64 pid;
     char name[32];
@@ -86,6 +92,9 @@ struct process {
     /* signals (stage E6) */
     struct sigaction_k sigactions[NSIG];
     u64 sigpending;           /* sent to the process, taken by any thread that does not block it */
+    /* interval timers (stage SE4, kernel/proc/itimer.c): kept across execve, not inherited by fork */
+    struct itimer itimers[3];
+    struct process *itimer_next;   /* list of processes whose ITIMER_REAL runs */
     struct process *all_next;
     struct process *reap_next;   /* temporary list while a parent ends */
 };
@@ -133,8 +142,8 @@ typedef void (*thread_fn)(void *arg);
 
 /* Turns the boot context into the first thread ("kmain") and creates the idle thread. */
 void sched_init(void);
-/* Called by the timer interrupt (interrupts disabled). */
-void sched_tick(void);
+/* Called by the timer interrupt (interrupts disabled); `user_mode`: it interrupted user code. */
+void sched_tick(bool user_mode);
 
 struct thread *thread_create(const char *name, thread_fn fn, void *arg);   /* NULL if out of memory */
 /* Same, in another process (its address space is used while the thread runs). */
@@ -194,6 +203,7 @@ void mutex_unlock(struct mutex *m);
 u64 sched_ticks(void);                /* timer ticks since the timer started */
 static inline u64 time_ms(void) { return sched_ticks() * 1000 / TIMER_HZ; }
 u64 sched_context_switches(void);
+u64 sched_task_count(void);           /* threads that have not ended, the idle thread aside */
 
 bool sched_selftest(void);            /* kernel/sched/selftest.c */
 

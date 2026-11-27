@@ -51,6 +51,7 @@ enum {
     SYS_fchownat = 260, SYS_utimensat = 280, SYS_sysinfo = 99, SYS_poll = 7, SYS_ppoll = 271,
     SYS_select = 23, SYS_pselect6 = 270,
     SYS_link = 86, SYS_symlink = 88, SYS_linkat = 265, SYS_symlinkat = 266,
+    SYS_getitimer = 36, SYS_alarm = 37, SYS_setitimer = 38,
     SYS_opaline_spawn = 1000,   /* spawn(path, argv): starts a program, returns its pid */
 };
 
@@ -866,7 +867,8 @@ static i64 sys_prlimit(u64 pid, u64 resource, u64 new_limit, u64 old) {
     return 0;
 }
 
-/* sysinfo(): uptime, memory and the number of processes (struct sysinfo of Linux, 112 bytes). */
+/* sysinfo(): uptime, memory and the number of processes (struct sysinfo of Linux, 112 bytes).
+   procs counts threads, as Linux counts tasks (kernel threads included). */
 static i64 sys_sysinfo(u64 buf) {
     if (!user_ok(buf, 112, true)) return -EFAULT;
     struct pmm_stats ps;
@@ -876,6 +878,8 @@ static i64 sys_sysinfo(u64 buf) {
     *(i64 *)out = (i64)(time_monotonic_ns() / NS_PER_SEC);   /* uptime */
     *(u64 *)(out + 32) = ps.total_pages;                       /* totalram */
     *(u64 *)(out + 40) = ps.free_pages;                        /* freeram */
+    u64 tasks = sched_task_count();
+    *(u16 *)(out + 80) = (u16)(tasks < 0xFFFF ? tasks : 0xFFFF);   /* procs */
     *(u32 *)(out + 104) = (u32)PAGE_SIZE;                      /* mem_unit: the values count pages */
     return 0;
 }
@@ -1207,6 +1211,9 @@ int syscall_dispatch(struct interrupt_frame *f) {
     /* time */
     case SYS_nanosleep:     r = sys_clock_nanosleep(1, 0, a, b); break;
     case SYS_clock_nanosleep: r = sys_clock_nanosleep(a, b, c, d); break;
+    case SYS_setitimer:     r = sys_setitimer(a, b, c); break;
+    case SYS_getitimer:     r = sys_getitimer(a, b); break;
+    case SYS_alarm:         r = sys_alarm(a); break;
     case SYS_clock_gettime: r = sys_clock_gettime(a, b); break;
     case SYS_clock_settime: r = sys_clock_settime(a, b); break;
     case SYS_settimeofday:

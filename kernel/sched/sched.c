@@ -19,6 +19,7 @@
 #include <opaline/errno.h>
 #include <opaline/mm.h>
 #include <opaline/panic.h>
+#include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
 #include <opaline/string.h>
@@ -137,13 +138,14 @@ static void schedule(void) {
     switch_context(&old->rsp, next->rsp);
 }
 
-void sched_tick(void) {
+void sched_tick(bool user_mode) {
     ticks++;
     for (struct thread *t = sleeping, *n; t; t = n) {   /* wake every thread whose time came */
         n = t->sleep_next;
         if (t->wake_tick <= ticks) unblock(t, -ETIMEDOUT);
     }
     if (!current) return;   /* scheduler not started yet */
+    itimer_tick(ticks, current == idle_thread ? NULL : current->process, user_mode);
     if (current == idle_thread ? ready_head != NULL : --slice_left == 0) schedule();
 }
 
@@ -322,6 +324,15 @@ void thread_detach(struct thread *t) {
 
 u64 sched_ticks(void) { return ticks; }
 u64 sched_context_switches(void) { return switches; }
+
+u64 sched_task_count(void) {
+    u64 n = 0;
+    u64 f = irq_save();
+    for (struct thread *t = all_threads; t; t = t->all_next)
+        if (t->state != THREAD_DEAD && t != idle_thread) n++;
+    irq_restore(f);
+    return n;
+}
 
 void sched_init(void) {
     /* a clean FPU/SSE state for new threads: x87 reset, SSE exceptions masked (MXCSR 0x1F80) */

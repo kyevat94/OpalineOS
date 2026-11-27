@@ -93,9 +93,8 @@ static int run_program(const char *path) {
 }
 
 static void timer_interrupt(struct interrupt_frame *f) {
-    (void)f;
     lapic_eoi();      /* before sched_tick: it may switch threads and not return for a while */
-    sched_tick();
+    sched_tick((f->cs & 3) == 3);
 }
 
 /* Deep recursion: each call keeps 256 bytes on the stack until it runs into the guard page.
