@@ -13,9 +13,12 @@ system's GUI toolkit.
 > a journaled file system that survives power cuts, and symbolic and hard links. Since **SE3**:
 > terminal settings (canonical and raw mode), `select`, non-blocking I/O, and a new shell written
 > against musl that runs programs with `fork`/`execve` and passes them its environment variables.
-> Self-tests for memory, scheduling, user space, files and POSIX run on every boot.
+> **SE4** was an independent review of all of it: about 40 findings fixed (security holes, kernel
+> crashes a user program could cause, Linux compatibility, performance), each with a test that
+> fails without the fix; interval timers (`setitimer`, `alarm`) were added. Self-tests for memory,
+> scheduling, user space, files and POSIX (257 checks) run on every boot.
 
-![Shell](docs/screenshots/e5-shell.png)
+![Shell](docs/screenshots/se4-shell.png)
 > The full plan is in [`project.md`](project.md) (in Portuguese) and the toolkit API in
 > [`opaline-relief.md`](opaline-relief.md).
 

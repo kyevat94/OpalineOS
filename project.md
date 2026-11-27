@@ -459,7 +459,7 @@ isso funcionando.
 | **SE1** ✅ | Sub-etapa: o que a E6 simplificou — copy-on-write, `MAP_SHARED` real, `mremap`, `execve` com threads, relógio real e tempos de arquivo, usuários e permissões, controle de tarefas (Ctrl+C/Ctrl+Z) | `posixtest` (104 verificações) passa, inclusive como usuário comum. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
 | **SE2** ✅ | Sub-etapa: sistema de arquivos — journal no EFS3, links simbólicos e físicos | queda de energia simulada no meio de uma escrita não corrompe o disco (fsck limpo). **Concluída em 2026-11-21** (QEMU e VirtualBox) |
 | **SE3** ✅ | Sub-etapa: terminal e shell — `select`/`pselect6`, termios (modo canônico/cru, `TCGETS`/`TCSETS`), shell com `fork`/`execve` e ambiente herdado | um programa em modo cru lê teclas uma a uma; o shell passa variáveis de ambiente. **Concluída em 2026-11-21** (QEMU e VirtualBox) |
-| **SE4** | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados |
+| **SE4** ✅ | Sub-etapa: revisão independente do código da E6 e das SEs, imagem nova no README | achados da revisão corrigidos ou registrados. **Concluída em 2026-11-27** (QEMU e VirtualBox) |
 | **E7** | **CPython** portado (estático → dinâmico) + zlib, libffi, sqlite | REPL do Python no console; subconjunto da suíte de testes do CPython passa |
 | **E8** | Compositor + renderizador (alfa, relevo com sombras em cache, TrueType com fontes de reserva) + entrada (mouse; teclado com layouts US, US-International e ABNT2, teclas mortas) | janela em relevo arrastável a 60 fps; digitar "ação, über, ñ" funciona |
 | **E9** | **`opaline.relief`** (núcleo C + API Python) + `opaline.system` + **`opaline.i18n`** + shell (barra superior com as tarefas, lançador, central de notificações) | o app Counter da seção 4.4 roda; a área de trabalho segue o design; trocar en-US ↔ pt-BR atualiza a interface sem reiniciar |
@@ -1002,6 +1002,58 @@ OpalineOS/
     `file_read`, o `posixtest` trava na leitura do terminal; sem a correção da máscara, o teste do
     `pselect` falha.
 
+### 10.1.11 Como a SE4 foi feita (revisão independente)
+
+- **Escopo**: todo o código mudado da E5 até a SE3 (`3aa7629..`, 8.084 linhas acrescentadas em 51
+  arquivos). Quatro revisores independentes (subagentes, só leitura), um por área — memória e
+  processos; system calls, sinais e permissões; sistemas de arquivos; terminal, shell e testes —,
+  cada um olhando bugs, comportamento comparado ao Linux, desempenho e falta de testes. Cerca de 30
+  achados; os graves foram conferidos no código antes de corrigir. O journal do EFS3 passou sem
+  achados.
+- **Como as correções foram feitas**: por builders em paralelo, cada um numa cópia própria do
+  repositório (git worktree) e numa porta própria do QEMU (`OPALINE_MONITOR_PORT` no `vm.py`).
+  Toda correção com teste passou por um **teste negativo** (tirar a correção, recompilar, ver o teste
+  falhar, restaurar). Depois de juntar, um **segundo revisor** leu só as correções e achou mais 8
+  problemas, também corrigidos. Três decisões foram do dono do projeto: barra final igual ao Linux,
+  Esc sozinho ignorado no modo canônico, `TIOCSCTTY` com EPERM e a sessão limpa quando o líder sai.
+- **Segurança** (um programa comum conseguia):
+  - reescrever um arquivo que só podia ler (`mprotect` de um mapeamento compartilhado só de leitura);
+  - trocar o binário entre a checagem setuid e a carga no `execve`;
+  - derrubar o kernel com um `MXCSR` forjado no `sigreturn`, com a flag NT, estourando o contador de
+    referências de página (era de 16 bits) ou apertando uma tecla durante o boot.
+- **CPU e sinais**: CR0.WP ligado; endereço da falta (CR2) lido antes de reabilitar interrupções;
+  `pause`, `sigsuspend`, `poll`, `select`, `nanosleep` não recomeçam depois de um tratador com
+  `SA_RESTART`; máscara restaurada entrega sinais pendentes; `kill(-1)` e `kill(-grupo)` como no
+  Linux e sem limite de 64; `sigaltstack` corrigido.
+- **Memória e processos**: o cache de páginas é usado com referência; o `execve` usa um único vnode;
+  dois `execve` simultâneos e threads criadas durante um `execve` não travam mais; `brk` correto
+  depois de `mprotect`; pipe e terminal nunca tocam a memória do usuário com interrupções desligadas
+  (copiam por um buffer intermediário); o futex confere a página antes de ler a palavra.
+- **Arquivos**: `POLLOUT` em pipe só quando cabe um `PIPE_BUF`; `O_CREAT` por link pendente cria o
+  alvo; liberação de vnode sem corrida; `readdir` não devolve nomes apagados; renomear diretório
+  sobre um vazio; barra final como no Linux; `unlink(dir)` e `open(dir, O_CREAT)` dão EISDIR;
+  `unlink`/`truncate` de arquivos enormes em vários passos (cada um uma transação), e uma transação
+  que não cabe no journal falha com erro em vez de pânico.
+- **Terminal e shell**: `VMIN`/`VTIME` e `TCSAFLUSH` como no POSIX; Esc mapeado; o redesenho da linha
+  é uma única escrita por tecla; o shell não vaza descritores, mostra prompt novo no Ctrl+C e não
+  desliga a máquina num erro de leitura.
+- **Novo**: `setitimer`, `getitimer`, `alarm` (real, virtual e prof; `timer_create` continua
+  ENOSYS); `sysinfo` conta os processos.
+- **Desempenho**: `read()` de um arquivo com mapeamento compartilhado gravável não regrava mais todas
+  as páginas (16 MiB em pedaços de 4 KiB: de mais de 7 s, sem terminar, para cerca de 0,5 s);
+  `munmap`/`mprotect`/`fork` pulam tabelas de páginas ausentes (256 GiB reservados: de 2,5–5 s para
+  menos de 5 ms). Um mapeamento privado novo mostra as mudanças ainda não sincronizadas de um
+  compartilhado, como no Linux.
+- **Testes**: `posixtest` foi de 149 para **257** verificações; o teste do shell ganhou passos de
+  `VMIN`, `TCSAFLUSH`, Ctrl+C no prompt e Esc; novo caso `tty-echo` (`test=tty`); a verificação de
+  vazamento depois do `posixtest` agora desconta exatamente o crescimento do cache de blocos e do
+  heap e imprime a conta a cada boot; os testes limpam o que sobrou em `/tmp`; tempos-limite
+  separados para QEMU (120 s) e VirtualBox (600 s). Suíte completa: 15 testes, todos verdes.
+- **Registrado, não feito**: `timer_create` (POSIX timers), `statfs`, SIGHUP ao fim da sessão do
+  terminal, e o eco do terminal ainda é O(n) por tecla no começo de uma linha longa (o custo dos
+  próprios bytes).
+- O relatório completo da revisão ficou num documento à parte (Claude Docs).
+
 ### 10.2 Geral
 
 - **Toolchain**: LLVM (clang, ld.lld) para os alvos `x86_64-unknown-uefi` (bootloader) e
@@ -1062,6 +1114,7 @@ OpalineOS/
 | 2026-11-21 | **SE2 concluída**: EFS3 versão 2 com **journal** de metadados em modo ordenado (uma transação por operação, commit com checksum, reaplicado na montagem, órfãos liberados), links **simbólicos** (seguidos pelo VFS, até 40) e **físicos**, `getcwd` com o caminho real. Teste de queda de energia em 10 pontos de uma carga de 1178 escritas: fsck limpo em todos |
 | 2026-11-21 | **SE3 concluída**: termios no terminal (canônico e cru, `VMIN`/`VTIME`, Enter manda `\r` + `ICRNL`), `select`/`pselect6` sobre o laço do `poll`, `O_NONBLOCK` real em pipes e no terminal; **shell novo em C sobre a musl** (`programs/sh`, estático) com `fork`/`execve`, ambiente herdado, `$VAR`/`$?`, `export`/`unset`/`env`, `ln`, termios restaurado após cada programa. O shell da E5 (`user/sh`) saiu |
 | 2026-11-26 | **Tema escuro** no mockup, a partir de uma referência do usuário: o mesmo relevo sobre grafite (`#25262A`), destaque teal mais claro (`#23897D`), botão **Dark Mode / Light Mode** nos atalhos rápidos; tokens na seção 6.1 |
+| 2026-11-27 | **SE4 concluída**: revisão independente da E6 e das SE1–SE3 por quatro revisores, cerca de 30 achados (6 de segurança: arquivo só de leitura reescrito, troca no `execve` setuid, quatro jeitos de derrubar o kernel) corrigidos com testes negativos, e uma segunda revisão das correções com mais 8. Barra final igual ao Linux; Esc sozinho ignorado no modo canônico; `TIOCSCTTY` com EPERM e sessão limpa ao fim. Novos `setitimer`/`alarm`. `posixtest` com 257 verificações |
 ---
 
 ## Apêndice A — Candidatos a nome do sistema
