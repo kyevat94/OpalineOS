@@ -470,11 +470,12 @@ u64 mm_brk(struct mm *mm, u64 addr) {
            the old heap range (MAP_FIXED) are not: brk never touches them. */
         if (new_end > old_end) {
             struct vma *heap = old_end > mm->brk_start ? find_vma(mm, old_end - 1) : NULL;   /* ends at the break */
-            if (heap && heap->kind != VMA_HEAP) heap = NULL;
+            /* only a read-write piece grows: one mprotected otherwise must not lend its protection */
+            if (heap && (heap->kind != VMA_HEAP || heap->prot != (PROT_READ | PROT_WRITE))) heap = NULL;
             ok = range_free(mm, old_end, new_end);
             if (ok && heap) {
                 heap->end = new_end;
-            } else if (ok) {   /* no heap below the break (none yet, or unmapped): a new piece from there */
+            } else if (ok) {   /* no read-write heap below the break (none yet, unmapped, mprotected): a new piece */
                 heap = kcalloc(1, sizeof *heap);
                 ok = heap != NULL;
                 if (ok) {

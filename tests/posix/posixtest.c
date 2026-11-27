@@ -17,8 +17,9 @@
  * and, since stage SE4, signals and CPU state (hostile signal frames, the NT
  * flag, si_addr, copy-on-write under kernel writes, which calls SA_RESTART
  * restarts, kill(-1), sigaltstack), file system details (pipe POLLOUT,
- * O_CREAT through links, readdir while unlinking, directory renames, slashes)
- * and limits of shared and brk memory.
+ * O_CREAT through links, readdir while unlinking, directory renames, slashes),
+ * limits of shared and brk memory, trailing slashes on names to create,
+ * remove or rename (as in Linux) and brk over an mprotected heap top.
  * "posixtest rawkeys", "vmin", "flushraw", "sleep" and "env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
@@ -1535,6 +1536,67 @@ static void test_memory_limits(void) {
     CHECK(regrown && usable, "brk grows again afterwards and the memory is usable");
 }
 
+/* ---- trailing slashes on names that are created or removed, brk over an mprotected top ---- */
+
+static int err_of(int r) { return r < 0 ? errno : 0; }
+
+static void test_slashes_and_brk(void) {
+    printf("slashes and brk:\n");
+    struct stat st;
+    CHECK(mkdir("/tmp/sl", 0755) == 0, "mkdir /tmp/sl");
+    close(open("/tmp/sl/f", O_WRONLY | O_CREAT, 0644));
+    mkdir("/tmp/sl/d", 0755);
+    symlink("d", "/tmp/sl/dl");
+    symlink("f", "/tmp/sl/fl");
+
+    /* as in Linux: "name/" asks for a directory, and a link there is the link, not its target */
+    CHECK(err_of(unlink("/tmp/sl/f/")) == ENOTDIR && access("/tmp/sl/f", F_OK) == 0, "unlink(\"file/\"): ENOTDIR, file kept");
+    CHECK(err_of(unlink("/tmp/sl/d/")) == EISDIR, "unlink(\"dir/\"): EISDIR");
+    CHECK(err_of(unlink("/tmp/sl/dl/")) == ENOTDIR && lstat("/tmp/sl/dl", &st) == 0 && S_ISLNK(st.st_mode),
+          "unlink(\"dirlink/\"): ENOTDIR, link kept");
+    CHECK(err_of(unlink("/tmp/sl/none/")) == ENOENT, "unlink(\"missing/\"): ENOENT");
+    CHECK(err_of(rmdir("/tmp/sl/dl/")) == ENOTDIR && lstat("/tmp/sl/dl", &st) == 0 && S_ISLNK(st.st_mode),
+          "rmdir(\"dirlink/\"): ENOTDIR, link kept");
+    CHECK(err_of(rename("/tmp/sl/f", "/tmp/sl/g/")) == ENOTDIR && access("/tmp/sl/f", F_OK) == 0 && access("/tmp/sl/g", F_OK) < 0,
+          "rename(\"file\", \"new/\"): ENOTDIR, nothing moved");
+    CHECK(err_of(rename("/tmp/sl/f/", "/tmp/sl/g")) == ENOTDIR && access("/tmp/sl/f", F_OK) == 0 && access("/tmp/sl/g", F_OK) < 0,
+          "rename(\"file/\", \"new\"): ENOTDIR, nothing moved");
+    CHECK(err_of(rename("/tmp/sl/f", "/tmp/sl/d/")) == ENOTDIR, "rename(\"file\", \"dir/\"): ENOTDIR");
+    CHECK(err_of(rename("/tmp/sl/dl/", "/tmp/sl/g")) == ENOTDIR && lstat("/tmp/sl/dl", &st) == 0 && S_ISLNK(st.st_mode),
+          "rename(\"dirlink/\", \"new\"): ENOTDIR, link kept");
+    CHECK(rename("/tmp/sl/d/", "/tmp/sl/e/") == 0 && stat("/tmp/sl/e", &st) == 0 && S_ISDIR(st.st_mode) && rename("/tmp/sl/e/", "/tmp/sl/d") == 0,
+          "rename(\"dir/\", \"new/\") works");
+    CHECK(err_of(link("/tmp/sl/f", "/tmp/sl/g/")) == ENOENT && access("/tmp/sl/g", F_OK) < 0, "link(\"file\", \"new/\"): ENOENT, nothing made");
+    CHECK(err_of(link("/tmp/sl/f", "/tmp/sl/fl/")) == EEXIST, "link(\"file\", \"existing/\"): EEXIST");
+    CHECK(err_of(symlink("t", "/tmp/sl/s/")) == ENOENT && lstat("/tmp/sl/s", &st) < 0, "symlink(\"t\", \"new/\"): ENOENT, nothing made");
+    CHECK(err_of(symlink("t", "/tmp/sl/f/")) == EEXIST, "symlink(\"t\", \"existing/\"): EEXIST");
+    CHECK(mkdir("/tmp/sl/x/", 0755) == 0 && rmdir("/tmp/sl/x/") == 0, "mkdir(\"dir/\") and rmdir(\"dir/\") work");
+    const char *names[] = {"/tmp/sl/f", "/tmp/sl/fl", "/tmp/sl/dl", "/tmp/sl/g", "/tmp/sl/s"};
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) unlink(names[i]);
+    CHECK(rmdir("/tmp/sl/d") == 0 && rmdir("/tmp/sl") == 0, "slash tests cleaned up");
+
+    /* brk grows over a top heap page that was mprotected: the new memory is still read-write
+       (in a child: a SIGSEGV there is a failed check, not the end of the test) */
+    pid_t pid = fork();
+    if (pid == 0) {
+        const long page = 4096;
+        char *cur = (char *)syscall(SYS_brk, 0);
+        char *start = (char *)(((uintptr_t)cur + page - 1) & ~(uintptr_t)(page - 1));
+        if ((char *)syscall(SYS_brk, start + 4 * page) != start + 4 * page) _exit(2);
+        memset(start, 'h', 4 * page);
+        if (mprotect(start + 3 * page, page, PROT_READ) != 0) _exit(3);
+        if ((char *)syscall(SYS_brk, start + 8 * page) != start + 8 * page) _exit(4);
+        memset(start + 4 * page, 'g', 4 * page);
+        if (mprotect(start + 7 * page, page, PROT_NONE) != 0) _exit(5);
+        if ((char *)syscall(SYS_brk, start + 12 * page) != start + 12 * page) _exit(6);
+        memset(start + 8 * page, 'n', 4 * page);
+        _exit(start[3 * page] == 'h' && start[4 * page] == 'g' && start[8 * page] == 'n' ? 0 : 7);
+    }
+    int status = 0;
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "brk over a PROT_READ or PROT_NONE top page: the new memory is writable");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1585,6 +1647,7 @@ int main(int argc, char **argv) {
     test_fs_details();
     test_signals_cpu();
     test_memory_limits();
+    test_slashes_and_brk();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;
