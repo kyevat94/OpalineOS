@@ -45,6 +45,8 @@
 #define SIGTTIN 21
 #define SIGTTOU 22
 #define SIGURG  23
+#define SIGVTALRM 26
+#define SIGPROF 27
 #define SIGWINCH 28
 
 /* Exit codes of processes killed by a CPU exception (128 + the POSIX signal number). */
@@ -118,6 +120,15 @@ bool syscall_restartable(u64 nr);
 i64 sys_rt_sigpending(u64 set, u64 size);
 i64 sys_rt_sigsuspend(u64 set, u64 size);
 i64 signal_suspend(u64 mask);   /* waits for a signal with `mask` blocked; -EINTR */
+
+/* Interval timers (kernel/proc/itimer.c): setitimer, getitimer, alarm. */
+i64 sys_setitimer(u64 which, u64 new_value, u64 old_value);
+i64 sys_getitimer(u64 which, u64 value);
+i64 sys_alarm(u64 seconds);
+/* Timer interrupt (interrupts disabled): counts the timers down; p is the process that was
+   running (NULL: none), user_mode whether it was in user mode. */
+void itimer_tick(u64 now, struct process *p, bool user_mode);
+void itimer_cancel_all(struct process *p);   /* the process ends */
 
 /* Futexes (kernel/proc/futex.c) */
 i64 sys_futex(u64 addr, u64 op, u64 val, u64 timeout, u64 addr2, u64 val3);

@@ -582,6 +582,7 @@ void process_kill(struct process *p, int sig) {
 /* The last thread of p ended: release everything but the struct, become a zombie. */
 static NORETURN void process_finish(struct process *p, int code) {
     if (!p->exiting) p->exit_code = code;
+    itimer_cancel_all(p);
     close_files(p);
     if (p->pid == p->sid) tty_session_ended(p->sid);
 

@@ -19,7 +19,8 @@
  * restarts, kill(-1), sigaltstack), file system details (pipe POLLOUT,
  * O_CREAT through links, readdir while unlinking, directory renames, slashes),
  * limits of shared and brk memory, trailing slashes on names to create,
- * remove or rename (as in Linux) and brk over an mprotected heap top.
+ * remove or rename (as in Linux), brk over an mprotected heap top, interval
+ * timers (alarm, setitimer, getitimer) and the process count of sysinfo.
  * "posixtest rawkeys", "vmin", "flushraw", "sleep" and "env NAME" are used by the shell test.
  * Prints "ok"/"FAIL" per check and ends with exit code 0 only if all passed.
  */
@@ -46,6 +47,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <grp.h>
@@ -1708,6 +1710,172 @@ static void test_kernel_core(void) {
     free(s.ss_sp);
 }
 
+/* ---- interval timers and sysinfo (stage SE4) ------------------------------------------- */
+
+static volatile sig_atomic_t alarms, vtalarms, profs;
+static void on_alarm(int sig) { alarms += sig == SIGALRM; }
+static void on_vtalarm(int sig) { vtalarms += sig == SIGVTALRM; }
+static void on_prof(int sig) { profs += sig == SIGPROF; }
+
+static long usec_left(int which) {
+    struct itimerval it;
+    if (getitimer(which, &it) != 0) return -1;
+    return it.it_value.tv_sec * 1000000L + it.it_value.tv_usec;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts = {ms / 1000, ms % 1000 * 1000000};
+    nanosleep(&ts, NULL);
+}
+
+static int wait_child(pid_t c) {
+    int st = -1;
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+    return st;
+}
+
+/* User-mode work until *flag is set or `limit_ms` passed. */
+static void spin_until(volatile sig_atomic_t *flag, long limit_ms) {
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (!*flag && ms_since(&t0) < limit_ms)
+        for (volatile int i = 0; i < 100000; i++) {}
+}
+
+/* Runs in a child process: without timers, pause() would wait for ever (test_timers sets a limit). */
+static void timer_checks(void) {
+    char what[160];
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    sa.sa_handler = on_vtalarm;
+    sigaction(SIGVTALRM, &sa, NULL);
+    sa.sa_handler = on_prof;
+    sigaction(SIGPROF, &sa, NULL);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(alarm(1) == 0, "alarm(1): no alarm was set (0)");
+    errno = 0;
+    int r = pause();
+    long took = ms_since(&t0);
+    snprintf(what, sizeof what, "alarm(1) + pause(): SIGALRM after 1 s, EINTR (%ld ms)", took);
+    CHECK(r == -1 && errno == EINTR && alarms == 1 && took >= 990 && took < 3000, what);
+
+    alarms = 0;
+    struct itimerval it = {{0, 50000}, {0, 50000}}, old, zero = {{0, 0}, {0, 0}};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(setitimer(ITIMER_REAL, &it, NULL) == 0, "setitimer: ITIMER_REAL every 50 ms");
+    while (ms_since(&t0) < 400) sleep_ms(10);
+    int fired = alarms;
+    setitimer(ITIMER_REAL, &zero, &old);
+    snprintf(what, sizeof what, "the periodic timer fires 5-10 times in 0.4 s (%d)", fired);
+    CHECK(fired >= 5 && fired <= 10, what);
+    CHECK(old.it_interval.tv_sec == 0 && old.it_interval.tv_usec == 50000 && old.it_value.tv_sec == 0 &&
+          old.it_value.tv_usec > 0 && old.it_value.tv_usec <= 50000,
+          "setitimer returns the old interval and time left");
+    sleep_ms(120);
+    CHECK(alarms == fired && usec_left(ITIMER_REAL) == 0, "a stopped timer stays stopped");
+
+    struct itimerval one = {{0, 0}, {1, 0}};
+    setitimer(ITIMER_REAL, &one, NULL);
+    long left1 = usec_left(ITIMER_REAL);
+    sleep_ms(50);
+    long left2 = usec_left(ITIMER_REAL);
+    snprintf(what, sizeof what, "getitimer: the time left goes down (%ld, then %ld us)", left1, left2);
+    CHECK(left1 > 900000 && left1 <= 1000000 && left2 > 0 && left2 <= left1 - 40000, what);
+    CHECK(alarm(5) == 1, "alarm(5) returns what the 1 s timer had left (1)");
+    CHECK(alarm(3) == 5, "alarm(3) returns the seconds left of alarm(5)");
+    CHECK(syscall(SYS_alarm, 2) == 3, "the alarm system call rounds the seconds left (3)");
+    CHECK(alarm(0) == 2 && usec_left(ITIMER_REAL) == 0, "alarm(0) returns the seconds left and stops it");
+    alarms = 0;
+    struct itimerval short_timer = {{0, 0}, {0, 100000}};
+    setitimer(ITIMER_REAL, &short_timer, NULL);
+    alarm(0);
+    sleep_ms(200);
+    CHECK(alarms == 0, "alarm(0) cancels a running timer: no SIGALRM");
+    struct itimerval bad = {{0, 0}, {0, 1000000}};
+    errno = 0;
+    CHECK(setitimer(ITIMER_REAL, &bad, NULL) == -1 && errno == EINVAL, "setitimer: tv_usec 1000000 is EINVAL");
+    errno = 0;
+    CHECK(getitimer(7, &old) == -1 && errno == EINVAL, "getitimer: an unknown timer is EINVAL");
+
+    /* fork: the child has no timer; execve keeps it */
+    alarms = 0;
+    struct itimerval t200 = {{0, 0}, {0, 200000}};
+    setitimer(ITIMER_REAL, &t200, NULL);
+    pid_t c = fork();
+    if (c == 0) {
+        signal(SIGALRM, SIG_DFL);   /* a SIGALRM would end the child */
+        long left = usec_left(ITIMER_REAL);
+        sleep_ms(400);
+        _exit(left == 0 ? 0 : 1);
+    }
+    int st = wait_child(c);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0 && alarms == 1,
+          "fork: the parent's timer fires, the child has none (no SIGALRM there)");
+    c = fork();
+    if (c == 0) {
+        struct itimerval t30 = {{0, 0}, {30, 0}};
+        setitimer(ITIMER_REAL, &t30, NULL);
+        execl(self_path, self_path, "itimer-child", (char *)NULL);
+        _exit(1);
+    }
+    st = wait_child(c);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 6, "execve keeps the interval timer (and exit stops it)");
+
+    /* ITIMER_VIRTUAL counts user time only; ITIMER_PROF user and system time */
+    struct itimerval v1 = {{0, 0}, {1, 0}};
+    setitimer(ITIMER_VIRTUAL, &v1, NULL);
+    sleep_ms(100);
+    long vleft = usec_left(ITIMER_VIRTUAL);
+    setitimer(ITIMER_VIRTUAL, &zero, NULL);
+    snprintf(what, sizeof what, "ITIMER_VIRTUAL does not count time asleep (%ld us left)", vleft);
+    CHECK(vleft > 950000 && vleft <= 1000000, what);
+    struct itimerval t20 = {{0, 0}, {0, 20000}};
+    setitimer(ITIMER_VIRTUAL, &t20, NULL);
+    spin_until(&vtalarms, 3000);
+    CHECK(vtalarms == 1, "ITIMER_VIRTUAL: SIGVTALRM after 20 ms of user time");
+    setitimer(ITIMER_PROF, &t20, NULL);
+    spin_until(&profs, 3000);
+    CHECK(profs == 1, "ITIMER_PROF: SIGPROF after 20 ms of CPU time");
+}
+
+static void test_timers(void) {
+    printf("interval timers, sysinfo:\n");
+    struct sysinfo si;
+    CHECK(sysinfo(&si) == 0 && si.procs > 1, "sysinfo: procs counts the running tasks (> 1)");
+
+    int p[2];
+    pipe(p);
+    int base_checks = checks, base_failures = failures;
+    fflush(stdout);
+    pid_t c = fork();
+    if (c == 0) {
+        close(p[0]);
+        timer_checks();
+        int counts[2] = {checks - base_checks, failures - base_failures};
+        write(p[1], counts, sizeof counts);
+        fflush(stdout);
+        _exit(0);
+    }
+    close(p[1]);
+    int counts[2] = {0, 0};
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    struct timeval limit = {20, 0};
+    int r;
+    while ((r = select(p[0] + 1, &rd, NULL, NULL, &limit)) < 0 && errno == EINTR) {}
+    int done = r == 1 && read(p[0], counts, sizeof counts) == sizeof counts;
+    if (!done) kill(c, SIGKILL);
+    wait_child(c);
+    close(p[0]);
+    checks += counts[0];
+    failures += counts[1];
+    CHECK(done, "the timer checks finished within 20 s");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1733,6 +1901,10 @@ int main(int argc, char **argv) {
         return argc == 3 && !strcmp(argv[2], "arg with spaces") && t && !strcmp(t, "yes") && !getenv("PATH") ? 7 : 1;
     }
     if (argc >= 2 && !strcmp(argv[1], "spawn-child")) return 9;
+    if (argc >= 2 && !strcmp(argv[1], "itimer-child")) {   /* the timer set before execve still runs */
+        struct itimerval it;
+        return getitimer(ITIMER_REAL, &it) == 0 && it.it_value.tv_sec >= 25 && it.it_value.tv_sec < 30 ? 6 : 1;
+    }
     if (argc >= 2 && !strcmp(argv[1], "suid-child")) return geteuid() == 0 && getuid() == 1000 && getauxval(AT_SECURE) ? 5 : 1;
     if (argc >= 2 && !strcmp(argv[1], "sleep")) {   /* for the shell test: Ctrl+C and Ctrl+Z */
         printf("sleeping...\n");
@@ -1760,6 +1932,7 @@ int main(int argc, char **argv) {
     test_memory_limits();
     test_slashes_and_brk();
     test_kernel_core();
+    test_timers();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;
