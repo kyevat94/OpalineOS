@@ -191,6 +191,7 @@ int vfs_read_vnode(struct vnode *v, void **data, u64 *size);   /* the same for a
 /* File systems and devices */
 struct block_device;
 int efs3_mount(struct block_device *dev, struct vnode **root);
+extern u32 efs3_step_blocks;   /* blocks one transaction of a big truncation frees at most (the power-cut test lowers it) */
 void efs3_info(struct vnode *root, u64 *total_blocks, u64 *free_blocks, char *label, u32 label_size);
 struct vnode *devfs_init(void);
 int pipe_create(struct file **read_end, struct file **write_end);

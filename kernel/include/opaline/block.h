@@ -40,6 +40,9 @@ bool block_flush(struct block_device *dev);
 /* Writes one physical page to a block, bypassing the cache (whose copy of that block is dropped).
    The file system journal uses it, so its blocks do not push useful ones out of the cache. */
 bool block_write_phys(struct block_device *dev, u64 block, u64 phys);
+/* Drops the cached copy of a block (the next read comes from the disk): for changes made to it in the
+   cache that must not reach the disk. */
+void block_forget(struct block_device *dev, u64 block);
 
 /* Power-cut test: after `writes` more block writes, every write is silently dropped, as if the
    power went off (the cache still believes them). block_writes() counts writes since arming. */

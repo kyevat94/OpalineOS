@@ -1916,6 +1916,92 @@ static void test_timers(void) {
     CHECK(done, "the timer checks finished within 20 s");
 }
 
+/* Writes `mib` MiB to `fd`, each MiB filled with its own letter ('a' + MiB number). */
+static int write_mib(int fd, int mib) {
+    char *buf = malloc(1 << 20);
+    int ok = buf != NULL;
+    for (int m = 0; m < mib && ok; m++) {
+        memset(buf, 'a' + m % 26, 1 << 20);
+        ok = write(fd, buf, 1 << 20) == 1 << 20;
+    }
+    free(buf);
+    return ok;
+}
+
+static void test_fs_wave2(void) {
+    printf("file systems (2):\n");
+
+    /* unlink of a directory, "." and ".." included: EISDIR; rmdir(".") stays EINVAL */
+    mkdir("/tmp/w2dir", 0755);
+    errno = 0;
+    int r1 = unlink("/tmp/w2dir/.");
+    int e1 = errno;
+    errno = 0;
+    int r2 = unlink("/tmp/w2dir/..");
+    int e2 = errno;
+    errno = 0;
+    int r3 = unlink(".");
+    int e3 = errno;
+    CHECK(r1 == -1 && e1 == EISDIR && r2 == -1 && e2 == EISDIR && r3 == -1 && e3 == EISDIR,
+          "unlink(\"dir/.\"), unlink(\"dir/..\") and unlink(\".\") fail with EISDIR");
+    errno = 0;
+    CHECK(rmdir("/tmp/w2dir/.") == -1 && errno == EINVAL, "rmdir(\"dir/.\") fails with EINVAL");
+
+    /* open of an existing directory with O_CREAT, or for writing: EISDIR */
+    const int creat_modes[] = {O_CREAT | O_WRONLY, O_CREAT | O_RDONLY, O_CREAT | O_RDWR};
+    int eisdir = 0;
+    for (int i = 0; i < 3; i++) {
+        errno = 0;
+        int fd = open("/tmp/w2dir", creat_modes[i], 0644);
+        if (fd >= 0) close(fd);
+        eisdir += fd == -1 && errno == EISDIR;
+    }
+    CHECK(eisdir == 3, "open(directory, O_CREAT | any access) fails with EISDIR");
+    errno = 0;
+    int fd = open("/tmp/w2dir", O_WRONLY);
+    int ew = errno;
+    if (fd >= 0) close(fd);
+    errno = 0;
+    int fd2 = open("/tmp/w2dir", O_RDWR);
+    int erw = errno;
+    if (fd2 >= 0) close(fd2);
+    CHECK(fd == -1 && ew == EISDIR && fd2 == -1 && erw == EISDIR, "open(directory, O_WRONLY or O_RDWR) fails with EISDIR");
+    rmdir("/tmp/w2dir");
+
+    /* big truncations and deletions run in several transactions (at most 16 MiB freed in each) */
+    const off_t cut = (1 << 20) + 1234;
+    fd = open("/tmp/w2big", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    int ok = fd >= 0 && write_mib(fd, 20);
+    struct stat st;
+    ok = ok && ftruncate(fd, cut) == 0 && fstat(fd, &st) == 0 && st.st_size == cut;
+    ok = ok && ftruncate(fd, 3 << 20) == 0;   /* grown again: zeros after the cut */
+    char c[2] = {0, 1};
+    ok = ok && pread(fd, c, 2, cut - 1) == 2 && c[0] == 'b' && c[1] == 0;
+    ok = ok && pread(fd, c, 1, (2 << 20) + 5) == 1 && c[0] == 0;
+    ok = ok && pread(fd, c, 1, 5) == 1 && c[0] == 'a';
+    CHECK(ok, "ftruncate of a 20 MiB file to 1 MiB keeps its start, and growing it again shows zeros");
+    if (fd >= 0) close(fd);
+    unlink("/tmp/w2big");
+    /* three times 20 MiB: deleted closed, deleted while open, emptied with O_TRUNC then deleted */
+    int rounds = 0;
+    for (int round = 0; round < 3; round++) {
+        fd = open("/tmp/w2big", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ok = fd >= 0 && write_mib(fd, 20);
+        if (round == 1) ok = ok && unlink("/tmp/w2big") == 0 && pread(fd, c, 1, 19 << 20) == 1 && c[0] == 't';
+        if (fd >= 0) close(fd);
+        if (round == 2) {
+            fd = open("/tmp/w2big", O_RDWR | O_TRUNC);
+            ok = ok && fd >= 0 && fstat(fd, &st) == 0 && st.st_size == 0;
+            if (fd >= 0) close(fd);
+        }
+        if (round != 1) ok = ok && unlink("/tmp/w2big") == 0;
+        ok = ok && stat("/tmp/w2big", &st) == -1 && errno == ENOENT;
+        rounds += ok;
+        unlink("/tmp/w2big");
+    }
+    CHECK(rounds == 3, "20 MiB files deleted (closed, while open, after O_TRUNC) three times over");
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1974,6 +2060,7 @@ int main(int argc, char **argv) {
     test_kernel_core();
     test_futex_unmap();
     test_timers();
+    test_fs_wave2();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;

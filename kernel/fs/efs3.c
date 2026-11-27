@@ -106,6 +106,9 @@ struct efs3 {
     u64 tx_phys[TX_MAX];          /* the staged contents, one page each */
     u32 *tx_free;                 /* blocks to free in the bitmap when the transaction commits */
     u32 tx_free_count, tx_free_cap;
+    int tx_error;                 /* the transaction could not be staged whole: it is dropped, not committed */
+    struct efs3_super sb_done;    /* the superblock as the last commit left it */
+    u32 doomed;                   /* an inode left without links, too big to free in the same transaction */
 };
 
 static const struct vnode_ops efs3_ops;
@@ -128,9 +131,12 @@ static bool bwrite(struct efs3 *fs, u64 b, const void *data) {
             if (phys_to_virt(fs->tx_phys[i]) != data) memcpy(phys_to_virt(fs->tx_phys[i]), data, BLOCK_SIZE);
             return true;
         }
-    if (fs->tx_count == tx_capacity(fs)) panic("efs3: a transaction needs more than %u metadata blocks", tx_capacity(fs));
-    u64 phys = pmm_alloc_page();
-    if (!phys) return false;
+    u64 phys = fs->tx_count < tx_capacity(fs) ? pmm_alloc_page() : 0;
+    if (!phys) {   /* the operation fails; `data` may be the cache's copy, changed: drop it */
+        if (!fs->tx_error) fs->tx_error = fs->tx_count < tx_capacity(fs) ? -ENOMEM : -ENOSPC;
+        block_forget(fs->dev, b);
+        return false;
+    }
     memcpy(phys_to_virt(phys), data, BLOCK_SIZE);
     fs->tx_block[fs->tx_count] = (u32)b;
     fs->tx_phys[fs->tx_count++] = phys;
@@ -170,14 +176,9 @@ static u32 journal_checksum(const struct jdesc *d, const u64 *phys, struct block
 static void bitmap_clear(struct efs3 *fs, u32 first_block, u32 bit);
 static bool write_super(struct efs3 *fs);
 
-/* Ends the transaction: journal, commit, write in place, mark done. */
+/* Writes the staged transaction: journal, commit, write in place, mark done. */
 static void tx_commit(struct efs3 *fs) {
-    for (u32 i = 0; i < fs->tx_free_count; i++) {   /* the deferred frees */
-        bitmap_clear(fs, fs->sb.block_bitmap, fs->tx_free[i]);
-        fs->sb.free_blocks++;
-    }
-    if (fs->tx_free_count) write_super(fs);
-    fs->tx_free_count = 0;
+    fs->sb_done = fs->sb;
     if (!fs->tx_count) return;
     if (fs->jblocks) {
         struct jdesc *d = phys_to_virt(fs->jpage);
@@ -212,6 +213,35 @@ static void tx_commit(struct efs3 *fs) {
     }
     for (u32 i = 0; i < fs->tx_count; i++) pmm_free_page(fs->tx_phys[i]);
     fs->tx_count = 0;
+}
+
+/* Drops a transaction that could not be staged whole: nothing of it reaches the disk, and the
+   cached copies its changes went through are dropped. */
+static void tx_abort(struct efs3 *fs) {
+    kprintf("EFS3: an operation needed more than one transaction can hold (error %d): it failed\n", fs->tx_error);
+    for (u32 i = 0; i < fs->tx_count; i++) {
+        block_forget(fs->dev, fs->tx_block[i]);
+        pmm_free_page(fs->tx_phys[i]);
+    }
+    fs->tx_count = 0;
+    fs->tx_free_count = 0;   /* the committed metadata still uses those blocks */
+    fs->sb = fs->sb_done;
+    fs->tx_error = 0;
+    fs->doomed = 0;
+}
+
+/* Ends the transaction: commits it, or drops it if it could not be staged whole (returns the error). */
+static int tx_end(struct efs3 *fs) {
+    for (u32 i = 0; i < fs->tx_free_count && !fs->tx_error; i++) {   /* the deferred frees */
+        bitmap_clear(fs, fs->sb.block_bitmap, fs->tx_free[i]);
+        fs->sb.free_blocks++;
+    }
+    if (fs->tx_free_count) write_super(fs);
+    fs->tx_free_count = 0;
+    int e = fs->tx_error;
+    if (e) tx_abort(fs);
+    else tx_commit(fs);
+    return e;
 }
 
 /* Writes a committed transaction found in the journal again (at mount). Returns its number, or 0. */
@@ -445,6 +475,68 @@ static void free_from(struct efs3 *fs, struct efs3_inode *in, u64 first) {
             in->dindirect = 0;
         }
     }
+}
+
+/*
+ * Big truncations (and deletions) run in steps from the end of the file, one transaction each:
+ * freeing a block stages the bitmap block of its 128 MiB group, so a fragmented file on a big disk
+ * could otherwise need more blocks than one transaction holds. Each step leaves a smaller but
+ * consistent file, so a power cut between steps only leaves the truncation unfinished.
+ */
+u32 efs3_step_blocks = 4096;   /* 16 MiB per step at most */
+
+struct step {
+    u32 groups[TX_MAX];          /* the bitmap blocks the step's frees touch */
+    u32 ngroups, max_groups;
+    u64 blocks;
+};
+
+/* Counts block `b` among those the step frees; false if it does not fit the step. */
+static bool step_add(struct step *s, u32 b) {
+    if (!b) return true;
+    if (s->blocks >= efs3_step_blocks) return false;
+    u32 g = b / (BLOCK_SIZE * 8), i = s->ngroups;
+    while (i > 0 && s->groups[i - 1] != g) i--;
+    if (!i) {
+        if (s->ngroups == s->max_groups) return false;
+        s->groups[s->ngroups++] = g;
+    }
+    s->blocks++;
+    return true;
+}
+
+/* The file block from which freeing everything up to `end` (with the indirect blocks that empties)
+   fits one transaction, going down from `end` but not below `first`. Every indirect block passed
+   counts, freed or not. Returns `first` if all of it fits. */
+static u64 step_start(struct efs3 *fs, const struct efs3_inode *in, u64 first, u64 end) {
+    struct step s = {.max_groups = tx_capacity(fs) > 24 ? tx_capacity(fs) - 16 : 8};
+    const u64 d0 = 12 + PTRS;   /* the first file block under the double indirect block */
+    u64 fb = end;
+    if (fb > MAX(first, d0) && in->dindirect) {
+        if (!step_add(&s, in->dindirect)) return fb;
+        while (fb > MAX(first, d0)) {
+            u64 j = (fb - 1 - d0) / PTRS, base = d0 + j * PTRS, lo = MAX(first, base);
+            u8 *outer = bread(fs, in->dindirect);
+            u32 inner = outer ? ((u32 *)outer)[j] : 0;
+            if (inner) {
+                if (!step_add(&s, inner)) return fb;
+                u32 *t = (u32 *)bread(fs, inner);
+                for (; t && fb > lo; fb--)
+                    if (!step_add(&s, t[fb - 1 - base])) return fb;
+            }
+            fb = lo;
+        }
+    }
+    fb = MIN(fb, MAX(first, d0));
+    if (fb > MAX(first, 12) && in->indirect) {
+        if (!step_add(&s, in->indirect)) return fb;
+        u32 *t = (u32 *)bread(fs, in->indirect);
+        for (; t && fb > MAX(first, 12); fb--)
+            if (!step_add(&s, t[fb - 1 - 12])) return fb;
+    }
+    for (fb = MIN(fb, MAX(first, 12)); fb > first; fb--)
+        if (!step_add(&s, in->direct[fb - 1])) return fb;
+    return first;
 }
 
 /* ---- file data ---------------------------------------------------------------- */
@@ -695,6 +787,8 @@ static void destroy_inode(struct efs3 *fs, u32 ino, struct efs3_inode *in) {
     free_inode(fs, ino);
 }
 
+static int destroy_committed(struct efs3 *fs, u32 ino);
+
 /*
  * Drops a reference. The drop to zero happens only under fs->lock, in the same critical section
  * that takes the vnode out of the cache: get_vnode (also under the lock) therefore never finds a
@@ -717,8 +811,7 @@ static void efs3_put(struct vnode *v) {
             break;
         }
     struct efs3_inode in;
-    if (inode_get(fs, (u32)v->ino, &in) && in.links == 0) destroy_inode(fs, (u32)v->ino, &in);   /* deleted while open */
-    tx_commit(fs);
+    if (inode_get(fs, (u32)v->ino, &in) && in.links == 0) destroy_committed(fs, (u32)v->ino);   /* deleted while open */
     mutex_unlock(&fs->lock);
     kfree(v);
 }
@@ -739,6 +832,54 @@ static void touch_dir(struct efs3 *fs, u32 ino) {
     inode_put(fs, ino, &d);
 }
 
+/* Truncates inode `ino` towards `size` in steps of one committed transaction each, until the rest
+   fits one transaction: the caller's. Called with the lock held, outside a transaction. */
+static int shrink(struct efs3 *fs, u32 ino, u64 size) {
+    u64 first = ALIGN_UP(size, BLOCK_SIZE) / BLOCK_SIZE;
+    for (;;) {
+        struct efs3_inode in;
+        if (!inode_get(fs, ino, &in)) return -EIO;
+        u64 end = ALIGN_UP(in.size, BLOCK_SIZE) / BLOCK_SIZE;
+        if (end <= first) return 0;
+        u64 cut = step_start(fs, &in, first, end);
+        if (cut <= first) return 0;
+        if (cut >= end) cut = end - 1;   /* not even one block fits: try, and fail if it does not */
+        free_from(fs, &in, cut);
+        in.size = cut * BLOCK_SIZE;
+        stamp(&in, true);
+        if (!inode_put(fs, ino, &in) && !fs->tx_error) fs->tx_error = -EIO;
+        int r = tx_end(fs);
+        if (r < 0) return r;
+    }
+}
+
+/* True if freeing all of the inode's blocks fits one transaction. */
+static bool fits_one_step(struct efs3 *fs, const struct efs3_inode *in) {
+    return step_start(fs, in, 0, ALIGN_UP(in->size, BLOCK_SIZE) / BLOCK_SIZE) == 0;
+}
+
+/* Frees an inode that has no links left and is not open, in as many transactions as its blocks
+   need: meanwhile it is an orphan (no links, still allocated), which the next mount frees if the
+   power goes off. Called with the lock held, outside a transaction. */
+static int destroy_committed(struct efs3 *fs, u32 ino) {
+    int r = shrink(fs, ino, 0);
+    struct efs3_inode in;
+    if (r == 0 && !inode_get(fs, ino, &in)) r = -EIO;
+    if (r == 0) destroy_inode(fs, ino, &in);
+    int e = tx_end(fs);
+    return r < 0 ? r : e;
+}
+
+/* Ends the transaction of an unlink or rename, then frees the inode it left without links if that
+   was too big to free inside it. */
+static int end_and_reap(struct efs3 *fs, int r) {
+    int e = tx_end(fs);
+    u32 doomed = fs->doomed;
+    fs->doomed = 0;
+    if (doomed) destroy_committed(fs, doomed);
+    return e < 0 ? e : r;
+}
+
 #define LOCKED(fs, expr)              \
     ({                                \
         mutex_lock(&(fs)->lock);      \
@@ -752,7 +893,8 @@ static void touch_dir(struct efs3 *fs, u32 ino) {
     ({                                \
         mutex_lock(&(fs)->lock);      \
         __typeof__(expr) _r = (expr); \
-        tx_commit(fs);                \
+        int _e = tx_end(fs);          \
+        if (_e < 0) _r = _e;          \
         mutex_unlock(&(fs)->lock);    \
         _r;                           \
     })
@@ -806,7 +948,12 @@ static int do_truncate(struct efs3 *fs, struct vnode *v, u64 size) {
 static int efs3_truncate(struct vnode *v, u64 size) {
     struct efs3 *fs = v->fs;
     if (v->type == VN_DIR) return -EISDIR;
-    return TX(fs, do_truncate(fs, v, size));
+    mutex_lock(&fs->lock);
+    int r = shrink(fs, (u32)v->ino, size);   /* a big cut: every step but the last */
+    if (r == 0) r = do_truncate(fs, v, size);
+    int e = tx_end(fs);
+    mutex_unlock(&fs->lock);
+    return r < 0 ? r : e;
 }
 
 static int do_lookup(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, struct vnode **out) {
@@ -873,6 +1020,7 @@ static int do_create(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
     if (type == VN_DIR) d.links++;
     stamp(&d, true);
     inode_put(fs, (u32)dir->ino, &d);
+    if (fs->tx_error) return fs->tx_error;   /* the transaction will be dropped: no vnode for it */
     *out = get_vnode(fs, ino);
     return *out ? 0 : -EIO;
 }
@@ -888,7 +1036,10 @@ static void unlink_inode(struct efs3 *fs, u32 ino, struct efs3_inode *in, bool i
     in->links = is_dir ? 0 : in->links - 1;
     stamp(in, false);
     inode_put(fs, ino, in);
-    if (in->links == 0 && !is_open(fs, ino)) destroy_inode(fs, ino, in);
+    if (in->links == 0 && !is_open(fs, ino)) {
+        if (fits_one_step(fs, in)) destroy_inode(fs, ino, in);
+        else fs->doomed = ino;   /* in steps, once this transaction has committed */
+    }
 }
 
 static int do_remove(struct efs3 *fs, struct vnode *dir, const char *name, u32 len, bool is_dir) {
@@ -917,7 +1068,10 @@ static int do_remove(struct efs3 *fs, struct vnode *dir, const char *name, u32 l
 
 static int efs3_remove(struct vnode *dir, const char *name, u32 len, bool is_dir) {
     struct efs3 *fs = dir->fs;
-    return TX(fs, do_remove(fs, dir, name, len, is_dir));
+    mutex_lock(&fs->lock);
+    int r = end_and_reap(fs, do_remove(fs, dir, name, len, is_dir));
+    mutex_unlock(&fs->lock);
+    return r;
 }
 
 /* True if directory `ino` is `ancestor` or lies inside it (follows ".." up to the root). */
@@ -995,7 +1149,10 @@ static int do_rename(struct efs3 *fs, struct vnode *od, const char *on, u32 ol, 
 static int efs3_rename(struct vnode *od, const char *on, u32 ol, struct vnode *nd, const char *nn, u32 nl) {
     struct efs3 *fs = od->fs;
     if (nd->fs != fs) return -EXDEV;
-    return TX(fs, do_rename(fs, od, on, ol, nd, nn, nl));
+    mutex_lock(&fs->lock);
+    int r = end_and_reap(fs, do_rename(fs, od, on, ol, nd, nn, nl));
+    mutex_unlock(&fs->lock);
+    return r;
 }
 
 struct readdir_ctx {
@@ -1233,6 +1390,7 @@ int efs3_mount(struct block_device *dev, struct vnode **root) {
     } else {
         kprintf("EFS3: version 1 file system: no journal\n");
     }
+    fs->sb_done = fs->sb;
     fs->block_hint = fs->sb.first_data;
     fs->inode_hint = 1;
     mutex_lock(&fs->lock);
@@ -1242,11 +1400,8 @@ int efs3_mount(struct block_device *dev, struct vnode **root) {
         u8 *bm = bread(fs, fs->sb.inode_bitmap + ino / (BLOCK_SIZE * 8));
         if (!bm || !(bm[(ino % (BLOCK_SIZE * 8)) / 8] & (1 << (ino % 8)))) continue;
         struct efs3_inode in;
-        if (ino != fs->sb.root_inode && inode_get(fs, ino, &in) && in.links == 0) {
-            destroy_inode(fs, ino, &in);
-            tx_commit(fs);
+        if (ino != fs->sb.root_inode && inode_get(fs, ino, &in) && in.links == 0 && destroy_committed(fs, ino) == 0)
             orphans++;
-        }
     }
     if (orphans) kprintf("EFS3: %u orphaned inode(s) freed\n", orphans);
     *root = get_vnode(fs, fs->sb.root_inode);

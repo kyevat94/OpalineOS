@@ -428,7 +428,7 @@ int vfs_open(const char *path, struct vnode *cwd, u32 flags, u32 mode, struct fi
         return -ELOOP;
     }
     u32 acc = flags & O_ACCMODE;
-    if (v->type == VN_DIR && acc != O_RDONLY) {
+    if (v->type == VN_DIR && (acc != O_RDONLY || (flags & O_CREAT))) {   /* O_CREAT on a directory too (Linux) */
         vnode_put(v);
         return -EISDIR;
     }
@@ -542,12 +542,22 @@ int vfs_mkdir(const char *path, struct vnode *cwd, u32 mode) {
     return r;
 }
 
+/* The last name in `path` is "." or ".." (trailing slashes aside). */
+static bool ends_in_dot(const char *path) {
+    u64 n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;
+    u64 at = n;
+    while (at > 0 && path[at - 1] != '/') at--;
+    return is_dot(path + at, (u32)(n - at));
+}
+
 int vfs_remove(const char *path, struct vnode *cwd, bool is_dir) {
     struct vnode *parent;
     char name[NAME_MAX + 1];
     u32 len;
     bool slash;
     int r = lookup_parent(path, cwd, &parent, name, &len, &slash);
+    if (r == -EINVAL && !is_dir && ends_in_dot(path)) return -EISDIR;   /* unlink(".") (Linux); rmdir(".") stays EINVAL */
     if (r < 0) return r;
     if (slash && !is_dir) {   /* unlink("name/") removes nothing (Linux): ENOENT, EISDIR or ENOTDIR */
         r = must_be_dir(parent, name, len);
