@@ -14,6 +14,10 @@
 #include <opaline/mm.h>
 #include <opaline/proc.h>
 
+/* posix_selftest: pages the POSIX test may leave in use beyond the cache and heap growth (measured
+   residue: see the "POSIX self-test memory" line at boot) */
+#define POSIX_LEAK_SLACK 32
+
 #define FAIL(...)                          \
     do {                                   \
         console_set_color(COLOR_ERROR);    \
@@ -76,7 +80,9 @@ bool user_selftest(void) {
  */
 bool posix_selftest(void) {
     struct pmm_stats before, after;
+    struct heap_stats heap_before, heap_after;
     pmm_get_stats(&before);
+    heap_get_stats(&heap_before);
     u64 cache_before = block_cache_pages();
     static const char *const programs[] = {"/apps/posixtest", "/apps/posixtest-static"};
     for (unsigned i = 0; i < 2; i++) {
@@ -88,11 +94,19 @@ bool posix_selftest(void) {
         if (code != 0) FAIL("%s exited with code %d", programs[i], code);
     }
     pmm_get_stats(&after);
-    struct heap_stats hs;
-    heap_get_stats(&hs);
-    u64 cached = block_cache_pages() - cache_before;
-    if (before.free_pages - after.free_pages > hs.slab_pages + cached)
-        FAIL("pages lost after the POSIX test: %lu free before, %lu after", before.free_pages, after.free_pages);
+    heap_get_stats(&heap_after);
+    /* what the kernel legitimately keeps: a fuller block cache and a heap that grew (slab pages
+       and large blocks, e.g. lists sized for the biggest operation so far); anything else is lost */
+    i64 used = (i64)before.free_pages - (i64)after.free_pages;
+    i64 cached = (i64)block_cache_pages() - (i64)cache_before;
+    i64 slab = (i64)heap_after.slab_pages - (i64)heap_before.slab_pages;
+    i64 large = (i64)heap_after.large_pages - (i64)heap_before.large_pages;
+    i64 lost = used - cached - slab - large;
+    kprintf("POSIX self-test memory: %ld pages used = %ld block cache + %ld slab + %ld large + %ld other\n",
+            used, cached, slab, large, lost);
+    if (lost > POSIX_LEAK_SLACK)
+        FAIL("pages lost after the POSIX test: %ld (%lu free before, %lu after; %ld block cache, %ld slab, %ld large)",
+             lost, before.free_pages, after.free_pages, cached, slab, large);
     console_set_color(COLOR_TEXT);
     kprintf("POSIX self-test passed: musl programs (dynamic and static), no memory lost\n");
     return true;

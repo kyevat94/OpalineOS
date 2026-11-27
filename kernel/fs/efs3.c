@@ -238,6 +238,11 @@ static int tx_end(struct efs3 *fs) {
     }
     if (fs->tx_free_count) write_super(fs);
     fs->tx_free_count = 0;
+    if (fs->tx_free_cap > 256) {   /* grown by a big deletion: give its pages back instead of keeping them */
+        kfree(fs->tx_free);
+        fs->tx_free = NULL;
+        fs->tx_free_cap = 0;
+    }
     int e = fs->tx_error;
     if (e) tx_abort(fs);
     else tx_commit(fs);

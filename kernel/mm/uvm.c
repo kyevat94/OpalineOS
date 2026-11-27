@@ -95,6 +95,20 @@ void memobj_sync(struct memobj *obj) {
     mutex_unlock(&obj->lock);
 }
 
+void memobj_read(struct memobj *obj, u64 offset, void *buf, u64 len) {
+    /* as if memobj_sync had run first, but only for these pages: O(len), not O(cached pages) */
+    if (!obj->file || !obj->writable || !obj->file->ops->write || !obj->file->ops->stat) return;
+    for (u64 at = offset; at < offset + len;) {
+        u64 index = at / PAGE_SIZE, in_page = at % PAGE_SIZE, n = MIN(PAGE_SIZE - in_page, offset + len - at);
+        mutex_lock(&obj->lock);
+        u64 phys = index < obj->count ? obj->pages[index] : 0;
+        mutex_unlock(&obj->lock);
+        /* copied unlocked: buf may be user memory; the page stays while the caller holds obj */
+        if (phys) memcpy((u8 *)buf + (at - offset), (const u8 *)phys_to_virt(phys) + in_page, n);
+        at += n;
+    }
+}
+
 void memobj_written(struct memobj *obj, u64 offset, const void *data, u64 len) {
     mutex_lock(&obj->lock);
     for (u64 at = offset; at < offset + len;) {
@@ -176,9 +190,14 @@ static bool split_vma(struct vma *v, u64 at) {
     return true;
 }
 
+/* The present pages of [start, end): untouched spans (a whole reservation) cost nothing. */
+#define for_each_mapped(mm, a, start, end)                                        \
+    for (u64 a = vmm_next_mapped_in((mm)->page_table, (start), (end)); a < (end); \
+         a = vmm_next_mapped_in((mm)->page_table, a + PAGE_SIZE, (end)))
+
 /* Drops the pages of [start, end) from the page table. */
 static void release_pages(struct mm *mm, u64 start, u64 end) {
-    for (u64 a = start; a < end; a += PAGE_SIZE) {
+    for_each_mapped(mm, a, start, end) {
         u64 phys = vmm_unmap_in(mm->page_table, a);
         if (phys != VMM_NOT_MAPPED) pmm_page_put(phys);
     }
@@ -218,8 +237,10 @@ static u64 ensure_page(struct mm *mm, struct vma *v, u64 page, bool write) {
         phys = pmm_alloc_page();
         if (!phys) return 0;
         memset(phys_to_virt(phys), 0, PAGE_SIZE);
-        if (v->file && v->file->ops->read)   /* a private copy of the file data; past the end: zero */
-            v->file->ops->read(v->file, v->offset + (page - v->start), phys_to_virt(phys), PAGE_SIZE);
+        /* a private copy of the file data, with what shared mappings wrote and did not sync yet (as read()
+           sees it); past the end: zero */
+        if (v->file && v->file->ops->read)
+            vnode_read_at(v->file, v->offset + (page - v->start), phys_to_virt(phys), PAGE_SIZE);
     }
     if (!vmm_map_in(mm->page_table, page, phys, vmm_flags(v->prot))) {
         pmm_page_put(phys);
@@ -277,7 +298,7 @@ struct mm *mm_fork(struct mm *src) {
         if (v->obj) continue;   /* shared: the child finds the same pages when it touches them */
         /* private: both sides keep the pages read-only until one of them writes */
         u32 flags = vmm_flags(v->prot) & ~(u32)VMM_WRITE;
-        for (u64 a = v->start; a < v->end; a += PAGE_SIZE) {
+        for_each_mapped(src, a, v->start, v->end) {
             u64 pte, phys = vmm_translate_in(src->page_table, a, &pte);
             if (phys == VMM_NOT_MAPPED) continue;
             phys = ALIGN_DOWN(phys, PAGE_SIZE);
@@ -448,7 +469,7 @@ int mm_protect(struct mm *mm, u64 addr, u64 len, u32 prot) {
         }
         v->prot = prot;
         if (v->obj && (prot & PROT_WRITE)) v->obj->writable = true;
-        for (u64 a = v->start; a < v->end; a += PAGE_SIZE) {
+        for_each_mapped(mm, a, v->start, v->end) {
             u64 phys = vmm_translate_in(mm->page_table, a, NULL);
             if (phys == VMM_NOT_MAPPED) continue;
             u32 flags = vmm_flags(prot);
@@ -663,8 +684,7 @@ u64 mm_pages(struct mm *mm) {
     u64 n = 0;
     mutex_lock(&mm->lock);
     for (struct vma *v = mm->vmas; v; v = v->next)
-        for (u64 a = v->start; a < v->end; a += PAGE_SIZE)
-            if (vmm_translate_in(mm->page_table, a, NULL) != VMM_NOT_MAPPED) n++;
+        for_each_mapped(mm, a, v->start, v->end) n++;
     mutex_unlock(&mm->lock);
     return n;
 }

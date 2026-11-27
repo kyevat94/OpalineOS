@@ -10,7 +10,8 @@
  *
  * Kinds of areas:
  *   private anonymous   zero-filled pages of this process (heap, stack, malloc)
- *   private file        a copy of the file's data, written changes stay private
+ *   private file        a copy of the file's data (with what shared mappings wrote,
+ *                       synced or not), written changes stay private
  *   shared              the pages of a memory object (struct memobj): a file's page
  *                       cache (MAP_SHARED of a file) or shared anonymous memory;
  *                       every process mapping it sees the same pages
@@ -122,6 +123,9 @@ void mm_futex_key(struct mm *mm, u64 addr, bool private_op, void **space, u64 *o
 
 /* The page cache side of shared file mappings (used by the VFS). */
 void memobj_sync(struct memobj *obj);       /* writes the pages back to the file */
+/* read() got len bytes of the file at offset into buf: the cached pages of a writable mapping
+   replace them (they hold the newest data; the file gets it on sync). */
+void memobj_read(struct memobj *obj, u64 offset, void *buf, u64 len);
 void memobj_written(struct memobj *obj, u64 offset, const void *data, u64 len);   /* write() went to the file */
 /* The file's page cache with a reference (NULL: no shared mapping); memobj_put releases it. */
 struct memobj *vnode_memobj_get(struct vnode *v);

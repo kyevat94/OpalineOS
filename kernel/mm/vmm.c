@@ -323,6 +323,28 @@ u64 vmm_translate_in(u64 page_table, u64 virt, u64 *pte_out) {
     return (e & PTE_ADDR) + (virt & (PAGE_SIZE - 1));
 }
 
+u64 vmm_next_mapped_in(u64 page_table, u64 virt, u64 end) {
+    u64 *pml4 = phys_to_virt(page_table);
+    while (virt < end) {   /* an absent table skips its whole span: 512 GiB, 1 GiB or 2 MiB */
+        u64 *pdpt = next_table(pml4, (virt >> 39) & 511, false, false);
+        if (!pdpt) {
+            virt = ALIGN_DOWN(virt, 512 * GiB) + 512 * GiB;
+            continue;
+        }
+        u64 *pd = next_table(pdpt, (virt >> 30) & 511, false, false);
+        if (!pd) {
+            virt = ALIGN_DOWN(virt, GiB) + GiB;
+            continue;
+        }
+        u64 *pt = next_table(pd, (virt >> 21) & 511, false, false);
+        u64 stop = MIN(end, ALIGN_DOWN(virt, SIZE_2M) + SIZE_2M);
+        for (; pt && virt < stop; virt += PAGE_SIZE)
+            if (pt[(virt >> 12) & 511] & PTE_PRESENT) return virt;
+        virt = stop;
+    }
+    return end;
+}
+
 void vmm_destroy_address_space(u64 page_table) {
     if (page_table == kernel_pml4_phys) panic("vmm: refusing to destroy the kernel address space");
     if (read_cr3() == page_table) panic("vmm: destroying the active address space");
