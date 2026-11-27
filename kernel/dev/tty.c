@@ -20,6 +20,7 @@
  */
 #include <opaline/console.h>
 #include <opaline/errno.h>
+#include <opaline/mm.h>
 #include <opaline/proc.h>
 #include <opaline/sched.h>
 #include <opaline/spinlock.h>
@@ -87,6 +88,11 @@ void tty_set_foreground(u64 sid, u64 pgid) {
 }
 
 u64 tty_session(void) { return tty.sid; }
+
+/* As on Linux, the terminal of a session whose leader exited can be taken by another session. */
+void tty_session_ended(u64 sid) {
+    if (tty.sid == sid) tty.sid = tty.fg = 0;
+}
 
 /* ---- drawing (all with the console lock held) ------------------------------------------ */
 
@@ -443,12 +449,8 @@ static i64 read_raw(char *buf, u64 len) {
     return (i64)n;
 }
 
-static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
-    (void)v, (void)off;
-    int bg = background_check(SIGTTIN);
-    if (bg < 0) return bg;
-    if (len == 0) return 0;
-    if (!(tty.tio.lflag & ICANON)) return read_raw(buf, len);
+/* Canonical mode: at most one line. */
+static i64 read_line(char *buf, u64 len) {
     u64 f = irq_save();
     while (tty.ready_len == 0 && tty.eof_pending == 0) {
         if (thread_current()->io_nonblock) {
@@ -465,22 +467,48 @@ static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
         irq_restore(f);
         return 0;
     }
-    /* return at most one line */
     u64 n = 0;
     while (n < len && tty.ready_len > 0) {
         char c = tty.ready[tty.ready_head];
         tty.ready_head = (tty.ready_head + 1) % READY_MAX;
         tty.ready_len--;
-        ((char *)buf)[n++] = c;
+        buf[n++] = c;
         if (c == '\n') break;
     }
     irq_restore(f);
     return (i64)n;
 }
 
+static i64 tty_read(struct vnode *v, u64 off, void *buf, u64 len) {
+    (void)v, (void)off;
+    int bg = background_check(SIGTTIN);
+    if (bg < 0) return bg;
+    if (len == 0) return 0;
+    /* the ring is read with interrupts off, user memory only touched with them on: a user access
+       may fault and sleep on mm->lock (see pipe.c), so the bytes go through a bounce buffer */
+    len = MIN(len, (u64)READY_MAX);   /* never more is there */
+    char *bounce = kmalloc(len);
+    if (!bounce) return -ENOMEM;
+    i64 n = tty.tio.lflag & ICANON ? read_line(bounce, len) : read_raw(bounce, len);
+    if (n > 0) memcpy(buf, bounce, (u64)n);
+    kfree(bounce);
+    return n;
+}
+
 static i64 tty_write(struct vnode *v, u64 off, const void *buf, u64 len) {
     (void)v, (void)off;
-    kputs(buf, len);
+    /* kputs holds the console lock (interrupts off): user memory goes through a bounce buffer */
+    enum { CHUNK = 4096 };
+    if (len == 0) return 0;
+    char *bounce = kmalloc(MIN(len, (u64)CHUNK));
+    if (!bounce) return -ENOMEM;
+    for (u64 done = 0; done < len;) {
+        u64 n = MIN(len - done, (u64)CHUNK);
+        memcpy(bounce, (const char *)buf + done, n);
+        kputs(bounce, n);
+        done += n;
+    }
+    kfree(bounce);
     return (i64)len;
 }
 

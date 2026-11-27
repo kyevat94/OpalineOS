@@ -463,14 +463,13 @@ i64 sys_sigaltstack(u64 ss, u64 old, u64 sp) {   /* sp: the caller's stack point
         if (n.flags == SS_ONSTACK) n.flags = 0;   /* accepted and ignored, as on Linux */
         if (n.flags & ~SS_DISABLE) return -EINVAL;
     }
-    if (old) {
-        if (!user_ok(old, sizeof(struct stack_k), true)) return -EFAULT;
-        struct stack_k *o = (struct stack_k *)old;
-        o->sp = t->altstack_sp;
-        o->size = t->altstack_size;
-        o->flags = !t->altstack_size ? SS_DISABLE : on_altstack(t, sp) ? SS_ONSTACK : 0;
-        o->pad = 0;
-    }
+    /* the old stack is written only if the call succeeds (as on Linux) */
+    if (old && !user_ok(old, sizeof(struct stack_k), true)) return -EFAULT;
+    struct stack_k o = {
+        .sp = t->altstack_sp,
+        .flags = !t->altstack_size ? SS_DISABLE : on_altstack(t, sp) ? SS_ONSTACK : 0,
+        .size = t->altstack_size,
+    };
     if (ss) {
         if (on_altstack(t, sp)) return -EPERM;   /* the stack in use cannot change */
         if (n.flags & SS_DISABLE) {
@@ -483,5 +482,6 @@ i64 sys_sigaltstack(u64 ss, u64 old, u64 sp) {   /* sp: the caller's stack point
             t->altstack_flags = 0;
         }
     }
+    if (old) *(struct stack_k *)old = o;
     return 0;
 }

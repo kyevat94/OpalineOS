@@ -198,6 +198,7 @@ struct vnode *tty_vnode(void);
 void powercut_test(u64 cut_after);              /* kernel/fs/powercut.c */
 void tty_set_foreground(u64 sid, u64 pgid);    /* job control (stage SE1) */
 u64 tty_session(void);
+void tty_session_ended(u64 sid);               /* its leader exited: the terminal is free again */
 void tty_input(const char *utf8, u32 len);     /* keyboard -> terminal */
 void tty_init(void);
 void keyboard_init(void);

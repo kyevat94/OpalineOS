@@ -71,12 +71,24 @@ static bool kernel_user_fault(struct interrupt_frame *f) {
     if (addr >= USER_TOP || !p || !p->user || !p->mm || p->mm->lock.owner == thread_current()) return false;
     if (f->rflags & 0x200) __asm__ volatile("sti");
     bool ok = mm_fault(p->mm, addr, fault_access(f->error));
+    u64 page = ok ? 0 : pmm_alloc_page();
+    if (page) {
+        /* the address may still hold a page (one made read-only meanwhile, for a write): it goes
+           as on munmap, so its reference is not lost; the lock keeps other threads' changes whole */
+        memset(phys_to_virt(page), 0, PAGE_SIZE);
+        u64 va = ALIGN_DOWN(addr, PAGE_SIZE);
+        mutex_lock(&p->mm->lock);
+        u64 old = vmm_unmap_in(p->mm->page_table, va);
+        if (old != VMM_NOT_MAPPED) pmm_page_put(old);
+        if (!vmm_map_in(p->mm->page_table, va, page, VMM_WRITE)) {
+            pmm_free_page(page);
+            page = 0;
+        }
+        mutex_unlock(&p->mm->lock);
+    }
     __asm__ volatile("cli");
     if (ok) return true;
-    u64 page = pmm_alloc_page();
     if (!page) return false;
-    memset(phys_to_virt(page), 0, PAGE_SIZE);
-    vmm_map_in(p->mm->page_table, ALIGN_DOWN(addr, PAGE_SIZE), page, VMM_WRITE);
     process_kill(p, SIGSEGV);
     return true;
 }

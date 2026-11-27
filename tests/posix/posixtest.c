@@ -1535,6 +1535,117 @@ static void test_memory_limits(void) {
     CHECK(regrown && usable, "brk grows again afterwards and the memory is usable");
 }
 
+/* ---- stage SE4: kernel core (review fixes) -------------------------------------------------- */
+
+static pthread_barrier_t exec_barrier;
+static void *exec_racer(void *arg) {
+    (void)arg;
+    char *argv[] = {(char *)self_path, "exec-child", "arg with spaces", NULL};
+    char *envp[] = {"OPALINE_TEST=yes", NULL};
+    pthread_barrier_wait(&exec_barrier);
+    execve(self_path, argv, envp);
+    return NULL;   /* the other thread's execve won: this one ends with it */
+}
+
+static stack_t alt_old;
+static int alt_old_err;
+static void on_alt_old(int sig) {
+    (void)sig;
+    stack_t other = {.ss_sp = malloc(SIGSTKSZ), .ss_size = SIGSTKSZ, .ss_flags = 0};
+    memset(&alt_old, 0x5A, sizeof alt_old);
+    alt_old_err = sigaltstack(&other, &alt_old) == -1 ? errno : 0;
+    free(other.ss_sp);
+}
+
+static int all_bytes(const void *p, int byte, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (((const unsigned char *)p)[i] != byte) return 0;
+    return 1;
+}
+
+static void test_kernel_core(void) {
+    printf("kernel core:\n");
+    int status;
+
+    /* kill(-1) reaches every process, however many: 80 of them, more than one batch of 64 */
+    pid_t pid = fork();
+    if (pid == 0) {
+        uid_t uid = 30000 + (uid_t)(getpid() % 10000);   /* a user nobody else runs as */
+        setsid();
+        setgroups(0, NULL);
+        if (setgid(uid) || setuid(uid)) _exit(200);
+        enum { N = 80 };
+        pid_t kids[N];
+        for (int i = 0; i < N; i++) {
+            if ((kids[i] = fork()) == 0) {
+                for (;;) pause();
+            }
+            if (kids[i] < 0) _exit(2);
+        }
+        struct timespec ms10 = {0, 10 * 1000000};
+        nanosleep(&ms10, NULL);
+        if (kill(-1, SIGTERM) != 0) _exit(3);
+        int dead = 0;
+        for (int tries = 0; tries < 300 && dead < N; tries++) {   /* up to 3 s */
+            int st;
+            while (waitpid(-1, &st, WNOHANG) > 0) dead += WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM;
+            if (dead < N) nanosleep(&ms10, NULL);
+        }
+        for (int i = 0; i < N; i++) kill(kids[i], SIGKILL);   /* survivors, if the check fails */
+        while (wait(NULL) > 0) {}
+        _exit(dead == N ? 0 : 4);
+    }
+    int done = wait_poking(pid, 0, 10000, &status);
+    CHECK(done && exited_with(status, 0), "kill(-1) as an ordinary user ends all 80 of its processes");
+
+    /* two threads call execve at once: one wins, the other ends (no deadlock); a few rounds, since
+       both must be inside execve together for the old deadlock */
+    int rounds_ok = 0;
+    for (int round = 0; round < 5; round++) {
+        pid = fork();
+        if (pid == 0) {
+            pthread_barrier_init(&exec_barrier, NULL, 2);
+            pthread_t t[2];
+            for (int i = 0; i < 2; i++) pthread_create(&t[i], NULL, exec_racer, NULL);
+            for (;;) pause();
+        }
+        rounds_ok += wait_poking(pid, 0, 5000, &status) && exited_with(status, 7);
+    }
+    CHECK(rounds_ok == 5, "two threads calling execve at once: one program runs");
+
+    /* the terminal of a session whose leader exited is free again */
+    pid = fork();
+    if (pid == 0) _exit(setsid() > 0 && ioctl(0, TIOCSCTTY, 1) == 0 ? 0 : 1);   /* root takes it */
+    waitpid(pid, &status, 0);
+    int taken = exited_with(status, 0);
+    pid = fork();
+    if (pid == 0) {
+        uid_t uid = 30000 + (uid_t)(getpid() % 10000);
+        setsid();
+        setgroups(0, NULL);
+        if (setgid(uid) || setuid(uid)) _exit(200);
+        _exit(ioctl(0, TIOCSCTTY, 0) == 0 ? 0 : 1);
+    }
+    waitpid(pid, &status, 0);
+    CHECK(taken && exited_with(status, 0), "after a session leader with the terminal exits, another session takes it");
+    CHECK(ioctl(0, TIOCSCTTY, 1) == 0 && tcgetpgrp(0) == getpgrp(), "and this test takes it back");
+
+    /* sigaltstack on the alternate stack: EPERM, and the old stack is not written */
+    stack_t s = {.ss_sp = malloc(SIGSTKSZ), .ss_size = SIGSTKSZ, .ss_flags = 0};
+    sigaltstack(&s, NULL);
+    struct sigaction aa = {0};
+    aa.sa_handler = on_alt_old;
+    aa.sa_flags = SA_ONSTACK;
+    sigaction(SIGUSR1, &aa, NULL);
+    raise(SIGUSR1);
+    CHECK(alt_old_err == EPERM && all_bytes(&alt_old, 0x5A, sizeof alt_old),
+          "sigaltstack failing with EPERM leaves the old stack untouched");
+    signal(SIGUSR1, SIG_DFL);
+    stack_t off = {.ss_flags = SS_DISABLE};
+    sigaltstack(&off, NULL);
+    free(s.ss_sp);
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc >= 2 && !strcmp(argv[1], "rawkeys")) {
@@ -1585,6 +1696,7 @@ int main(int argc, char **argv) {
     test_fs_details();
     test_signals_cpu();
     test_memory_limits();
+    test_kernel_core();
     printf("posixtest: %d checks, %d failures\n", checks, failures);
     if (!failures) printf("POSIXTEST_OK %s\n", argv[0]);
     return failures ? 1 : 0;
