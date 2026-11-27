@@ -425,6 +425,11 @@ int process_execve(struct interrupt_frame *f, const char *path, const char *cons
     }
     /* the new program is loaded: the other threads end now (as on Linux), then this one carries on */
     u64 lf = spin_lock(&list_lock);
+    if (p->exec_thread || t->exit_pending) {   /* another thread's execve won meanwhile: it ends this one */
+        spin_unlock(&list_lock, lf);
+        mm_put(mm);
+        return -EAGAIN;
+    }
     p->exec_thread = t;
     for (struct thread *o = p->threads; o; o = o->proc_next)
         if (o != t) {
@@ -578,6 +583,7 @@ void process_kill(struct process *p, int sig) {
 static NORETURN void process_finish(struct process *p, int code) {
     if (!p->exiting) p->exit_code = code;
     close_files(p);
+    if (p->pid == p->sid) tty_session_ended(p->sid);
 
     /* children nobody will wait for any more are freed when they end */
     struct process *collect = NULL;
@@ -782,53 +788,62 @@ i64 process_setsid(void) {
     return (i64)me->sid;
 }
 
-int process_signal_group(u64 pgid, int sig, bool check) {
-    /* references first: sending may take locks that the list lock must not hold */
-    struct process *targets[64];
-    int n = 0, found = 0, sent = 0;
+/*
+ * Sends sig (0: none) to every user process that `wanted` accepts and, with `check`, the caller may
+ * signal. References first: sending may take locks that the list lock must not hold. So it goes in
+ * batches in pid order, each pass taking the lowest pids above the last batch: none is missed or
+ * signalled twice, however many there are. Processes started meanwhile are left alone (as on
+ * Linux). Returns how many it found; *sent: how many of them it signalled; *err: a send's error.
+ */
+static int signal_each(bool (*wanted)(const struct process *p, const void *arg), const void *arg, int sig,
+                       bool check, int *sent, int *err) {
+    enum { BATCH = 64 };
+    struct process *batch[BATCH];
     const struct cred *me = cred_current();
-    u64 f = spin_lock(&list_lock);
-    for (struct process *p = all_processes; p; p = p->all_next) {
-        if (p->state != PROCESS_ALIVE || p->pgid != pgid || !p->user) continue;
-        found++;
-        if (check && !cred_may_signal(me, &p->cred)) continue;
-        if (n < 64) {
-            p->refs++;
-            targets[n++] = p;
+    u64 last = 0, limit = 0;
+    int found = 0;
+    *sent = *err = 0;
+    for (bool first = true;; first = false) {
+        int n = 0;
+        u64 f = spin_lock(&list_lock);
+        if (first) limit = next_id;   /* ids from here on are processes started meanwhile */
+        for (struct process *p = all_processes; p; p = p->all_next) {
+            if (p->pid <= last || p->pid >= limit || p->state != PROCESS_ALIVE || !p->user || !wanted(p, arg)) continue;
+            if (first) found++;
+            if (check && !cred_may_signal(me, &p->cred)) continue;
+            if (n == BATCH && p->pid > batch[BATCH - 1]->pid) continue;
+            int i = n < BATCH ? n++ : BATCH - 1;   /* a full batch drops its highest pid */
+            for (; i > 0 && batch[i - 1]->pid > p->pid; i--) batch[i] = batch[i - 1];
+            batch[i] = p;
         }
+        for (int i = 0; i < n; i++) batch[i]->refs++;
+        spin_unlock(&list_lock, f);
+        if (n) last = batch[n - 1]->pid;
+        for (int i = 0; i < n; i++) {
+            if (sig) {
+                int e = signal_send_process(batch[i], sig);
+                if (e) *err = e;
+            }
+            process_put(batch[i]);
+        }
+        *sent += n;
+        if (n < BATCH) return found;
     }
-    spin_unlock(&list_lock, f);
-    for (int i = 0; i < n; i++) {
-        if (sig) signal_send_process(targets[i], sig);
-        sent++;
-        process_put(targets[i]);
-    }
+}
+
+static bool in_group(const struct process *p, const void *pgid) { return p->pgid == *(const u64 *)pgid; }
+
+int process_signal_group(u64 pgid, int sig, bool check) {
+    int sent, err;
+    int found = signal_each(in_group, &pgid, sig, check, &sent, &err);
     return !found ? -ESRCH : !sent ? -EPERM : 0;
 }
 
+static bool not_init_or_caller(const struct process *p, const void *caller) { return p->pid != 1 && p != caller; }
+
 int process_signal_all(struct process *caller, int sig) {
     /* as Linux: every process but pid 1 and the caller; those it may not signal are skipped silently */
-    struct process *targets[64];
-    int n = 0, found = 0;
-    const struct cred *me = cred_current();
-    u64 f = spin_lock(&list_lock);
-    for (struct process *p = all_processes; p; p = p->all_next) {
-        if (p->state != PROCESS_ALIVE || !p->user || p->pid == 1 || p == caller) continue;
-        found++;
-        if (!cred_may_signal(me, &p->cred)) continue;
-        if (n < 64) {
-            p->refs++;
-            targets[n++] = p;
-        }
-    }
-    spin_unlock(&list_lock, f);
-    int r = 0;
-    for (int i = 0; i < n; i++) {
-        if (sig) {
-            int e = signal_send_process(targets[i], sig);
-            if (e) r = e;
-        }
-        process_put(targets[i]);
-    }
-    return found ? r : -ESRCH;
+    int sent, err;
+    int found = signal_each(not_init_or_caller, caller, sig, true, &sent, &err);
+    return found ? err : -ESRCH;
 }

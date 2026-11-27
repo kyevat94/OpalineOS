@@ -23,26 +23,36 @@ struct pipe {
     struct waitqueue wait;      /* readers and writers both wait here */
 };
 
+/*
+ * The ring is changed with interrupts off, but user memory is only touched with them on, through
+ * a bounce buffer: a user access may fault (a copy-on-write page after another thread's fork, or
+ * memory another thread unmapped), and the fault handler may sleep on mm->lock, which with
+ * interrupts off would let another reader or writer change the ring under this one.
+ */
 static i64 pipe_read(struct vnode *v, u64 off, void *out, u64 n) {
     (void)off;
     struct pipe *p = v->priv;
     if (n == 0) return 0;
+    u8 *bounce = kmalloc(MIN(n, (u64)PIPE_SIZE));
+    if (!bounce) return -ENOMEM;
     u64 f = irq_save();
-    while (p->len == 0 && p->writers > 0) {
-        if (thread_current()->io_nonblock) {
-            irq_restore(f);
-            return -EAGAIN;
-        }
-        if (waitqueue_wait_intr(&p->wait) < 0) {   /* a signal arrived */
-            irq_restore(f);
-            return -EINTR;
-        }
+    i64 err = 0;
+    while (p->len == 0 && p->writers > 0 && !err) {
+        if (thread_current()->io_nonblock) err = -EAGAIN;
+        else if (waitqueue_wait_intr(&p->wait) < 0) err = -EINTR;   /* a signal arrived */
     }
-    u64 got = MIN(n, (u64)p->len);
-    for (u64 i = 0; i < got; i++) ((u8 *)out)[i] = p->buf[(p->head + i) % PIPE_SIZE];
+    if (err) {
+        irq_restore(f);
+        kfree(bounce);
+        return err;
+    }
+    u64 got = MIN(MIN(n, (u64)PIPE_SIZE), (u64)p->len);
+    for (u64 i = 0; i < got; i++) bounce[i] = p->buf[(p->head + i) % PIPE_SIZE];
     p->head = (u32)((p->head + got) % PIPE_SIZE);
     p->len -= (u32)got;
     irq_restore(f);
+    memcpy(out, bounce, got);
+    kfree(bounce);
     if (got) {
         waitqueue_wake_all(&p->wait);
         vfs_poll_notify();
@@ -53,38 +63,47 @@ static i64 pipe_read(struct vnode *v, u64 off, void *out, u64 n) {
 static i64 pipe_write(struct vnode *v, u64 off, const void *in, u64 n) {
     (void)off;
     struct pipe *p = v->priv;
+    if (n == 0) return 0;
+    u8 *bounce = kmalloc(MIN(n, (u64)PIPE_SIZE));
+    if (!bounce) return -ENOMEM;
     u64 done = 0;
-    while (done < n) {
-        u64 f = irq_save();
+    i64 err = 0;
+    while (done < n && !err) {
         u64 want = MIN(n - done, (u64)PIPE_SIZE);   /* small writes go in one piece */
+        memcpy(bounce, (const u8 *)in + done, want);
+        u64 f = irq_save();
         if (thread_current()->io_nonblock && p->readers > 0 && PIPE_SIZE - p->len < want) {
             /* O_NONBLOCK: a small write goes whole or not at all; a big one takes what fits */
             u64 room = PIPE_SIZE - p->len;
             if (n - done <= PIPE_SIZE || room == 0) {
                 irq_restore(f);
-                return done ? (i64)done : -EAGAIN;
+                err = -EAGAIN;
+                break;
             }
             want = room;
         }
-        while (p->readers > 0 && PIPE_SIZE - p->len < want)
-            if (waitqueue_wait_intr(&p->wait) < 0) {
-                irq_restore(f);
-                return done ? (i64)done : -EINTR;
-            }
+        while (p->readers > 0 && PIPE_SIZE - p->len < want && !err)
+            if (waitqueue_wait_intr(&p->wait) < 0) err = -EINTR;
+        if (err) {
+            irq_restore(f);
+            break;
+        }
         if (p->readers == 0) {
             irq_restore(f);
             struct thread *t = thread_current();
             if (!done && t->process->user) signal_send_thread(t, SIGPIPE);   /* as POSIX asks */
-            return done ? (i64)done : -EPIPE;
+            err = -EPIPE;
+            break;
         }
-        for (u64 i = 0; i < want; i++) p->buf[(p->head + p->len + i) % PIPE_SIZE] = ((const u8 *)in)[done + i];
+        for (u64 i = 0; i < want; i++) p->buf[(p->head + p->len + i) % PIPE_SIZE] = bounce[i];
         p->len += (u32)want;
         done += want;
         irq_restore(f);
         waitqueue_wake_all(&p->wait);
         vfs_poll_notify();
     }
-    return (i64)done;
+    kfree(bounce);
+    return done ? (i64)done : err;
 }
 
 static int pipe_stat(struct vnode *v, struct vnode_stat *st) {
