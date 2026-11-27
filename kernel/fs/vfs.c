@@ -216,7 +216,8 @@ static int step(struct vnode *cur, const char *name, u32 len, struct vnode **nex
  * path: relative targets start from the link's directory). The last component is followed
  * only with W_FOLLOW, or if a slash comes after it (then it must also be a directory, as in
  * Linux). With W_PARENT, stops before the last component, returns its directory and copies
- * the name (raw) into `last` (NAME_MAX + 1 bytes). W_CREATE (with W_PARENT, for open with
+ * the name (raw) into `last` (NAME_MAX + 1 bytes), and into `last_slash` (if not NULL) whether a
+ * slash came after it: the caller decides what that means. W_CREATE (with W_PARENT, for open with
  * O_CREAT) returns 0 and the file if the last component exists (a link to it followed with
  * W_FOLLOW, so a dangling link names the file to create), else 1 and its directory and name.
  */
@@ -224,7 +225,8 @@ static int step(struct vnode *cur, const char *name, u32 len, struct vnode **nex
 #define W_FOLLOW 2
 #define W_CREATE 4
 
-static int walk(const char *path, struct vnode *cwd, int flags, struct vnode **out, char *last, u32 *last_len) {
+static int walk(const char *path, struct vnode *cwd, int flags, struct vnode **out, char *last, u32 *last_len,
+                bool *last_slash) {
     bool want_parent = flags & W_PARENT, create = flags & W_CREATE;
     if (!root) return -ENOENT;
     if (!path[0]) return -ENOENT;
@@ -257,6 +259,7 @@ static int walk(const char *path, struct vnode *cwd, int flags, struct vnode **o
                 memcpy(last, start, len);
                 last[len] = 0;
                 *last_len = len;
+                if (last_slash) *last_slash = dir_slash;
                 *out = cur;
                 kfree(buf);
                 return create ? 1 : 0;
@@ -315,17 +318,19 @@ fail:
 }
 
 int vfs_lookup(const char *path, struct vnode *cwd, struct vnode **out) {
-    return walk(path, cwd, W_FOLLOW, out, NULL, NULL);
+    return walk(path, cwd, W_FOLLOW, out, NULL, NULL, NULL);
 }
 
 int vfs_lookup_nofollow(const char *path, struct vnode *cwd, struct vnode **out) {
-    return walk(path, cwd, 0, out, NULL, NULL);
+    return walk(path, cwd, 0, out, NULL, NULL, NULL);
 }
 
-int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len) {
+/* vfs_lookup_parent, and *slash: whether a slash followed the name ("name/"). */
+static int lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len, bool *slash) {
     char raw[NAME_MAX + 1];
     u32 raw_len;
-    int r = walk(path, cwd, W_PARENT | W_FOLLOW, parent, raw, &raw_len);
+    *slash = false;
+    int r = walk(path, cwd, W_PARENT | W_FOLLOW, parent, raw, &raw_len, slash);
     if (r < 0) return r;
     if (is_dot(raw, raw_len)) {
         vnode_put(*parent);
@@ -342,6 +347,21 @@ int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent
     }
     *len = (u32)n;
     return 0;
+}
+
+int vfs_lookup_parent(const char *path, struct vnode *cwd, struct vnode **parent, char *name, u32 *len) {
+    bool slash;
+    return lookup_parent(path, cwd, parent, name, len, &slash);
+}
+
+/* For a name written with a trailing slash ("name/" asks for a directory): 0 if it is one, else
+   -ENOENT or -ENOTDIR. As in Linux, a link there is not followed: "link/" is not a directory. */
+static int must_be_dir(struct vnode *dir, const char *name, u32 len) {
+    struct vnode *t;
+    if (dir->ops->lookup(dir, name, len, &t) < 0) return -ENOENT;
+    int r = t->type == VN_DIR ? 0 : -ENOTDIR;
+    vnode_put(t);
+    return r;
 }
 
 /* ---- open files ------------------------------------------------------------------ */
@@ -375,7 +395,7 @@ static int open_create(const char *path, struct vnode *cwd, u32 flags, u32 mode,
         struct vnode *parent;
         char raw[NAME_MAX + 1], name[NAME_MAX + 1];
         u32 raw_len;
-        int r = walk(path, cwd, walk_flags, &parent, raw, &raw_len);
+        int r = walk(path, cwd, walk_flags, &parent, raw, &raw_len, NULL);
         if (r < 0) return r;
         if (r == 0) {   /* it exists */
             if (flags & O_EXCL) {
@@ -526,8 +546,14 @@ int vfs_remove(const char *path, struct vnode *cwd, bool is_dir) {
     struct vnode *parent;
     char name[NAME_MAX + 1];
     u32 len;
-    int r = vfs_lookup_parent(path, cwd, &parent, name, &len);
+    bool slash;
+    int r = lookup_parent(path, cwd, &parent, name, &len, &slash);
     if (r < 0) return r;
+    if (slash && !is_dir) {   /* unlink("name/") removes nothing (Linux): ENOENT, EISDIR or ENOTDIR */
+        r = must_be_dir(parent, name, len);
+        vnode_put(parent);
+        return r == 0 ? -EISDIR : r;
+    }
     r = may(parent, MAY_WRITE | MAY_EXEC, false);
     if (r == 0) r = sticky_ok(parent, name, len);
     if (r < 0) {
@@ -561,14 +587,16 @@ int vfs_rename(const char *old_path, const char *new_path, struct vnode *cwd) {
     struct vnode *od, *nd;
     char on[NAME_MAX + 1], nn[NAME_MAX + 1];
     u32 ol, nl;
-    int r = vfs_lookup_parent(old_path, cwd, &od, on, &ol);
+    bool os, ns;
+    int r = lookup_parent(old_path, cwd, &od, on, &ol, &os);
     if (r < 0) return r;
-    r = vfs_lookup_parent(new_path, cwd, &nd, nn, &nl);
+    r = lookup_parent(new_path, cwd, &nd, nn, &nl, &ns);
     if (r < 0) {
         vnode_put(od);
         return r;
     }
     if (od->fs != nd->fs) r = -EXDEV;
+    else if ((os || ns) && (r = must_be_dir(od, on, ol)) < 0) {}   /* a slash on either name: only a directory moves */
     else if ((r = may(od, MAY_WRITE | MAY_EXEC, false)) < 0 || (r = may(nd, MAY_WRITE | MAY_EXEC, false)) < 0) {}
     else if ((r = sticky_ok(od, on, ol)) < 0 || (r = sticky_ok(nd, nn, nl)) < 0) {}
     else if ((r = not_busy(nd, nn, nl)) < 0) {}   /* a directory may now replace an empty one */
@@ -601,8 +629,14 @@ int vfs_symlink(const char *target, const char *path, struct vnode *cwd) {
     struct vnode *parent;
     char name[NAME_MAX + 1];
     u32 len;
-    int r = vfs_lookup_parent(path, cwd, &parent, name, &len);
+    bool slash;
+    int r = lookup_parent(path, cwd, &parent, name, &len, &slash);
     if (r < 0) return r;
+    if (slash) {   /* "name/" asks for a directory, which symlink cannot make (Linux): EEXIST or ENOENT */
+        r = must_be_dir(parent, name, len) == -ENOENT ? -ENOENT : -EEXIST;
+        vnode_put(parent);
+        return r;
+    }
     struct vnode_attr attr;
     r = may(parent, MAY_WRITE | MAY_EXEC, false);
     if (r == 0) r = new_attr(parent, VN_SYMLINK, 0777, &attr);
@@ -631,12 +665,14 @@ int vfs_link(const char *old_path, struct vnode *old_cwd, const char *new_path, 
     }
     char name[NAME_MAX + 1];
     u32 len;
-    r = vfs_lookup_parent(new_path, new_cwd, &parent, name, &len);
+    bool slash;
+    r = lookup_parent(new_path, new_cwd, &parent, name, &len, &slash);
     if (r < 0) {
         vnode_put(v);
         return r;
     }
-    r = may(parent, MAY_WRITE | MAY_EXEC, false);
+    if (slash) r = must_be_dir(parent, name, len) == -ENOENT ? -ENOENT : -EEXIST;   /* as symlink */
+    else r = may(parent, MAY_WRITE | MAY_EXEC, false);
     if (r == 0 && parent->fs != v->fs) r = -EXDEV;
     if (r == 0) r = parent->ops->link ? parent->ops->link(parent, name, len, v) : -EPERM;
     vnode_put(parent);
