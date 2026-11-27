@@ -128,6 +128,11 @@ bool block_flush(struct block_device *dev) {
     return dev->flush ? dev->flush(dev) : true;
 }
 
+void block_forget(struct block_device *dev, u64 block) {
+    struct cache_entry *e = lookup(dev, block);
+    if (e) e->dev = NULL;
+}
+
 bool block_write_phys(struct block_device *dev, u64 block, u64 phys) {
     struct cache_entry *e = lookup(dev, block);
     if (e) e->dev = NULL;   /* the cached copy is no longer current */

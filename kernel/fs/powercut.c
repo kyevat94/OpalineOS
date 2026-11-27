@@ -33,6 +33,7 @@ static void write_file(const char *path, u64 size, u8 seed, bool keep_open, stru
 }
 
 void powercut_test(u64 cut_after) {
+    efs3_step_blocks = 16;   /* big truncations and deletions in many small steps, so the cuts reach them */
     block_powercut_arm(cut_after ? cut_after : ~0ULL);
     kprintf("POWERCUT test: the workload starts (the power goes off after %lu writes)\n", cut_after);
     char path[64];
@@ -57,6 +58,13 @@ void powercut_test(u64 cut_after) {
         file_put(f);
     }
     vfs_remove("/home/pc/hard.txt", NULL, false);
+    /* 8 MiB (double indirect blocks): cut to 1 MiB + 123 bytes, then deleted, each in many steps */
+    write_file("/home/pc/huge.bin", 8 * MiB, 6, false, NULL);
+    if (vfs_open("/home/pc/huge.bin", NULL, O_WRONLY, 0, &f) == 0) {
+        f->vn->ops->truncate(f->vn, 1 * MiB + 123);
+        file_put(f);
+    }
+    vfs_remove("/home/pc/huge.bin", NULL, false);
     for (int i = 0; i < 20; i++) {
         ksnprintf(path, sizeof path, "/home/pc/f%02d", i);
         write_file(path, 1000 + (u64)i * 300, (u8)i, false, NULL);
